@@ -1,0 +1,165 @@
+name: package-release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build release assets
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.3"
+          python-version: "3.12"
+      - name: Verify tag matches package version
+        shell: bash
+        run: |
+          version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          test "$GITHUB_REF_NAME" = "v$version"
+      - name: Verify lock
+        run: uv lock --check
+      - name: Build package
+        run: uv build --out-dir dist
+      - name: Export runtime constraints
+        run: >-
+          uv export --locked --no-emit-project --no-hashes
+          --format requirements-txt -o dist/constraints-runtime.txt
+      - name: Export MCP constraints
+        run: >-
+          uv export --locked --no-emit-project --no-hashes
+          --format requirements-txt --extra mcp -o dist/constraints-mcp.txt
+      - name: Create checksums
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib
+          from pathlib import Path
+
+          dist = Path("dist")
+          packages = sorted([*dist.glob("*.whl"), *dist.glob("*.tar.gz")])
+          if len(packages) != 2:
+              raise SystemExit(f"expected one wheel and one sdist, found: {packages}")
+          lines = [f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}" for path in packages]
+          (dist / "SHA256SUMS.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/
+          if-no-files-found: error
+
+  smoke:
+    name: Smoke release wheel (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    needs: build
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.12"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+      - name: Smoke exact wheel
+        run: >-
+          python scripts/smoke_installed_artifact.py
+          --dist dist
+          --workdir "${{ runner.temp }}/coda-smoke"
+
+  publish:
+    name: Publish GitHub Release
+    needs: [build, smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+      - name: Verify checksums and release asset set
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib
+          from pathlib import Path
+
+          dist = Path("dist")
+          wheel = list(dist.glob("*.whl"))
+          sdist = list(dist.glob("*.tar.gz"))
+          if len(wheel) != 1 or len(sdist) != 1:
+              raise SystemExit(f"expected one wheel and one sdist: wheel={wheel}, sdist={sdist}")
+          expected = {}
+          for line in (dist / "SHA256SUMS.txt").read_text(encoding="utf-8").splitlines():
+              digest, name = line.split("  ", 1)
+              expected[name] = digest
+          packages = wheel + sdist
+          if set(expected) != {path.name for path in packages}:
+              raise SystemExit("SHA256SUMS.txt must list exactly the wheel and sdist")
+          for path in packages:
+              actual = hashlib.sha256(path.read_bytes()).hexdigest()
+              if actual != expected[path.name]:
+                  raise SystemExit(f"checksum mismatch: {path.name}")
+          PY
+      - name: Refuse to overwrite an existing release
+        shell: bash
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "release already exists: $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+      - name: Extract changelog notes
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          version = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          text = Path("CHANGELOG.md").read_text(encoding="utf-8")
+          match = re.search(
+              rf"(?ms)^## \[{re.escape(version)}\].*?\n(.*?)(?=^## \[|\Z)",
+              text,
+          )
+          if not match or not match.group(1).strip():
+              raise SystemExit(f"missing CHANGELOG.md section for {version}")
+          Path("release-notes.md").write_text(match.group(1).strip() + "\n", encoding="utf-8")
+          PY
+      - name: Create GitHub Release
+        shell: bash
+        run: |
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          sdists=(dist/*.tar.gz)
+          test "${#wheels[@]}" -eq 1
+          test "${#sdists[@]}" -eq 1
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --prerelease \
+            --notes-file release-notes.md \
+            "${wheels[0]}" \
+            "${sdists[0]}" \
+            dist/SHA256SUMS.txt

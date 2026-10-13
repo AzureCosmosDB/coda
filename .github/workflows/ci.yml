@@ -1,0 +1,82 @@
+name: package-ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.3"
+          python-version: "3.12"
+      - name: Verify lock
+        run: uv lock --check
+      - name: Build package
+        run: uv build --out-dir dist
+      - name: Export runtime constraints
+        run: >-
+          uv export --locked --no-emit-project --no-hashes
+          --format requirements-txt -o dist/constraints-runtime.txt
+      - name: Export MCP constraints
+        run: >-
+          uv export --locked --no-emit-project --no-hashes
+          --format requirements-txt --extra mcp -o dist/constraints-mcp.txt
+      - name: Upload built artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  test:
+    name: Test package boundaries (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.12"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.3"
+          python-version: ${{ matrix.python-version }}
+      - name: Install locked test environment
+        run: uv sync --locked --group test
+      - name: Run public packaging tests
+        run: uv run --no-sync pytest -q -p no:cacheprovider
+
+  smoke:
+    name: Smoke built wheel (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    needs: build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.12"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Download built artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - name: Smoke exact wheel
+        run: >-
+          python scripts/smoke_installed_artifact.py
+          --dist dist
+          --workdir "${{ runner.temp }}/coda-smoke"
