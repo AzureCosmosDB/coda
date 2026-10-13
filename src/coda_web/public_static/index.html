@@ -1,0 +1,1651 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CODA</title>
+<script>
+  (() => {
+    const param = new URLSearchParams(window.location.search).get("scoutTheme");
+    const stored = localStorage.getItem("codaTheme");
+    // Default to dark; a stored toggle choice (or ?scoutTheme=) overrides it.
+    const theme = param || stored || "dark";
+    document.documentElement.setAttribute("data-theme", theme);
+  })();
+</script>
+<script src="portal-link.js?contract=account-explorer-v2" defer></script>
+<style>
+:root {
+  color-scheme: light;
+  --cp-bg: #eef2f8;
+  --cp-bg-elevated: #f7f9fc;
+  --cp-surface: #ffffff;
+  --cp-surface-soft: #eef2f8;
+  --cp-border: #d5dded;
+  --cp-border-strong: #8ea1c4;
+  --cp-text: #17233b;
+  --cp-text-muted: #4a5876;
+  --cp-text-soft: #5d6b8a;
+  --cp-accent: #2563eb;
+  --cp-accent-hover: #1d4ed8;
+  --cp-accent-soft: rgba(37, 99, 235, 0.08);
+  --cp-accent-fg: #ffffff;
+  --cp-success: #16a34a;
+  --cp-danger: #dc2626;
+  --cp-warning: #d97706;
+  --cp-link: #2563eb;
+  --cp-shadow: 0 18px 48px rgba(15, 35, 75, 0.12);
+  --cp-overlay: rgba(255, 255, 255, 0.8);
+  --cp-panel: rgba(255, 255, 255, 0.86);
+  --cp-panel-strong: rgba(255, 255, 255, 0.96);
+  --cp-sheen: rgba(255, 255, 255, 0.55);
+  --cp-highlight: rgba(37, 99, 235, 0.12);
+}
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --cp-bg: #0b1220;
+  --cp-bg-elevated: #0f1a2e;
+  --cp-surface: #14203a;
+  --cp-surface-soft: #1b2947;
+  --cp-border: #26355a;
+  --cp-border-strong: #3b5081;
+  --cp-text: #e7eefc;
+  --cp-text-muted: #93a4c6;
+  --cp-text-soft: #b3c1de;
+  --cp-accent: #5b9dff;
+  --cp-accent-hover: #7db2ff;
+  --cp-accent-soft: rgba(91, 157, 255, 0.16);
+  --cp-accent-fg: #06101f;
+  --cp-success: #4ade80;
+  --cp-danger: #f87171;
+  --cp-warning: #fbbf24;
+  --cp-link: #6db1ff;
+  --cp-shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
+  --cp-overlay: rgba(11, 18, 32, 0.9);
+  --cp-panel: rgba(15, 26, 46, 0.72);
+  --cp-panel-strong: rgba(15, 26, 46, 0.96);
+  --cp-sheen: rgba(120, 170, 255, 0.05);
+  --cp-highlight: rgba(91, 157, 255, 0.14);
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--cp-bg);
+  color: var(--cp-text);
+  font-family: "Segoe UI", Aptos, Calibri, -apple-system, BlinkMacSystemFont, sans-serif;
+}
+.auth-shell {
+  min-height: 100vh;
+  place-items: center;
+  padding: 2rem;
+}
+.auth-shell:not([hidden]) {
+  display: grid;
+}
+.auth-card {
+  width: min(30rem, 100%);
+  padding: 2rem;
+  text-align: center;
+}
+.auth-card h1 { margin: 0 0 0.5rem; }
+.auth-card p { color: var(--cp-text-muted); }
+body.coda-auth-required .app { display: none; }
+a { color: var(--cp-link); }
+button,
+input,
+select {
+  font: inherit;
+}
+button,
+select,
+input {
+  border-radius: 0.625rem;
+  border: 1px solid var(--cp-border);
+}
+button {
+  cursor: pointer;
+}
+button:disabled,
+select:disabled,
+input:disabled {
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+.app {
+  display: grid;
+  grid-template-columns: 19rem minmax(0, 1fr);
+  height: 100vh;
+  overflow: hidden;
+}
+.sidebar {
+  border-right: 1px solid var(--cp-border);
+  background: var(--cp-bg-elevated);
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+.brand h1 {
+  margin: 0;
+  font-size: 1.35rem;
+}
+.tagline {
+  color: var(--cp-text-muted);
+  margin: 0.125rem 0 0;
+  font-size: 0.875rem;
+}
+.panel {
+  background: var(--cp-surface);
+  border: 1px solid var(--cp-border);
+  border-radius: 16px;
+  box-shadow: var(--cp-shadow);
+}
+.panel h2,
+.panel h3 {
+  margin: 0;
+}
+.detectors {
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1 1 auto;
+}
+.detectors h2 {
+  font-size: 0.92rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--cp-text-muted);
+}
+.detector-list {
+  list-style: none;
+  margin: 0.875rem 0 0;
+  padding: 0;
+  display: grid;
+  gap: 0.5rem;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+.detector-list li {
+  display: grid;
+  gap: 0.2rem;
+  padding: 0.625rem;
+  border: 1px solid var(--cp-border);
+  border-radius: 0.625rem;
+  background: var(--cp-surface-soft);
+}
+.detector-id {
+  color: var(--cp-accent);
+  font-family: Consolas, "Courier New", Courier, monospace;
+  font-size: 0.78rem;
+}
+.detector-meta {
+  color: var(--cp-text-muted);
+  font-size: 0.76rem;
+}
+.main {
+  min-width: 0;
+  min-height: 0;
+  padding: 1.25rem;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.hero {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+.hero h2 {
+  margin: 0;
+  font-size: 1.45rem;
+}
+.hero p {
+  margin: 0.25rem 0 0;
+  color: var(--cp-text-muted);
+}
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.25rem 0.6rem;
+  border: 1px solid var(--cp-border);
+  border-radius: 999px;
+  background: var(--cp-surface);
+  color: var(--cp-text-muted);
+  font-size: 0.8rem;
+}
+.pill[hidden] { display: none; }
+.user-name {
+  max-width: 16rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.controls {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  padding: 0.85rem 1rem;
+  margin-bottom: 1rem;
+}
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: 0.7rem 0;
+}
+.tb-group {
+  display: flex;
+  align-items: end;
+  gap: 0.75rem;
+}
+.tb-group.scope { flex: 1 1 24rem; min-width: 16rem; }
+.tb-group.scope .field { flex: 1 1 0; min-width: 0; }
+.tb-group.actions {
+  margin-left: 1rem;
+  padding-left: 1rem;
+  border-left: 1px solid var(--cp-border);
+}
+.tb-group.actions { align-items: center; flex-wrap: wrap; }
+.tb-group.actions .btn { min-height: 2.75rem; white-space: nowrap; }
+.field {
+  display: grid;
+  gap: 0.35rem;
+}
+.field label,
+.mode-label {
+  color: var(--cp-text-muted);
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.checkline {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-height: 2.5rem;
+  color: var(--cp-text-muted);
+  font-size: 0.88rem;
+}
+.checkline input {
+  width: auto;
+  min-height: auto;
+}
+input,
+select {
+  width: 100%;
+  min-height: 2.5rem;
+  padding: 0.45rem 0.7rem;
+  color: var(--cp-text);
+  background: var(--cp-surface-soft);
+}
+.mode-toggle {
+  display: grid;
+  gap: 0.35rem;
+}
+.mode-options {
+  display: flex;
+  border: 1px solid var(--cp-border);
+  border-radius: 0.625rem;
+  overflow: hidden;
+}
+.mode-options label {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  min-height: 2.5rem;
+  padding: 0 0.75rem;
+  background: var(--cp-surface-soft);
+}
+.mode-options input {
+  width: auto;
+  min-height: auto;
+}
+.btn {
+  min-height: 2.5rem;
+  padding: 0.45rem 0.85rem;
+  background: var(--cp-surface-soft);
+  color: var(--cp-text);
+}
+.btn.primary {
+  background: var(--cp-accent);
+  border-color: var(--cp-accent);
+  color: var(--cp-accent-fg);
+  font-weight: 700;
+}
+.btn.primary:hover:not(:disabled) {
+  background: var(--cp-accent-hover);
+}
+.btn.secondary {
+  border-color: var(--cp-border-strong);
+}
+.status-bar {
+  min-height: 1.5rem;
+  color: var(--cp-text-muted);
+  font-size: 0.88rem;
+  margin: 0.25rem 0 0.75rem;
+}
+.error {
+  color: var(--cp-danger);
+}
+.spinner {
+  display: none;
+  color: var(--cp-accent);
+}
+.busy .spinner {
+  display: inline;
+}
+.results {
+  display: grid;
+  gap: 1rem;
+  align-content: start;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+.headline {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+.tile {
+  padding: 1rem;
+}
+.tile .k {
+  color: var(--cp-text-muted);
+  font-size: 0.8rem;
+}
+.tile .v {
+  margin-top: 0.3rem;
+  font-size: 1.35rem;
+  font-weight: 750;
+}
+.tile .accent {
+  color: var(--cp-success);
+}
+.section {
+  padding: 1rem;
+}
+.section-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 0.8rem;
+}
+.section-header h3 {
+  font-size: 1rem;
+}
+.cards {
+  display: grid;
+  gap: 0.75rem;
+}
+.finding-card {
+  padding: 1rem;
+  border: 1px solid var(--cp-border);
+  border-radius: 16px;
+  background: var(--cp-surface-soft);
+}
+.finding-title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 0.55rem;
+}
+.finding-title h4 {
+  margin: 0;
+  font-size: 1rem;
+}
+.severity {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.14rem 0.45rem;
+  border: 1px solid var(--cp-border);
+  border-radius: 0.625rem;
+  text-transform: uppercase;
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+}
+.severity.high {
+  color: var(--cp-danger);
+  border-color: var(--cp-danger);
+}
+.severity.medium {
+  color: var(--cp-warning);
+  border-color: var(--cp-warning);
+}
+.severity.low {
+  color: var(--cp-warning);
+  border-color: var(--cp-border-strong);
+}
+.finding-id {
+  color: var(--cp-accent);
+  font-family: Consolas, "Courier New", Courier, monospace;
+  font-size: 0.78rem;
+}
+.muted {
+  color: var(--cp-text-muted);
+}
+.summary {
+  margin: 0.4rem 0;
+}
+.magnitude {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin: 0.55rem 0;
+}
+.metric-chip {
+  display: inline-flex;
+  padding: 0.2rem 0.5rem;
+  border: 1px solid var(--cp-border);
+  border-radius: 0.625rem;
+  color: var(--cp-success);
+  background: var(--cp-surface);
+  font-size: 0.82rem;
+}
+.hero-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+.theme-toggle {
+  border: 1px solid var(--cp-border-strong);
+  background: var(--cp-surface);
+  color: var(--cp-text);
+  border-radius: 0.625rem;
+  padding: 0.35rem 0.7rem;
+  font-size: 0.82rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.theme-toggle:hover {
+  border-color: var(--cp-accent);
+  color: var(--cp-accent);
+}
+.mode-options label {
+  cursor: help;
+}
+.bubble-help {
+  position: relative;
+  display: inline-block;
+}
+.help-trigger {
+  border: 1px solid var(--cp-border-strong);
+  border-radius: 50%;
+  background: var(--cp-surface);
+  color: var(--cp-text-muted);
+  cursor: help;
+}
+.help-bubble {
+  display: none;
+  position: absolute;
+  z-index: 10;
+  top: 1.5rem;
+  left: 0;
+  width: min(22rem, 70vw);
+  padding: 0.7rem;
+  border: 1px solid var(--cp-border-strong);
+  border-radius: 0.625rem;
+  background: var(--cp-surface);
+  color: var(--cp-text);
+  font-size: 0.82rem;
+  font-weight: 400;
+  white-space: normal;
+}
+.bubble-help:hover .help-bubble,
+.bubble-help:focus-within .help-bubble {
+  display: block;
+}
+.help-context { display: block; margin-bottom: 0.4rem; }
+.mode-options .info {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.05rem;
+  height: 1.05rem;
+  border-radius: 50%;
+  border: 1px solid var(--cp-border-strong);
+  color: var(--cp-text-muted);
+  font-size: 0.7rem;
+  font-weight: 700;
+  font-style: normal;
+  line-height: 1;
+}
+.mode-options label:hover .info {
+  border-color: var(--cp-accent);
+  color: var(--cp-accent);
+}
+.sev-dot {
+  display: inline-block;
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+  margin-right: 0.4rem;
+  vertical-align: middle;
+}
+.sev-dot.d-high { background: var(--cp-danger); }
+.sev-dot.d-med { background: var(--cp-warning); }
+.sev-dot.d-ok { background: var(--cp-success); }
+.sev-dot.d-quiet { background: var(--cp-text-muted); opacity: 0.5; }
+.sev-dot.d-err { background: var(--cp-text-muted); }
+.subhead { margin: 0.85rem 0 0.4rem; font-size: 0.95rem; }
+.calibrating {
+  margin-top: 0.5rem;
+  padding: 0.55rem 0.7rem;
+  border-left: 3px solid var(--cp-warning);
+  background: var(--cp-surface);
+  color: var(--cp-text-soft);
+  border-radius: 0.625rem;}
+details {
+  border: 1px solid var(--cp-border);
+  border-radius: 16px;
+  background: var(--cp-surface);
+  padding: 0.85rem 1rem;
+}
+summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+.callout {
+  margin-top: 0.75rem;
+  padding: 0.75rem;
+  border-left: 3px solid var(--cp-warning);
+  border-radius: 0.625rem;
+  background: var(--cp-surface-soft);
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+th,
+td {
+  text-align: left;
+  padding: 0.65rem 0.55rem;
+  border-bottom: 1px solid var(--cp-border);
+}
+th {
+  color: var(--cp-text-muted);
+  font-weight: 600;
+}
+tr.clickable {
+  cursor: pointer;
+}
+tr.clickable:hover {
+  background: var(--cp-highlight);
+}
+.empty {
+  padding: 1rem;
+  color: var(--cp-text-muted);
+  border: 1px dashed var(--cp-border-strong);
+  border-radius: 16px;
+}
+@media (max-width: 1180px) {
+  /* Narrow layouts use normal document flow so touch users are not trapped in nested scrolling. */
+  .app {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto auto;
+    height: auto;
+    min-height: 100vh;
+    overflow: visible;
+  }
+  .sidebar { border-right: 0; border-bottom: 1px solid var(--cp-border); }
+  .main { overflow: visible; }
+  .results { flex: none; overflow: visible; }
+  .tb-group.options,
+  .tb-group.actions { margin-left: 0; padding-left: 0; border-left: 0; }
+  .headline { grid-template-columns: 1fr 1fr; }
+}
+@media (max-width: 720px) {
+  .headline { grid-template-columns: 1fr; }
+  .hero { display: grid; }
+}
+</style>
+</head>
+<body>
+<section class="auth-shell" id="codaAuthShell" aria-live="polite" hidden>
+  <div class="panel auth-card">
+    <h1>CODA</h1>
+    <p id="codaAuthMessage">Sign in with your local Azure identity to continue.</p>
+    <button class="btn primary" id="codaSignIn" type="button">Sign in</button>
+  </div>
+</section>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <div>
+        <h1>CODA</h1>
+        <p class="tagline">Cosmos Observability and Diagnostic Agent</p>
+      </div>
+    </div>
+    <section class="panel detectors">
+      <h2 id="detectorsTitle">What CODA checks</h2>
+      <ul class="detector-list" id="detectorList">
+        <li class="muted">Loading detector catalog…</li>
+      </ul>
+    </section>
+  </aside>
+  <main class="main">
+    <header class="hero">
+      <div>
+        <h2>Run an analysis over a Cosmos DB account</h2>
+        <p>Analyze one account, or scan the accounts in a selected resource group.</p>
+      </div>
+      <div class="hero-actions">
+        <button class="theme-toggle" id="themeToggle" type="button" aria-label="Toggle light or dark theme"></button>
+        <span class="pill" id="deploymentMode">Local only · your Azure tenant · shared CODA core engine</span>
+        <span class="pill" id="signedInProfile" hidden>
+          <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" focusable="false">
+            <circle cx="10" cy="6" r="3"></circle>
+            <path d="M4 18v-2a6 6 0 0 1 12 0v2"></path>
+          </svg>
+          <span class="user-name" id="signedInName"></span>
+        </span>
+      </div>
+    </header>
+
+    <section class="panel controls" aria-label="Analysis controls">
+      <div class="toolbar">
+        <div class="tb-group scope">
+          <div class="field">
+            <label for="subscriptionPicker">Subscription</label>
+            <select id="subscriptionPicker">
+              <option value="">Loading Cosmos subscriptions…</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="resourceGroupPicker">Resource group</label>
+            <select id="resourceGroupPicker" disabled>
+              <option value="">Select a subscription first…</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="accountPicker">Account</label>
+            <select id="accountPicker" disabled>
+              <option value="">Select a resource group first…</option>
+            </select>
+          </div>
+        </div>
+        <div class="tb-group actions">
+          <button class="btn primary" id="analyzeAccount">Analyze account</button>
+          <button class="btn secondary" id="scanResourceGroup" disabled>Scan resource group</button>
+        </div>
+      </div>
+    </section>
+
+    <div class="status-bar" id="statusBar"><span class="spinner">⏳</span> Ready.</div>
+    <section class="results" id="results">
+      <div class="empty">Select a subscription and resource group to scan, or choose an account to analyze.</div>
+    </section>
+  </main>
+</div>
+
+<script>
+const state = {
+  accounts: [],
+  subscriptions: [],
+  busy: false,
+  lastScan: null,
+  accountRequestVersion: 0,
+};
+
+const severityRank = { high: 0, medium: 1, low: 2, none: 3 };
+
+const el = {
+  codaAuthShell: document.getElementById("codaAuthShell"),
+  codaAuthMessage: document.getElementById("codaAuthMessage"),
+  codaSignIn: document.getElementById("codaSignIn"),
+  subscriptionPicker: document.getElementById("subscriptionPicker"),
+  resourceGroupPicker: document.getElementById("resourceGroupPicker"),
+  accountPicker: document.getElementById("accountPicker"),
+  analyzeAccount: document.getElementById("analyzeAccount"),
+  scanResourceGroup: document.getElementById("scanResourceGroup"),
+  statusBar: document.getElementById("statusBar"),
+  results: document.getElementById("results"),
+  detectorList: document.getElementById("detectorList"),
+  detectorsTitle: document.getElementById("detectorsTitle"),
+};
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function setStatus(message, isError = false) {
+  el.statusBar.className = `status-bar${isError ? " error" : ""}`;
+  el.statusBar.innerHTML = `<span class="spinner">⏳</span> ${escapeHtml(message)}`;
+}
+
+function setBusy(isBusy, message = "Working…") {
+  state.busy = isBusy;
+  document.body.classList.toggle("busy", isBusy);
+  if (isBusy) setStatus(message);
+  updateControls();
+}
+
+function currentSubscription() {
+  return el.subscriptionPicker.value.trim();
+}
+
+function resetAccounts() {
+  state.accountRequestVersion += 1;
+  state.accounts = [];
+  el.resourceGroupPicker.innerHTML = `<option value="">Select a subscription first…</option>`;
+  el.resourceGroupPicker.value = "";
+  resetAccountSelection();
+}
+
+function resetAccountSelection(message = "Select a resource group first…") {
+  el.accountPicker.innerHTML = `<option value="">${escapeHtml(message)}</option>`;
+  el.accountPicker.value = "";
+}
+
+function populateAccountsForSelectedGroup() {
+  const resourceGroup = el.resourceGroupPicker.value;
+  if (!resourceGroup) {
+    resetAccountSelection();
+    updateControls();
+    return;
+  }
+  const accounts = state.accounts
+    .map((account, index) => ({ account, index }))
+    .filter(item => item.account.resource_group === resourceGroup)
+    .sort((left, right) => (
+      left.account.account.localeCompare(right.account.account) || left.index - right.index
+    ));
+  el.accountPicker.innerHTML = accounts.length
+    ? `<option value="">Choose an account…</option>` + accounts.map(item => (
+      `<option value="${item.index}">${escapeHtml(item.account.account)}</option>`
+    )).join("")
+    : `<option value="">No accounts found in this resource group</option>`;
+  el.accountPicker.value = "";
+  updateControls();
+}
+
+function updateControls() {
+  const hasSub = Boolean(currentSubscription());
+  const resourceGroup = el.resourceGroupPicker.value;
+  const selected = el.accountPicker.value
+    ? state.accounts[Number(el.accountPicker.value)]
+    : null;
+  const hasAccount = Boolean(selected && selected.resource_group === resourceGroup);
+  el.subscriptionPicker.disabled = state.busy || state.subscriptions.length === 0;
+  el.resourceGroupPicker.disabled = state.busy || state.accounts.length === 0;
+  el.accountPicker.disabled = state.busy || !resourceGroup || !state.accounts.some(
+    account => account.resource_group === resourceGroup
+  );
+  el.analyzeAccount.disabled = state.busy || !hasSub || !resourceGroup || !hasAccount;
+  el.scanResourceGroup.disabled = state.busy || !hasSub || !resourceGroup;
+}
+
+function currentMode() {
+  // The customer-safe build fixes analysis mode to production: the Mode radio group is removed
+  // entirely, so every request always carries this fixed value (customer-web-ux/spec.md,
+  // "Customer app fixes analysis mode to production").
+  return "production";
+}
+
+function currentDepth() {
+  // The customer-safe build fixes depth to deep: the Depth radio group is removed entirely, so
+  // every request always carries this fixed value (customer-web-ux/spec.md, "Customer app fixes
+  // depth to deep").
+  return "deep";
+}
+
+async function readJson(response) {
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const failure = payload.error && typeof payload.error === "object" ? payload.error : {};
+    const error = new Error(
+      failure.message || "CODA could not safely complete the request."
+    );
+    error.failure = failure;
+    error.status = response.status;
+    throw error;
+  }
+  return payload;
+}
+
+async function apiGet(path) {
+  return readJson(await fetch(path, { headers: { Accept: "application/json" } }));
+}
+
+async function apiPost(path, body) {
+  return readJson(await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(body),
+  }));
+}
+
+function money(amount, currency) {
+  const numericAmount = Number(amount);
+  const currencyCode = currency || "USD";
+  try {
+    if (Number.isFinite(numericAmount) && numericAmount > 0 && numericAmount < 0.01) {
+      const oneCent = new Intl.NumberFormat(undefined, {
+        style: "currency",
+        currency: currencyCode,
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      }).format(0.01);
+      return `<${oneCent}`;
+    }
+    const showCents = Number.isFinite(numericAmount) && numericAmount > 0 && numericAmount < 1;
+    return new Intl.NumberFormat(undefined, {
+      style: "currency",
+      currency: currencyCode,
+      minimumFractionDigits: showCents ? 2 : 0,
+      maximumFractionDigits: showCents ? 2 : 0,
+    }).format(numericAmount);
+  } catch {
+    if (Number.isFinite(numericAmount) && numericAmount > 0 && numericAmount < 0.01) {
+      return `<0.01 ${currencyCode}`.trim();
+    }
+    const rendered = (
+      Number.isFinite(numericAmount) && numericAmount > 0 && numericAmount < 1
+        ? numericAmount.toFixed(2)
+        : numericAmount.toLocaleString()
+    );
+    return `${rendered} ${currency || ""}`.trim();
+  }
+}
+
+function number(value) {
+  return Number(value || 0).toLocaleString();
+}
+
+function isFiniteNonnegativeNumber(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+function matchesRoundedCurrencyProduct(amount, quantity, rate) {
+  if (![amount, quantity, rate].every(value => (
+    typeof value === "number" && Number.isFinite(value) && value > 0
+  ))) return false;
+  const amountInCents = amount * 100;
+  const centsTolerance = Number.EPSILON * Math.max(1, Math.abs(amountInCents)) * 8;
+  if (Math.abs(amountInCents - Math.round(amountInCents)) > centsTolerance) return false;
+  const exactAmount = quantity * rate;
+  const arithmeticTolerance = 0.005
+    + Number.EPSILON * Math.max(1, Math.abs(exactAmount), Math.abs(amount)) * 8;
+  return Number.isFinite(exactAmount) && Math.abs(amount - exactAmount) <= arithmeticTolerance;
+}
+
+function detectorImpactChips(finding) {
+  const evidence = finding.evidence && typeof finding.evidence === "object"
+    ? finding.evidence
+    : {};
+  if (finding.detection_id === "DX-008") {
+    const capacity = evidence.regional_capacity;
+    if (
+      !capacity
+      || typeof capacity !== "object"
+      || capacity.status !== "quantified"
+      || !isFiniteNonnegativeNumber(capacity.configured_per_region_ru)
+      || !isFiniteNonnegativeNumber(capacity.global_regional_ru)
+    ) {
+      return [];
+    }
+    const chips = [];
+    const rateBasis = evidence.rate_basis;
+    if (
+      isFiniteNonnegativeNumber(finding.estimated_monthly_savings)
+      && finding.estimated_monthly_savings > 0
+      && finding.savings_basis === "customer_amortized_bill"
+      && typeof finding.savings_currency === "string"
+      && finding.savings_currency.trim()
+      && evidence.estimated_monthly_savings === finding.estimated_monthly_savings
+      && evidence.savings_currency === finding.savings_currency
+      && isFiniteNonnegativeNumber(capacity.removable_extra_region_ru)
+      && capacity.removable_extra_region_ru > 0
+      && isFiniteNonnegativeNumber(evidence.effective_rate_usd_per_ru_month)
+      && evidence.effective_rate_usd_per_ru_month > 0
+      && matchesRoundedCurrencyProduct(
+        finding.estimated_monthly_savings,
+        capacity.removable_extra_region_ru,
+        evidence.effective_rate_usd_per_ru_month,
+      )
+      && rateBasis
+      && typeof rateBasis === "object"
+      && rateBasis.rate_source === "customer_amortized_bill"
+      && (
+        rateBasis.rate_scope === "account"
+        || rateBasis.rate_scope === "subscription_fallback"
+      )
+    ) {
+      chips.push(
+        "💰 Customer bill-derived estimate: "
+        + `${money(finding.estimated_monthly_savings, finding.savings_currency)}/mo`,
+      );
+    }
+    chips.push(
+      `${number(capacity.configured_per_region_ru)} RU/s configured per region`,
+      `${number(capacity.global_regional_ru)} regional RU/s globally`,
+    );
+    if (
+      isFiniteNonnegativeNumber(capacity.removable_extra_region_ru)
+      && capacity.removable_extra_region_ru > 0
+    ) {
+      chips.push(
+        `${number(capacity.removable_extra_region_ru)} regional RU/s removable only if `
+        + "unnecessary region(s) are removed",
+      );
+    }
+    return chips;
+  }
+  if (finding.detection_id === "DX-016") {
+    const enrichment = evidence.read_ru_enrichment;
+    if (
+      !enrichment
+      || typeof enrichment !== "object"
+      || enrichment.status !== "observed"
+      || !isFiniteNonnegativeNumber(enrichment.observed_read_request_charge_ru)
+      || !isFiniteNonnegativeNumber(enrichment.upper_bound_avoidable_read_request_charge_ru)
+    ) {
+      return [];
+    }
+    return [
+      `Accumulated observed RequestCharge: ${number(enrichment.observed_read_request_charge_ru)} RU`,
+      "Upper-bound avoidable accumulated RequestCharge: "
+        + `${number(enrichment.upper_bound_avoidable_read_request_charge_ru)} RU`,
+    ];
+  }
+  return [];
+}
+
+function unitLabel(unit) {
+  if (!unit) return "unknown resource";
+  if (unit.level === "account") return unit.account;
+  if (unit.container) return `${unit.database}/${unit.container}`;
+  return unit.database;
+}
+
+function actionableFindings(report) {
+  return (report.findings || [])
+    .filter(f => f.status === "finding" && !resolvedParent(report, f))
+    .sort((a, b) => {
+      const sev = (severityRank[a.severity] ?? 9) - (severityRank[b.severity] ?? 9);
+      if (sev) return sev;
+      return (b.estimated_monthly_savings || 0) - (a.estimated_monthly_savings || 0)
+        || (b.recoverable_ru || 0) - (a.recoverable_ru || 0)
+        || String(a.detection_id || "").localeCompare(String(b.detection_id || ""))
+        || unitLabel(a.unit).localeCompare(unitLabel(b.unit));
+    });
+}
+
+function findingMagnitude(finding) {
+  const detectorChips = detectorImpactChips(finding);
+  if (finding.detection_id === "DX-008" || finding.detection_id === "DX-016") {
+    return detectorChips
+      .map(chip => `<span class="metric-chip">${escapeHtml(chip)}</span>`)
+      .join("");
+  }
+  const chips = detectorChips;
+  if (finding.estimated_monthly_savings !== null && finding.estimated_monthly_savings !== undefined) {
+    const estimate = `${money(finding.estimated_monthly_savings, finding.savings_currency)}/mo`;
+    if (finding.savings_basis === "azure_retail_price") {
+      chips.push(`💰 Azure retail/list-price estimate: ${estimate}`);
+    } else if (finding.savings_basis === "customer_amortized_bill") {
+      chips.push(`💰 Customer bill-derived estimate: ${estimate}`);
+    } else {
+      chips.push(`💰 Savings estimate (provenance unavailable): ${estimate}`);
+    }
+  }
+  if (finding.recoverable_ru) {
+    chips.push(`${number(finding.recoverable_ru)} RU/s reclaimable`);
+  }
+  if (finding.materiality_pct) {
+    chips.push(`${Number(finding.materiality_pct).toFixed(1)}% materiality`);
+  }
+  return chips.map(chip => `<span class="metric-chip">${escapeHtml(chip)}</span>`).join("");
+}
+
+function canonicalResourceMatches(left, right) {
+  if (!left || !right) return false;
+  const normalize = value => String(value).trim().replace(/\/+$/, "").toLowerCase();
+  if (typeof left === "string" || typeof right === "string") {
+    const leftId = typeof left === "string" ? left : left.resource_id;
+    const rightId = typeof right === "string" ? right : right.resource_id;
+    return Boolean(leftId && rightId && normalize(leftId) === normalize(rightId));
+  }
+  for (const field of ["level", "account", "database", "container"]) {
+    if ((left[field] ?? null) !== (right[field] ?? null)) return false;
+  }
+  if (left.resource_id && right.resource_id) {
+    return normalize(left.resource_id) === normalize(right.resource_id);
+  }
+  return true;
+}
+
+const relationshipResolutionCache = new WeakMap();
+
+// Resolve the complete candidate graph iteratively so malformed chains fail open without recursion.
+function relationshipResolution(report) {
+  if (!report || typeof report !== "object") return new Map();
+  const cached = relationshipResolutionCache.get(report);
+  if (cached) return cached;
+
+  const findings = report.findings || [];
+  const candidatesById = new Map();
+  for (const candidate of findings) {
+    if (candidate.status !== "finding") continue;
+    const candidates = candidatesById.get(candidate.detection_id) || [];
+    candidates.push(candidate);
+    candidatesById.set(candidate.detection_id, candidates);
+  }
+
+  const candidateParents = new Map();
+  for (const finding of findings) {
+    const declarations = ["related_parent", "superseded_by"]
+      .filter(field => finding[field] !== null && finding[field] !== undefined)
+      .map(field => finding[field]);
+    if (!declarations.length || declarations.some(value => (
+      typeof value !== "string" || !value || value !== value.trim()
+    ))) {
+      candidateParents.set(finding, null);
+      continue;
+    }
+    const parentIds = new Set(declarations);
+    if (parentIds.size !== 1 || parentIds.has(finding.detection_id)) {
+      candidateParents.set(finding, null);
+      continue;
+    }
+    const [parentId] = parentIds;
+    const parents = (candidatesById.get(parentId) || []).filter(candidate => (
+      candidate !== finding && canonicalResourceMatches(candidate.unit, finding.unit)
+    ));
+    candidateParents.set(finding, parents.length === 1 ? parents[0] : null);
+  }
+
+  const chainState = new Map();
+  for (const finding of findings) {
+    if (chainState.has(finding)) continue;
+    const path = [];
+    const pathIndexes = new Map();
+    let current = finding;
+    let invalidChain = false;
+    while (current && !chainState.has(current) && !pathIndexes.has(current)) {
+      pathIndexes.set(current, path.length);
+      path.push(current);
+      current = candidateParents.get(current);
+    }
+    if (current && pathIndexes.has(current)) {
+      invalidChain = true;
+    } else if (current) {
+      invalidChain = chainState.get(current) === "invalid";
+    }
+    for (const member of path) {
+      chainState.set(member, invalidChain ? "invalid" : "valid");
+    }
+  }
+
+  const resolved = new Map();
+  for (const finding of findings) {
+    const parent = candidateParents.get(finding);
+    resolved.set(
+      finding,
+      chainState.get(finding) === "valid" && parent && !candidateParents.get(parent)
+        ? parent
+        : null,
+    );
+  }
+  relationshipResolutionCache.set(report, resolved);
+  return resolved;
+}
+
+// Resolve relationship markers again at the trust boundary so malformed API data fails open.
+function resolvedParent(report, finding) {
+  return relationshipResolution(report).get(finding) || null;
+}
+
+function proposedCutoffNote(finding) {
+  const evidence = finding.evidence && typeof finding.evidence === "object" ? finding.evidence : {};
+  const cutoffs = Object.entries(evidence)
+    .filter(([key, value]) => (
+      (key.includes("threshold") || key.includes("cutoff") || key.startsWith("min_"))
+      && ["string", "number"].includes(typeof value)
+    ))
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, value]) => `${key.replaceAll("_", " ")} = ${value}`);
+  if (!cutoffs.length) {
+    return "Proposed classification: this detector uses a configuration-based classification "
+      + "that is still being calibrated.";
+  }
+  return `Proposed cutoff: ${cutoffs.join("; ")}. Review this cutoff against your workload.`;
+}
+
+function relatedSignals(report, parent) {
+  return (report.findings || [])
+    .filter(f => (
+      f.related_parent !== null
+      && f.related_parent !== undefined
+      && resolvedParent(report, f) === parent
+    ))
+    .sort((a, b) => (
+      (severityRank[a.severity] ?? 9) - (severityRank[b.severity] ?? 9)
+      || String(a.detection_id || "").localeCompare(String(b.detection_id || ""))
+      || String(a.title || "").localeCompare(String(b.title || ""))
+      || String(a.summary || "").localeCompare(String(b.summary || ""))
+    ));
+}
+
+function renderRelatedSignals(report, parent) {
+  const related = relatedSignals(report, parent);
+  if (!related.length) return "";
+  return `
+    <details>
+      <summary>Related signals (${related.length})</summary>
+      ${related.map(f => `
+        <div>
+          <div><strong>Detector ID:</strong> ${escapeHtml(f.detection_id)}</div>
+          <div><strong>Title:</strong> ${escapeHtml(f.title)}</div>
+          <div><strong>Severity:</strong> ${escapeHtml(f.severity || "none")}</div>
+          <div><strong>Resource:</strong> ${escapeHtml(unitLabel(f.unit))}</div>
+          <div><strong>Summary:</strong> ${escapeHtml(f.summary)}</div>
+        </div>`).join("")}
+    </details>`;
+}
+
+// Account findings open the account resource; database/container findings open Data Explorer.
+function portalLink(report, finding) {
+  const label = escapeHtml(unitLabel(finding.unit));
+  const fallback = `<div class="muted">${label}</div>`;
+  if (!finding.unit) return fallback;
+  const codaPortalLink = window.CODA_PORTAL_LINK;
+  if (!codaPortalLink) return fallback;
+  const accountResourceId = (report && report.account_resource_id)
+    || (finding.unit && finding.unit.resource_id);
+  const builder = finding.unit.level === "account"
+    ? codaPortalLink.buildAccountUrl
+    : codaPortalLink.buildDataExplorerUrl;
+  if (typeof builder !== "function") return fallback;
+  const href = builder(accountResourceId, {
+    subscription: (report && report.subscription) || currentSubscription(),
+    resource_group: report && report.resource_group,
+    account: (report && report.account) || finding.unit.account,
+  });
+  if (!href) return fallback;
+  return `<div><a class="muted" href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer" title="Open in Azure Portal" aria-label="Open in Azure Portal">${label}<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" style="margin-left: 0.25rem; vertical-align: -0.1em;" aria-hidden="true" focusable="false"><path d="M6 3h7v7M13 3 5 11"></path><path d="M11 9v4H3V5h4"></path></svg></a></div>`;
+}
+
+function renderFindingCard(finding, report) {
+  const severity = finding.severity || "none";
+  return `
+    <article class="finding-card">
+      <div class="finding-title">
+        <span class="severity ${escapeHtml(severity)}">${escapeHtml(severity)}</span>
+        <span class="finding-id">${escapeHtml(finding.detection_id)}</span>
+        <h4>${escapeHtml(finding.title)}</h4>
+      </div>
+      ${portalLink(report, finding)}
+      <div class="magnitude">${findingMagnitude(finding)}</div>
+      <p class="summary">${escapeHtml(finding.summary)}</p>
+      ${finding.recommended_action ? `<p><strong>Recommended:</strong> ${escapeHtml(finding.recommended_action)}</p>` : ""}
+      ${finding.threshold_status === "proposal" ? `<div class="calibrating">${escapeHtml(proposedCutoffNote(finding))}</div>` : ""}
+      ${renderRelatedSignals(report, finding)}
+    </article>`;
+}
+
+function groupAbstained(findings) {
+  const groups = new Map();
+  for (const f of findings.filter(item => item.status === "abstained")) {
+    const key = `${f.detection_id}|${f.title}|${f.summary}`;
+    const group = groups.get(key) || { detection_id: f.detection_id, title: f.title, summary: f.summary, count: 0 };
+    group.count += 1;
+    groups.set(key, group);
+  }
+  return Array.from(groups.values()).sort((a, b) => a.detection_id.localeCompare(b.detection_id));
+}
+
+function renderIncomplete(findings) {
+  const groups = groupAbstained(findings);
+  const laBlocked = findings.filter(f => f.evidence && f.evidence.la_unavailable);
+  if (!groups.length && !laBlocked.length) return "";
+  const incompleteCount = groups.reduce((total, group) => total + group.count, 0);
+  const abstained = groups.length ? `
+    <ul>
+      ${groups.map(g => `<li><strong>${escapeHtml(g.title)}</strong> (${escapeHtml(g.detection_id)}) — ${escapeHtml(g.summary)} <span class="muted">· ${g.count} detector/resource evaluation(s)</span></li>`).join("")}
+    </ul>` : `<p class="muted">No abstained checks.</p>`;
+  const callouts = laBlocked.length ? `
+    <div class="callout">
+      <strong>Log Analytics prevented ${laBlocked.length} detector/resource evaluation(s).</strong>
+      <p class="muted">${escapeHtml(laBlocked[0].evidence.guidance || "Turn on Cosmos DB diagnostic settings in resource-specific mode and send categories to Log Analytics.")}</p>
+      <p><a href="https://learn.microsoft.com/en-us/azure/cosmos-db/monitor-resource-logs?tabs=azure-portal#create-diagnostic-settings" target="_blank" rel="noopener noreferrer">Set up resource-specific logs in Log Analytics (Microsoft Learn)</a></p>
+    </div>` : "";
+  return `
+    <details>
+      <summary>Detector/resource evaluations we couldn't complete (${incompleteCount})</summary>
+      ${callouts}
+      ${abstained}
+    </details>`;
+}
+
+function renderAccountReport(report) {
+  const summary = report.summary || {};
+  const actionable = actionableFindings(report);
+  const hasEstimatedSavings = isFiniteNonnegativeNumber(summary.total_estimated_monthly_savings)
+    && summary.total_estimated_monthly_savings > 0;
+  const hasRecoverableRu = typeof summary.total_recoverable_ru === "number"
+    && Number.isFinite(summary.total_recoverable_ru)
+    && summary.total_recoverable_ru > 0;
+  const hasDetectorImpact = actionable.some(
+    finding => !finding.superseded_by && detectorImpactChips(finding).length > 0,
+  );
+  const headline = hasEstimatedSavings
+    ? `💰 ${money(summary.total_estimated_monthly_savings, summary.savings_currency)}/mo`
+    : hasRecoverableRu
+      ? `${number(summary.total_recoverable_ru)} RU/s`
+      : hasDetectorImpact
+        ? "See finding details"
+        : "Savings not quantified";
+  const headlineLabel = hasEstimatedSavings
+    ? "Customer bill-derived monthly savings"
+    : hasRecoverableRu
+      ? `Recoverable RU/s of ${number(summary.scope_provisioned_ru)} provisioned`
+      : hasDetectorImpact
+        ? "Quantified detector impact"
+        : "Customer bill-derived savings estimate";
+  el.results.innerHTML = `
+    <div class="headline">
+      <div class="panel tile"><div class="k">${escapeHtml(headlineLabel)}</div><div class="v accent">${escapeHtml(headline)}</div></div>
+      <div class="panel tile"><div class="k">Actionable findings</div><div class="v">${number(summary.actionable_findings)}</div></div>
+      <div class="panel tile"><div class="k">Resources scanned</div><div class="v">${number(summary.units_scanned)}</div></div>
+      <div class="panel tile"><div class="k">Checks abstained</div><div class="v">${number(summary.abstained)}</div></div>
+    </div>
+    <section class="panel section">
+      <div class="section-header">
+        <div>
+          <h3>${escapeHtml(report.account)} findings</h3>
+        </div>
+        <span class="pill">${escapeHtml(report.mode)} mode</span>
+      </div>
+      <div class="cards">
+        ${actionable.length ? actionable.map(f => renderFindingCard(f, report)).join("") : `<div class="empty">No actionable findings in this report.</div>`}
+      </div>
+    </section>
+    ${renderIncomplete(report.findings || [])}`;
+}
+
+function renderFindingsByDetector(scan) {
+  const entries = Object.entries(scan.findings_by_detection || {});
+  if (!entries.length) return `<div class="empty">No actionable findings by detector.</div>`;
+  return `
+    <table>
+      <thead><tr><th>Detector</th><th>Count</th><th>Severity mix</th></tr></thead>
+      <tbody>
+        ${entries.map(([detector, data]) => `
+          <tr>
+            <td><span class="finding-id">${escapeHtml(detector)}</span></td>
+            <td>${number(data.count)}</td>
+            <td>${escapeHtml(Object.entries(data.by_severity || {}).map(([sev, count]) => `${sev}: ${count}`).join(", ") || "none")}</td>
+          </tr>`).join("")}
+      </tbody>
+    </table>`;
+}
+
+function renderPerAccount(scan) {
+  const rows = scan.per_account || [];
+  if (!rows.length) return `<div class="empty">No accounts returned.</div>`;
+  return `
+    <table>
+      <thead><tr><th>Resource group</th><th>Account</th><th>Status</th><th>Findings</th><th>Recoverable RU/s</th><th>Abstained</th></tr></thead>
+      <tbody>
+        ${rows.map((row, index) => `
+          <tr class="clickable" data-row="${index}" title="Click to drill into this account">
+            <td>${escapeHtml(row.resource_group)}</td>
+            <td>${escapeHtml(row.account)}</td>
+            <td>${escapeHtml(row.status)}${row.la_missing ? " · LA missing" : ""}</td>
+            <td>${number(row.actionable)}</td>
+            <td>${number(row.recoverable_ru)}</td>
+            <td>${number(row.abstained)}</td>
+          </tr>`).join("")}
+      </tbody>
+    </table>`;
+}
+
+function healthDot(row) {
+  let cls = "d-quiet";
+  if (row.error) cls = "d-err";
+  else if (row.severity === "high") cls = "d-high";
+  else if (row.severity === "medium") cls = "d-med";
+  else if (row.status === "healthy") cls = "d-ok";
+  return `<span class="sev-dot ${cls}"></span>`;
+}
+
+function statusBreakdown(by) {
+  by = by || {};
+  return ["throttling", "saturated", "healthy", "quiet"].filter(k => by[k]).map(k => `${by[k]} ${shallowStatusLabel(k)}`).join(" · ") || "no data";
+}
+
+function shallowStatusLabel(status) {
+  if (status === "healthy") return "No recent pressure (24h)";
+  if (status === "quiet") return "No recent traffic (24h)";
+  return status;
+}
+
+function renderShallowAccounts(rows) {
+  if (!rows.length) return `<div class="empty">No accounts.</div>`;
+  return `
+    <table>
+      <thead><tr><th>Resource group</th><th>Account</th><th>24h account-level signal</th><th>Throttle %</th><th>Peak sat %</th><th>Signal</th></tr></thead>
+      <tbody>
+        ${rows.map(row => `
+          <tr class="clickable" data-rg="${escapeHtml(row.resource_group)}" data-account="${escapeHtml(row.account)}" title="Click to run the deep single-account diagnosis">
+            <td>${escapeHtml(row.resource_group)}</td>
+            <td>${escapeHtml(row.account)}</td>
+            <td>${healthDot(row)}${escapeHtml(row.error ? "error" : shallowStatusLabel(row.status))}</td>
+            <td>${row.error ? "—" : escapeHtml(String(row.throttle_pct))}</td>
+            <td>${row.error ? "—" : escapeHtml(String(row.peak_saturation_pct))}</td>
+            <td class="muted">${escapeHtml(row.error || row.reason || "")}</td>
+          </tr>`).join("")}
+      </tbody>
+    </table>`;
+}
+
+function renderScan(scan) {
+  state.lastScan = scan;
+  if (scan.mode === "shallow") renderShallowScan(scan);
+  else renderDeepScan(scan);
+}
+
+function renderShallowScan(scan) {
+  const bySev = scan.by_severity || {};
+  const problems = scan.problems || [];
+  el.results.innerHTML = `
+    <div class="headline">
+      <div class="panel tile"><div class="k">Accounts scanned</div><div class="v">${number(scan.accounts_scanned)}</div></div>
+      <div class="panel tile"><div class="k">Accounts with pressure</div><div class="v accent">${number(scan.problem_accounts)}</div></div>
+      <div class="panel tile"><div class="k">High / Medium</div><div class="v">${number(bySev.high || 0)} / ${number(bySev.medium || 0)}</div></div>
+      <div class="panel tile"><div class="k">Elapsed</div><div class="v">${escapeHtml(String(scan.elapsed_s))}s</div></div>
+    </div>
+    <section class="panel section">
+      <div class="section-header"><h3>Recent account-level pressure · Tier 1</h3><span class="pill">shallow · 24h · no Log Analytics</span></div>
+      <p class="muted">${escapeHtml(statusBreakdown(scan.by_status))}${scan.accounts_errored ? ` · ${number(scan.accounts_errored)} unreadable` : ""}. Shallow checks only account-level throttling and saturation; Deep may find configuration, cost, per-resource, or older-window issues. Click any account to run Deep.</p>
+      ${problems.length ? `<h4 class="subhead">Accounts with recent pressure</h4>${renderShallowAccounts(problems)}` : `<div class="empty">No account-level throttling or saturation detected in the last 24 hours. Deep may still find other issues.</div>`}
+    </section>
+    <section class="panel section">
+      <div class="section-header"><h3>Accounts in ${escapeHtml(scan.resource_group)}</h3><span class="muted">Click a row to drill in.</span></div>
+      ${renderShallowAccounts(scan.per_account || [])}
+    </section>`;
+  el.results.querySelectorAll("tr.clickable").forEach(row => {
+    row.addEventListener("click", () => {
+      const rg = row.dataset.rg, account = row.dataset.account;
+      if (rg && account) diagnoseAccount(rg, account, "deep");  // drill-in is always the deep diagnosis
+    });
+  });
+}
+
+function renderDeepScan(scan) {
+  el.results.innerHTML = `
+    <div class="headline">
+      <div class="panel tile"><div class="k">Accounts scanned</div><div class="v">${number(scan.accounts_scanned)}</div></div>
+      <div class="panel tile"><div class="k">Accounts with findings</div><div class="v">${number(scan.accounts_with_findings)}</div></div>
+      <div class="panel tile"><div class="k">Actionable findings</div><div class="v">${number(scan.total_actionable_findings)}</div></div>
+      <div class="panel tile"><div class="k">Recoverable RU/s</div><div class="v accent">${number(scan.total_recoverable_ru)}</div></div>
+    </div>
+    <section class="panel section">
+      <div class="section-header"><h3>Findings by detector</h3><span class="pill">${escapeHtml(scan.mode)} mode · ${escapeHtml(String(scan.elapsed_s))}s (deep)</span></div>
+      ${renderFindingsByDetector(scan)}
+    </section>
+    <section class="panel section">
+      <div class="section-header"><h3>Accounts in ${escapeHtml(scan.resource_group)}</h3><span class="muted">Click a row to drill in.</span></div>
+      ${renderPerAccount(scan)}
+    </section>`;
+  el.results.querySelectorAll("tr[data-row]").forEach(row => {
+    row.addEventListener("click", () => {
+      const item = (state.lastScan.per_account || [])[Number(row.dataset.row)];
+      if (item) diagnoseAccount(item.resource_group, item.account, "deep");
+    });
+  });
+}
+
+async function loadDetectors() {
+  try {
+    const data = await apiGet("/api/detectors");
+    el.detectorsTitle.textContent = `What CODA checks (${data.count} detectors)`;
+    el.detectorList.innerHTML = (data.detectors || []).map(detector => `
+      <li>
+        <span><span class="detector-id">${escapeHtml(detector.detection_id)}</span> ${escapeHtml(detector.title)}</span>
+        <span class="detector-meta">${escapeHtml((detector.scopes || []).join(", "))}</span>
+      </li>`).join("");
+  } catch (err) {
+    el.detectorList.innerHTML = `<li class="error">${escapeHtml(err.message)}</li>`;
+  }
+}
+
+async function loadSubscriptions(preferredId = currentSubscription()) {
+  setBusy(true, "Loading Azure subscriptions...");
+  try {
+    const data = await apiGet(`/api/subscriptions?all=1`);
+    state.subscriptions = data || [];
+    // No default/auto-selected subscription (customer-web-ux/spec.md, "Customer app has no
+    // default subscription or account selection"): the picker always starts on an explicit
+    // empty prompt, and only a caller-supplied `preferredId` (never the first result) selects one.
+    el.subscriptionPicker.innerHTML = state.subscriptions.length
+      ? `<option value="">Select a subscription…</option>` + state.subscriptions.map(sub => `<option value="${escapeHtml(sub.id)}">${escapeHtml(sub.name)} (${escapeHtml(sub.id)})</option>`).join("")
+      : `<option value="">No matching subscriptions found</option>`;
+    const match = preferredId ? state.subscriptions.find(sub => sub.id === preferredId) : null;
+    if (match) {
+      el.subscriptionPicker.value = match.id;
+    } else {
+      el.subscriptionPicker.value = "";
+    }
+    resetAccounts();
+    setStatus(state.subscriptions.length ? `Loaded ${state.subscriptions.length} subscription(s).`
+      : "No subscriptions were found for this identity.",
+      state.subscriptions.length === 0);
+  } catch (err) {
+    el.subscriptionPicker.innerHTML = `<option value="">Subscription discovery failed</option>`;
+    setStatus(err.message, true);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function loadAccounts() {
+  const subscription = currentSubscription();
+  if (!subscription) return;
+  const requestVersion = ++state.accountRequestVersion;
+  state.accounts = [];
+  el.resourceGroupPicker.innerHTML = `<option value="">Loading resource groups…</option>`;
+  el.resourceGroupPicker.value = "";
+  resetAccountSelection();
+  setBusy(true, "Loading Cosmos DB accounts…");
+  try {
+    const data = await apiGet(`/api/accounts?subscription=${encodeURIComponent(subscription)}`);
+    if (requestVersion !== state.accountRequestVersion || subscription !== currentSubscription()) return;
+    state.accounts = (Array.isArray(data.accounts) ? data.accounts : []).filter(account => (
+      account && typeof account.resource_group === "string" && account.resource_group
+      && typeof account.account === "string" && account.account
+    ));
+    const resourceGroups = [...new Set(state.accounts.map(account => account.resource_group))]
+      .sort((left, right) => left.localeCompare(right));
+    el.resourceGroupPicker.innerHTML = resourceGroups.length
+      ? `<option value="">Choose a resource group…</option>` + resourceGroups.map(resourceGroup => (
+        `<option value="${escapeHtml(resourceGroup)}">${escapeHtml(resourceGroup)}</option>`
+      )).join("")
+      : `<option value="">No resource groups found</option>`;
+    el.resourceGroupPicker.value = "";
+    resetAccountSelection();
+    setStatus(
+      `Loaded ${state.accounts.length} account(s) in ${resourceGroups.length} resource group(s).`
+    );
+  } catch (err) {
+    if (requestVersion !== state.accountRequestVersion) return;
+    state.accounts = [];
+    el.resourceGroupPicker.innerHTML = `<option value="">Resource group discovery failed</option>`;
+    el.resourceGroupPicker.value = "";
+    resetAccountSelection();
+    setStatus(err.message, true);
+  } finally {
+    if (requestVersion === state.accountRequestVersion) setBusy(false);
+  }
+}
+
+async function diagnoseAccount(resourceGroup, account, depth) {
+  const subscription = currentSubscription();
+  if (!subscription || !resourceGroup || !account) return;
+  depth = depth || currentDepth();
+  setBusy(true, `Analyzing ${account}${depth === "shallow" ? " (quick 24h pressure check)" : ""}…`);
+  try {
+    const report = await apiPost("/api/diagnose", {
+      subscription,
+      resource_group: resourceGroup,
+      account,
+      mode: currentMode(),
+      depth,
+    });
+    if (report.depth === "shallow") {
+      renderShallowAccountCard(report);
+      setStatus(`${account}: ${shallowStatusLabel(report.status)}${report.severity !== "none" ? ` (${report.severity})` : ""}. Shallow checked only 24h account-level throttling and saturation.`);
+    } else {
+      renderAccountReport(report);
+      const count = actionableFindings(report).length;
+      setStatus(`Diagnosed ${account}: ${count} actionable finding(s).`);
+    }
+  } catch (err) {
+    setStatus(err.message, true);
+  } finally {
+    setBusy(false);
+  }
+}
+
+function renderShallowAccountCard(r) {
+  let sevClass = "d-quiet";
+  if (r.error) sevClass = "d-err";
+  else if (r.severity === "high") sevClass = "d-high";
+  else if (r.severity === "medium") sevClass = "d-med";
+  else if (r.status === "healthy") sevClass = "d-ok";
+  el.results.innerHTML = `
+    <div class="headline">
+      <div class="panel tile"><div class="k">24h account-level signal</div><div class="v"><span class="sev-dot ${sevClass}"></span>${escapeHtml(r.error ? "error" : shallowStatusLabel(r.status))}</div></div>
+      <div class="panel tile"><div class="k">Throttle %</div><div class="v">${r.error ? "—" : escapeHtml(String(r.throttle_pct))}</div></div>
+      <div class="panel tile"><div class="k">Peak saturation %</div><div class="v">${r.error ? "—" : escapeHtml(String(r.peak_saturation_pct))}</div></div>
+      <div class="panel tile"><div class="k">Requests (24h)</div><div class="v">${r.error ? "—" : number(r.total_requests)}</div></div>
+    </div>
+    <section class="panel section">
+      <div class="section-header"><h3>${escapeHtml(r.account)} — shallow pressure check · Tier 1</h3><span class="pill">account-level · 24h · no Log Analytics</span></div>
+      <p>${escapeHtml(r.error || r.reason || "")}</p>
+      <p class="muted">Shallow checked only account-level throttling and saturation in the last 24 hours. Deep may find configuration, cost, per-resource, or older-window issues.${r.severity === "none" ? "" : " Switch <strong>Depth</strong> to Deep and re-analyze for per-resource root cause and fixes."}</p>
+    </section>`;
+}
+
+async function analyzeSelectedAccount() {
+  const selected = state.accounts[Number(el.accountPicker.value)];
+  if (selected) diagnoseAccount(selected.resource_group, selected.account);
+}
+
+async function scanResourceGroup() {
+  const subscription = currentSubscription();
+  const resourceGroup = el.resourceGroupPicker.value;
+  if (!subscription || !resourceGroup) {
+    setStatus("Select a subscription and resource group before scanning.", true);
+    return;
+  }
+  const depth = currentDepth();
+  setBusy(true, depth === "deep"
+    ? `Deep-scanning accounts in ${resourceGroup} — this can take minutes for large resource groups…`
+    : `Scanning ${resourceGroup} (Tier 1 · shallow)…`);
+  try {
+    const scan = await apiPost("/api/scan", {
+      subscription, resource_group: resourceGroup, depth, mode: currentMode(),
+    });
+    renderScan(scan);
+    if (scan.mode === "shallow")
+      setStatus(`Scanned ${scan.accounts_scanned} account(s) in ${resourceGroup} in ${scan.elapsed_s}s — ${scan.problem_accounts} account(s) with recent pressure. Shallow checked only 24h account-level throttling and saturation.`);
+    else
+      setStatus(`Deep-scanned ${scan.accounts_scanned} account(s) in ${resourceGroup} — ${scan.total_actionable_findings} actionable finding(s).`);
+  } catch (err) {
+    setStatus(err.message, true);
+  } finally {
+    setBusy(false);
+  }
+}
+
+el.subscriptionPicker.addEventListener("change", () => {
+  resetAccounts();
+  updateControls();
+  loadAccounts();
+});
+el.resourceGroupPicker.addEventListener("change", populateAccountsForSelectedGroup);
+el.accountPicker.addEventListener("change", updateControls);
+el.analyzeAccount.addEventListener("click", analyzeSelectedAccount);
+el.scanResourceGroup.addEventListener("click", scanResourceGroup);
+
+const themeToggle = document.getElementById("themeToggle");
+function renderThemeToggle() {
+  const dark = document.documentElement.getAttribute("data-theme") === "dark";
+  themeToggle.textContent = dark ? "☀ Light mode" : "🌙 Dark mode";
+}
+themeToggle.addEventListener("click", () => {
+  const next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
+  document.documentElement.setAttribute("data-theme", next);
+  localStorage.setItem("codaTheme", next);
+  renderThemeToggle();
+});
+renderThemeToggle();
+
+// Explicit, user-initiated sign-in only: nothing here calls /api/auth/sign-in on its own.
+// `require_local_identity` (coda_web.local_auth) never resolves a credential until this
+// "Sign in" control is clicked, so startup only ever checks status, never signs in.
+async function checkSignedIn() {
+  const status = await apiGet("/api/auth/status");
+  if (status.signed_in) {
+    el.codaAuthShell.hidden = true;
+    document.body.classList.remove("coda-auth-required");
+    return true;
+  }
+  el.codaAuthShell.hidden = false;
+  document.body.classList.add("coda-auth-required");
+  return false;
+}
+
+async function startAuthenticatedSession() {
+  loadDetectors();
+  loadSubscriptions().then(() => { if (currentSubscription()) loadAccounts(); });
+  updateControls();
+}
+
+el.codaSignIn.addEventListener("click", async () => {
+  el.codaSignIn.disabled = true;
+  el.codaAuthMessage.textContent = "Signing in…";
+  try {
+    await apiPost("/api/auth/sign-in", {});
+    el.codaAuthShell.hidden = true;
+    document.body.classList.remove("coda-auth-required");
+    await startAuthenticatedSession();
+  } catch (err) {
+    el.codaAuthMessage.textContent = err.message;
+  } finally {
+    el.codaSignIn.disabled = false;
+  }
+});
+
+async function initializeApplication() {
+  const signedIn = await checkSignedIn();
+  if (signedIn) await startAuthenticatedSession();
+}
+initializeApplication();
+</script>
+</body>
+</html>

@@ -1,0 +1,82 @@
+name: Diagnostic feedback
+description: Tell us whether CODA's findings and severities were correct and useful.
+title: "[feedback] "
+labels: ["diagnostic-feedback"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve CODA. Feedback is most useful when you know the analyzed account
+        well and can explain where a finding is correct, incorrect, or missing.
+
+        **Privacy:** Attach only the `*-redacted.json` artifact. Do not paste or attach the full
+        report because it can contain resource names. Review the redacted artifact before sharing it,
+        and do not include credentials, customer data, or other sensitive information.
+  - type: input
+    id: account_familiarity
+    attributes:
+      label: How well do you know the account you analyzed?
+      description: Explain whether you operate the account and understand its workload.
+      placeholder: I operate this account and know its workload well.
+    validations:
+      required: true
+  - type: dropdown
+    id: overall
+    attributes:
+      label: Overall, were the findings correct and useful?
+      options:
+        - "Useful — I would act on these findings"
+        - "Mixed — some findings were useful and some were not"
+        - "Not useful"
+    validations:
+      required: true
+  - type: textarea
+    id: redacted
+    attributes:
+      label: Redacted artifact
+      description: Attach the `*-redacted.json` artifact or paste its contents.
+      placeholder: Drag the *-redacted.json artifact here, or paste it.
+    validations:
+      required: true
+  - type: textarea
+    id: wrong
+    attributes:
+      label: What did CODA get wrong?
+      description: Identify false positives by detection ID and hashed resource, and explain why.
+    validations:
+      required: false
+  - type: textarea
+    id: actionable
+    attributes:
+      label: Are the recommendations safe and actionable?
+      description: Explain whether you would follow the suggested next steps.
+    validations:
+      required: false
+  - type: textarea
+    id: severity
+    attributes:
+      label: Were the severities appropriate?
+      description: Identify findings rated too high or too low.
+    validations:
+      required: false
+  - type: textarea
+    id: missed
+    attributes:
+      label: What did CODA miss?
+      description: Describe a known issue that CODA did not report.
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: CODA version
+      description: Enter the version shown by the release you installed.
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy confirmation
+      options:
+        - label: I reviewed and attached only the `*-redacted.json` artifact, not the full report.
+          required: true
