@@ -14,15 +14,120 @@ CODA prefers Log-Analytics-backed detections for durable fixtures.
 
 from __future__ import annotations
 
+import math
 import threading
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
+from enum import Enum
 from typing import Any, TypeVar
 
 from azure.core.credentials import TokenCredential
 from azure.monitor.query import LogsQueryClient, LogsQueryStatus
 
+from coda_core.providers.base import TimeWindow
+
 _T = TypeVar("_T")
+
+
+class DataPlaneSource(str, Enum):
+    """One request-log source; aggregates and raw records must never be added together."""
+
+    RAW = "CDBDataPlaneRequests"
+    FIVE_MINUTE = "CDBDataPlaneRequests5M"
+
+    @property
+    def charge(self) -> str:
+        """Select total RU, not an unweighted average of aggregate rows."""
+        return "TotalRequestCharge" if self is self.FIVE_MINUTE else "RequestCharge"
+
+    @property
+    def count(self) -> str:
+        """Count represented requests rather than aggregate records."""
+        return "sum(RequestCount)" if self is self.FIVE_MINUTE else "count()"
+
+    def count_if(self, predicate: str) -> str:
+        """Count requests satisfying a trusted detector-authored predicate."""
+        if self is self.FIVE_MINUTE:
+            return f"sumif(RequestCount, {predicate})"
+        return f"countif({predicate})"
+
+    @property
+    def burst_interval(self) -> str:
+        """Keep raw one-minute evidence distinct from five-minute burst evidence."""
+        return "5m" if self is self.FIVE_MINUTE else "1m"
+
+    @property
+    def invalid_rows(self) -> str:
+        """Make malformed aggregate inputs observable instead of summing past nulls."""
+        if self is self.RAW:
+            return ""
+        return (
+            ", invalid_rows = countif(isnull(RequestCount) or RequestCount <= 0 "
+            "or floor(RequestCount, 1.0) != RequestCount "
+            "or isnull(TotalRequestCharge) or TotalRequestCharge < 0 "
+            "or TimeGenerated != bin(TimeGenerated, 5m))"
+        )
+
+    def anchor(self, now: datetime) -> datetime:
+        """End production analysis at a complete bucket without shortening its duration."""
+        if self is self.RAW:
+            return now
+        return now - timedelta(
+            minutes=now.minute % 5, seconds=now.second, microseconds=now.microsecond
+        )
+
+    def validate_window(self, window: TimeWindow) -> None:
+        """Reject partial aggregate buckets in explicit windows instead of inventing a split."""
+        if self is self.FIVE_MINUTE and any(
+            boundary.timestamp() % 300 != 0 for boundary in (window.start, window.end)
+        ):
+            raise ValueError("Five-minute request logs require five-minute-aligned window boundaries.")
+
+    def query_table(self, window: TimeWindow | None = None) -> str:
+        """Enforce half-open bucket bounds explicitly rather than relying on API endpoint rules."""
+        if self is self.RAW:
+            return f"{self.value} "
+        if window is None:
+            raise ValueError("Five-minute request queries require an explicit observation window.")
+        self.validate_window(window)
+        return (
+            f"{self.value} | where TimeGenerated >= datetime({window.start.isoformat()}) "
+            f"and TimeGenerated < datetime({window.end.isoformat()}) "
+        )
+
+    def validate_rows(self, rows: list[dict], *, counts: tuple[str, ...], charges: tuple[str, ...]) -> None:
+        """Reject incomplete/nonfinite aggregate totals before they can become a clean verdict."""
+        if self is self.RAW:
+            return
+        for row in rows:
+            if row.get("invalid_rows") != 0:
+                raise ValueError("Five-minute request logs contain invalid or unchecked aggregate rows.")
+            for key in (*counts, *charges):
+                value = row.get(key)
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(value)
+                    or value < 0
+                    or (key in counts and int(value) != value)
+                ):
+                    raise ValueError(f"Invalid five-minute request aggregate: {key}.")
+
+    def evidence(self, window: TimeWindow) -> dict:
+        """Expose the actual source and absolute window, not an implied raw-log observation."""
+        return {
+            "source_table": self.value,
+            "source_resolution": "PT5M" if self is self.FIVE_MINUTE else "per_request",
+            "coverage_note": (
+                "Table availability and row counts do not establish collection continuity. "
+                "Resource-context queries can include multiple diagnostic destinations."
+            ),
+            "observation_window": {
+                "start_utc": window.start.isoformat(),
+                "end_utc": window.end.isoformat(),
+                "semantics": "[start,end)",
+            },
+        }
 
 
 def _error_text(value: object) -> str:

@@ -59,9 +59,9 @@ def main() -> None:
                         help="[eval only] Eval-window size in hours (default 24). Sized to the signal "
                              "duration: a short window avoids diluting a sustained burst's p99.")
     parser.add_argument("--window-end", default=None,
-                        help="[eval only] ISO-8601 end anchor for the eval window (default: now). Pin "
+                        help="[eval only] ISO-8601 end anchor (default: automatic). Pin "
                              "to a past window for forensics or fixtures whose load ran earlier "
-                             "(e.g. 2026-06-22T03:00:00Z).")
+                             "(e.g. 2026-06-22T03:00:00Z). Five-minute logs require aligned boundaries.")
     parser.add_argument("--out-dir", default=None)
     parser.add_argument("--redact", action="store_true",
                         help="Also write a PII-safe *-redacted.json (hashed names, no query text / "

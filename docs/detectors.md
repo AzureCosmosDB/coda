@@ -122,7 +122,8 @@ is not a finding.
 ### DX-003 - Shared-throughput starvation
 
 Runs at shared-database scope. Looks for a throttling pool where one active container dominates RU
-consumption while a low-consumption sibling also throttles. Requires **`CDBDataPlaneRequests`**.
+consumption while a low-consumption sibling also throttles. Prefers **`CDBDataPlaneRequests5M`**,
+with **`CDBDataPlaneRequests`** compatibility when five-minute logs are unavailable.
 This is evidence of unfair contention, not visibility into Cosmos DB's exact internal pool allocation.
 Evaluate dedicated throughput or workload isolation/rebalancing.
 
@@ -154,10 +155,13 @@ requesting a merge; CODA does not perform it.
 
 ### DX-010 - Uncontrolled ingestion
 
-Uses **`CDBDataPlaneRequests`** to identify write-dominant throttling: current gates include at least
+Prefers **`CDBDataPlaneRequests5M`**, with raw **`CDBDataPlaneRequests`** compatibility, to identify
+write-dominant throttling: current gates include at least
 80% write RU, 10% throttled requests, and 1,000 total requests. Burstiness and client user-agent are
 supporting evidence, not proof of a particular connector or a required burst gate. Review bounded
-concurrency, throughput control, queue smoothing, and retry-after handling.
+concurrency, throughput control, queue smoothing, and retry-after handling. Burst evidence is
+explicitly five-minute when using aggregates and one-minute when using raw logs; those factors
+are not interchangeable. Counts use represented requests, not aggregate rows.
 
 ### DX-018 - Serverless throttling
 
@@ -199,7 +203,8 @@ that an individual logical partition has reached its size limit.
 
 Flags Strong or Bounded Staleness consistency across multiple regions. Review consistency and
 latency/availability requirements before relaxing them; a single-region account is not flagged by
-this configuration rule. Optional `CDBDataPlaneRequests` enrichment summarizes read/query charges
+this configuration rule. Optional enrichment prefers `CDBDataPlaneRequests5M`, with raw
+`CDBDataPlaneRequests` compatibility, to summarize read/query charges
 and a labelled half-charge upper bound, not a promised bill reduction.
 
 ### DX-017 - Rapid storage growth

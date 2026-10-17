@@ -45,6 +45,63 @@ Log Analytics is optional: four detectors require its resource-specific logs. Ot
 configuration and metrics, but some still need historical metrics or a sufficiently old resource.
 **Enabling logs does not make every detector fire.** See [readiness](docs/detections/log-analytics-readiness.md).
 
+## Configure diagnostic logs when needed
+
+Enable diagnostic **categories on the Cosmos DB account** and send them to a Log Analytics
+workspace. The tables are populated in that workspace; they are not Cosmos DB containers.
+
+| Detector | Log Analytics dependency | Table(s) used |
+|---|---|---|
+| DX-002 - Cross-partition query fan-out | Required | `CDBQueryRuntimeStatistics` **and** raw `CDBDataPlaneRequests` |
+| DX-003 - Shared-throughput starvation | Required | `CDBDataPlaneRequests5M` preferred; raw `CDBDataPlaneRequests` supported |
+| DX-007 - Shard-key misalignment | Required | `CDBQueryRuntimeStatistics` **and** raw `CDBDataPlaneRequests` |
+| DX-010 - Uncontrolled ingestion | Required | `CDBDataPlaneRequests5M` preferred; raw `CDBDataPlaneRequests` supported |
+| DX-016 - Expensive consistency | Optional read-charge enrichment; the finding uses ARM configuration | `CDBDataPlaneRequests5M` preferred; raw `CDBDataPlaneRequests` supported |
+
+The other 18 detectors do not use Log Analytics. See the
+[full detector-to-data-source and production-window table](docs/detectors.md#data-and-interpretation)
+for metrics, configuration, and optional cost/pricing inputs.
+
+An administrator configures collection:
+
+1. Choose an existing Log Analytics workspace, or create one under your organization's policies.
+2. In Azure Portal, open the **Cosmos DB account > Monitoring > Diagnostic settings > Add diagnostic setting**.
+3. Select **DataPlaneRequests5M** for DX-003, DX-010, and optional DX-016 enrichment.
+   Also select **DataPlaneRequests** and **QueryRuntimeStatistics** if you need DX-002/DX-007.
+   Enable only the categories needed for your diagnostics rather than indiscriminately enabling all logs.
+4. Choose **Send to Log Analytics workspace**, select the workspace, and select
+   **Resource specific** table mode. Save the setting. CODA's resource-context queries use the
+   **Analytics** table plan.
+5. Grant the diagnosing identity the appropriate [resource/log read access](docs/permissions.md).
+   Allow representative workload activity and ingestion before interpreting results.
+
+The four log-dependent detectors request 24 hours of logs. New settings collect future events;
+they do not backfill history. Ingestion/retention can incur charges, and readable records alone
+do not prove a complete window or sufficient per-container traffic.
+Full-text query logging is not required. Follow the
+[detailed setup and readiness guide](docs/detections/log-analytics-readiness.md).
+
+**Check before analyzing:** after signing in and selecting a subscription and resource group,
+select an account and click **Run Pre-Checks**. Leave **Account** empty to check NoSQL accounts in
+the group. Hover over the button for its scope: ARM, Resource Graph, Azure Monitor metrics,
+Log Analytics configuration/data, and optional subscription Cost Management.
+
+Green checks indicate successful read probes—not complete history or account health. Empty cost
+or metric results are not permission failures. ARG discovery and diagnosis use the same SDK
+credential. Cost and ARG warnings do not block ordinary diagnosis.
+
+For an issue, choose **View fix**. The popup shows the issue, exact scope and original requester.
+If the required administrative action is reported for that identity, it can offer **Copy PowerShell**.
+Otherwise it provides **Copy admin request**, identifying the read role or setup action for your
+subscription administrator or delegated scope administrator.
+
+**CODA never executes these scripts.** They use Azure CLI, preview by default, and require an
+explicit `-Apply` when run separately after review. Role scripts target the original requester,
+not the administrator running them. Logging scripts require an approved existing workspace,
+preserve existing exports and stop rather than overwrite settings. Reported rights do not bypass
+PIM, role conditions, deny assignments or Azure Policy. No administrator role is required merely
+to run CODA.
+
 ## Install
 
 Choose a release wheel for normal use, or clone/download the repository to run from source.
@@ -148,9 +205,11 @@ http://127.0.0.1:8080/ instead. Keep the terminal open; Ctrl+C stops the app.
 
 1. Select **Sign in**, then select your subscription. Enable **All subscriptions** if the default
    Cosmos-named subscription filter hides yours.
-2. Select a resource group. Choose **Scan resource group** for its supported NoSQL accounts, or
-   select an account and diagnose only that account.
-3. Review findings and recommendations, then expand **Detector/resource evaluations we couldn't
+2. Select a resource group and optionally an account. **Run Pre-Checks** performs optional
+   prerequisite read checks for that account, or the group when Account is empty.
+3. Choose **Scan resource group** for its supported NoSQL accounts, or **Analyze account** for
+   the selected account. Missing log prerequisites do not prevent other applicable checks.
+4. Review findings and recommendations, then expand **Detector/resource evaluations we couldn't
    complete**. Missing permissions, missing logs, and insufficient history are not a clean result.
 
 Web scans use production analysis windows. A large resource group can take time; start with a
@@ -203,9 +262,10 @@ its own privacy settings; review that policy before sharing customer telemetry w
 |---|---|
 | Authentication failed or no subscriptions | Run `az login`, confirm the tenant and roles, and check **All subscriptions** |
 | Missing resource group/account | Verify Azure access; discovery currently selects NoSQL accounts |
-| Log Analytics checks cannot complete | Enable both required categories in **Resource specific** mode; see the [setup guide](docs/detections/log-analytics-readiness.md) |
+| A prerequisite check fails | Use **Run Pre-Checks > View fix**. Review the scoped PowerShell or administrator request; do not assume every error needs a role assignment. |
+| Log Analytics checks cannot complete | Verify the relevant categories, Resource specific mode, ingestion and access; use the issue popup and [setup guide](docs/detections/log-analytics-readiness.md). |
 | Too new, too few samples, or no finding | Check the detector's window, resource applicability, traffic volume, and thresholds; absence of a finding is not proof of full coverage |
-| Cost amounts unavailable | Cost access and usable billing data are optional; capacity/recommendations can still be useful |
+| Dollar savings replaced by recoverable RU/s | Expand the report's incomplete section for the cost-estimate reason. Cost Management throttling (429) needs time before retrying, not an extra role; capacity findings remain valid. |
 | `coda` is not found | Activate the installation environment or use the full executable path |
 | `coda mcp` says the extra is missing | Reinstall the selected wheel with `[mcp]`, or run `uv sync --locked --extra mcp` |
 

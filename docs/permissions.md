@@ -21,8 +21,8 @@ token can be obtained; it does not create a CODA account. If your organization r
 conditional access, complete the appropriate Azure CLI login flow.
 
 `DefaultAzureCredential` may select another configured credential before Azure CLI. For example,
-environment-based credentials can take precedence over your CLI login. The optional Resource Graph
-discovery path uses the CLI identity, so keep that identity and the SDK credential aligned.
+environment-based credentials can take precedence over your CLI login. Resource Graph discovery
+and pre-checks use that same SDK credential, rather than a separate CLI identity.
 Do not add client secrets or account keys to CODA configuration to work around a permission failure.
 
 See [DefaultAzureCredential](https://learn.microsoft.com/en-us/python/api/azure-identity/azure.identity.defaultazurecredential)
@@ -69,6 +69,37 @@ and the **Analytics** table plan; do not assume Basic or Auxiliary tables work f
 See [Manage access to Log Analytics workspaces](https://learn.microsoft.com/en-us/azure/azure-monitor/logs/manage-access)
 for current access-mode, table-plan, and granular-RBAC behavior.
 
+### Optional pre-checks and guided fixes
+
+**Run Pre-Checks** tests ARM/ARG reads, metrics, logs and optional subscription Cost Management.
+It also reads the account's diagnostic settings and supported categories. Reader-level
+ARM access can provide these metadata reads; it does not require permission to write settings.
+A group check needs permission to enumerate the group's accounts; a named-account check uses
+that account directly. Log queries use the same resource-context permissions described above.
+If configuration cannot be read but logs are readable, CODA reports that distinction rather than
+calling the account unconfigured. Successful probes do not prove all descendant access, complete
+data history or detector sample/age requirements. Empty cost/metric data is not a permission failure.
+
+Issue popups distinguish runtime read permissions from permissions needed to apply a fix:
+
+| Purpose | Narrow runtime access | Authority required to grant/configure it |
+|---|---|---|
+| ARM, ARG and metrics | Reader at the selected account/RG, subject to the reads being requested | `Microsoft.Authorization/roleAssignments/write` at that scope |
+| Cost Management | Cost Management Reader at the subscription queried by CODA, subject to billing policy | Role-assignment write authority at that subscription |
+| Workspace-only log access | Log Analytics Data Reader at the verified workspace when its access mode requires it | Role-assignment write authority at that workspace |
+| Enable resource-specific logs | No write role is needed by CODA itself | `Microsoft.Insights/diagnosticSettings/write` on the Cosmos account, plus read access to the chosen workspace |
+
+CODA never grants those administrative rights to itself. If required authority or requester identity
+cannot be verified, the popup provides an administrator request rather than a runnable fix. It names
+the original requester object ID, tenant, narrow scope and required role/action. Ambiguous log access
+or a failure despite reported read rights requires policy/scope review, not a blanket workspace grant.
+
+Generated PowerShell uses Azure CLI and is **copy-only**. It previews by default; an operator must
+review it and explicitly supply `-Apply` outside CODA. It does not select a new identity, change the
+CLI's default subscription, delete/replace existing diagnostic exports, or create a workspace.
+Administrative rights are evaluated from reported scope permissions, not role names alone; PIM,
+conditions, deny assignments and Azure Policy can still prevent the operation.
+
 ## Optional cost information
 
 CODA uses the Cost Management **Query API** to obtain a customer's amortized Cosmos throughput
@@ -86,14 +117,24 @@ inventing currency savings. Container-level estimates allocate account-level bil
 they are not independently billed container charges. Optional backup-storage estimates use public
 retail prices and have different provenance from bill-derived throughput estimates.
 
+The report's incomplete section explains missing dollar estimates separately from detector/resource
+abstentions. For example, HTTP 429 is Cost Management rate limiting, not evidence of missing access.
+Capacity findings remain valid; wait before retrying rather than repeatedly querying cost data or
+assigning roles. Authentication/access failures, timeouts and unavailable billing rates have their
+own explanations. Structured reports expose `cost_estimate_issue` when enrichment is unavailable;
+this optional account-level issue does not increase the number of incomplete detector evaluations.
+
 CODA does not create cost exports, buy reservations, generate Cost Details reports, or change billing
 settings. Those permissions are not prerequisites for this release.
 
 ## Administrator setup versus CODA runtime
 
 An administrator must create or select a Log Analytics workspace and add the Cosmos diagnostic
-setting with **DataPlaneRequests** and **QueryRuntimeStatistics**, using **Resource specific**
-destination tables. Follow the [setup guide](detections/log-analytics-readiness.md).
+setting using **Resource specific** destination tables. **DataPlaneRequests5M** supports DX-003,
+DX-010, and optional DX-016 enrichment. **DataPlaneRequests** plus **QueryRuntimeStatistics**
+are additionally required for DX-002/DX-007 query analysis. Existing raw-only request collection
+remains supported for aggregate-compatible checks. Follow the
+[setup guide](detections/log-analytics-readiness.md).
 
 That setup needs permission to write diagnostic settings and select the destination; creating a new
 workspace requires additional provisioning permission. These are **not** permissions to grant to

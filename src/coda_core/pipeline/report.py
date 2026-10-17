@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+from coda_core.framework.cost_rate import CostEstimateIssue
 from coda_core.pipeline.finding import (
     STATUS_ABSTAINED,
     THRESHOLD_PROPOSAL,
@@ -31,6 +32,7 @@ class DiagnosticReport:
     # customer's code (the endpoint is what appears in their connection strings / SDK setup).
     account_resource_id: str | None = None
     account_endpoint: str | None = None
+    cost_estimate_issue: CostEstimateIssue | None = None
 
     def as_dict(self) -> dict:
         return {
@@ -42,6 +44,8 @@ class DiagnosticReport:
             "generated_at": self.generated_at,
             "summary": self.summary.as_dict(),
             "findings": [f.as_dict() for f in self.findings],
+            **({"cost_estimate_issue": self.cost_estimate_issue.as_dict()}
+               if self.cost_estimate_issue is not None else {}),
         }
 
 
@@ -193,8 +197,9 @@ def render_markdown(report: DiagnosticReport) -> str:
     elif s.total_recoverable_ru:
         lines += [
             f"You could reclaim **{s.total_recoverable_ru:,.0f} RU/s** of provisioned capacity "
-            f"(out of {s.scope_provisioned_ru:,.0f} RU/s total). To see this as a dollar amount at "
-            f"your own discounted rate, grant the tool **Cost Management Reader** and run it again.",
+            f"(out of {s.scope_provisioned_ru:,.0f} RU/s total). A usable customer billing rate "
+            "is needed to express this as dollar savings; see the incomplete estimates below "
+            "or use Run Pre-Checks to review cost-data availability.",
             "",
         ]
 
@@ -262,21 +267,31 @@ def render_markdown(report: DiagnosticReport) -> str:
     # finding that covers them is already shown above, so repeating them adds noise, not value. They
     # remain in the structured as_dict() output (``superseded_by``) for agents that want the full graph.
     abstained = [f for f in report.findings if f.status == STATUS_ABSTAINED]
-    if abstained:
+    if abstained or report.cost_estimate_issue is not None:
         # Group by (detector title, ref code, plain reason) → count of affected resources.
         groups: dict[tuple[str, str, str], int] = {}
         for f in abstained:
             key = (f.title, f.detection_id, _humanize_abstain(f.summary))
             groups[key] = groups.get(key, 0) + 1
+        section_title = (
+            f"Checks we couldn't complete ({len(abstained)})"
+            + ("; cost estimate unavailable" if report.cost_estimate_issue else "")
+            if abstained else "Cost estimate we couldn't complete"
+        )
         lines += [
             "---", "",
-            f"## Checks we couldn't complete ({len(abstained)})", "",
-            "_These checks ran but didn't have enough data to give a verdict — listed for transparency; "
-            "no action needed unless a fix is called out above._", "",
+            f"## {section_title}", "",
         ]
         for (title, det_id, reason), n in sorted(groups.items(), key=lambda kv: (kv[0][0], kv[0][2])):
             scope = f"{n} resource(s)" if n > 1 else "1 resource"
             lines.append(f"- **{title}** ({scope}) — {reason}. _ref `{det_id}`_")
+        if report.cost_estimate_issue is not None:
+            issue = report.cost_estimate_issue
+            lines += [
+                "", "### Cost estimate unavailable",
+                f"{issue.message} {issue.user_action}",
+                "This is one account-level enrichment issue, not an additional detector/resource failure.",
+            ]
         lines.append("")
 
     return "\n".join(line for line in lines if line is not None)

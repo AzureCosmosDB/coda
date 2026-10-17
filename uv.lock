@@ -388,7 +388,7 @@ wheels = [
 
 [[package]]
 name = "coda"
-version = "0.12.1"
+version = "0.17.1"
 source = { editable = "." }
 dependencies = [
     { name = "azure-core" },

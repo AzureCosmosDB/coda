@@ -74,6 +74,69 @@ class EffectiveRate:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class CostEstimateIssue:
+    """Account-level enrichment failure, not a failed detector or a fabricated zero-dollar estimate."""
+
+    code: str
+    message: str
+    user_action: str
+    query_scope: str
+    http_status: int | None = None
+
+    def as_dict(self) -> dict[str, object]:
+        """Keep only safe, authored explanations and structured provenance in report output."""
+        return {key: value for key, value in asdict(self).items() if value is not None}
+
+
+def cost_estimate_issue(
+    reason: str, query_scope: str, *, http_status: int | None = None,
+) -> CostEstimateIssue:
+    """Map a known failure class to guidance without forwarding external exception prose."""
+    explanations = {
+        "rate_limited": (
+            "Cost Management rate-limited the billing query (HTTP 429).",
+            "Wait before retrying; repeated analyses and pre-checks also consume Cost Management quota.",
+        ),
+        "access_denied": (
+            "Cost Management denied access to the billing query.",
+            "Use Run Pre-Checks to review cost access and billing policy with your administrator.",
+        ),
+        "authentication": (
+            "The billing query could not authenticate.",
+            "Verify your Azure sign-in before retrying. A role assignment is not necessarily the fix.",
+        ),
+        "timeout": (
+            "The Cost Management billing query timed out.",
+            "Wait before retrying and check service/network availability.",
+        ),
+        "service_unavailable": (
+            "Cost Management could not complete the billing query because of a service error.",
+            "Wait before retrying and check Azure service availability.",
+        ),
+        "query_failed": (
+            "The Cost Management billing query could not be completed or its response processed.",
+            "Use Run Pre-Checks to investigate. This failure does not establish a missing permission.",
+        ),
+        "no_usable_rate": (
+            "No usable billed throughput rate was available from the account or subscription.",
+            "Check billing-data availability and attribution; extra permissions do not create missing usage.",
+        ),
+        "not_configured": (
+            "Cost Management enrichment was not configured for this analysis.",
+            "Enable cost enrichment in the caller and use Run Pre-Checks to verify read access.",
+        ),
+    }
+    message, action = explanations[reason]
+    return CostEstimateIssue(
+        code=f"cost_estimate.{reason}",
+        message=f"Dollar savings unavailable: {message} Capacity findings remain valid.",
+        user_action=action,
+        query_scope=query_scope,
+        http_status=http_status,
+    )
+
+
 def derive_effective_rate(
     cost: float,
     usage: float,
@@ -144,6 +207,7 @@ def monthly_savings(recovered_ru: float, rate: EffectiveRate | None) -> float | 
 
 __all__ = [
     "EffectiveRate", "derive_effective_rate", "monthly_savings",
+    "CostEstimateIssue", "cost_estimate_issue",
     "HOURS_PER_MONTH", "THROUGHPUT_METER_UNIT_RU",
     "APPROVED_EFFECTIVE_RATE_SCOPES",
     "EffectiveRateScope",

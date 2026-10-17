@@ -8,11 +8,7 @@ caller-extension seam. There is no module-level ``app`` object: launchers use
 
 from __future__ import annotations
 
-import json
-import os
 import re
-import shutil
-import subprocess
 import uuid
 from pathlib import Path
 from typing import Any
@@ -22,25 +18,19 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from coda_core import mcp_tools
 from coda_core.error_contract import StableError, error_for
+from coda_core.log_readiness import ReadinessError, check_log_readiness
+from coda_core.prechecks import run_prechecks
 from coda_core.scan import list_accounts
+from coda_core.providers.resource_graph import list_graph_accounts
 from coda_web.local_auth import LocalIdentity, is_signed_in, require_local_identity, sign_in
 
 _DEFAULT_STATIC_DIRECTORY = Path(__file__).with_name("public_static")
 _RESOURCE_GROUP_RE = re.compile(r"^[\w().-]{1,90}$")
 _ACCOUNT_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{1,42}[a-z0-9])?$")
-_AZ = shutil.which("az") or "az"
-# Enumerate NoSQL (GlobalDocumentDB) accounts via Azure Resource Graph. ARM's per-subscription
-# database_accounts.list() is O(all accounts) and can take minutes on a subscription with
-# thousands of accounts; Resource Graph returns the same inventory in ~1-2s regardless of size.
-# The customer app uses Resource Graph for bounded discovery and ARM as a read-only fallback.
-_ARG_ACCOUNTS_QUERY = (
-    "resources | where type =~ 'microsoft.documentdb/databaseaccounts' "
-    "| where kind == 'GlobalDocumentDB' | project resourceGroup, name | order by name asc"
-)
 
 
 class _ApiError(Exception):
@@ -70,6 +60,15 @@ class ScanRequest(BaseModel):
     resource_group: str
     mode: str = "production"
     depth: str = "shallow"
+
+
+class LogReadinessRequest(BaseModel):
+    """One explicit account or group; no subscription-wide, mutation or credential inputs."""
+
+    model_config = ConfigDict(extra="forbid")
+    subscription: str
+    resource_group: str
+    account: str | None = None
 
 
 def _validate_uuid(value: str) -> str:
@@ -108,40 +107,16 @@ def _list_subscriptions(credential: Any, *, include_all: bool) -> list[dict[str,
     return sorted(subscriptions, key=lambda s: (s["name"].lower(), s["id"]))
 
 
-def _list_accounts_fast(subscription: str, *, max_accounts: int = 5000) -> list[tuple[str, str]]:
-    """Return ``(resource_group, account)`` NoSQL pairs via Resource Graph, paging with skip_token.
-
-    Raises on any failure so the caller can fall back to the (slower) ARM enumeration.
-    """
-    out: list[tuple[str, str]] = []
-    skip_token: str | None = None
-    for _ in range(20):  # hard bound: 20 pages x 1000 = 20k accounts
-        cmd = [_AZ, "graph", "query", "-q", _ARG_ACCOUNTS_QUERY,
-               "--subscriptions", subscription, "--first", "1000", "--only-show-errors", "-o", "json"]
-        if skip_token:
-            cmd += ["--skip-token", skip_token]
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=120,
-            env={**os.environ, "AZURE_EXTENSION_USE_DYNAMIC_INSTALL": "no"},
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(proc.stderr.strip() or "az graph query failed")
-        payload = json.loads(proc.stdout or "{}")
-        for row in payload.get("data", []):
-            out.append((row.get("resourceGroup") or "", row.get("name") or ""))
-            if len(out) >= max_accounts:
-                return out
-        skip_token = payload.get("skip_token") or payload.get("skipToken")
-        if not skip_token:
-            break
-    return out
+def _list_accounts_fast(credential, subscription: str, *, max_accounts: int = 5000) -> list[tuple[str, str]]:
+    """Use the same SDK identity for ARG discovery as for diagnosis and permission guidance."""
+    return list_graph_accounts(credential, subscription, max_accounts=max_accounts)
 
 
 def _discover_accounts(credential: Any, subscription: str) -> tuple[list[tuple[str, str]], str]:
     """Prefer the fast Resource Graph path; fall back to ARM enumeration without fixture scoping."""
     try:
-        return _list_accounts_fast(subscription), "resource-graph"
-    except (json.JSONDecodeError, OSError, RuntimeError, subprocess.TimeoutExpired):
+        return _list_accounts_fast(credential, subscription), "resource-graph"
+    except (OSError, RuntimeError, ValueError):
         return sorted(list_accounts(credential, subscription)), "arm"
 
 
@@ -243,6 +218,38 @@ def _api_router() -> APIRouter:
                 concurrency=24, credential=identity.credential,
             )
         return {**result, "resource_group": resource_group}
+
+    @router.post("/log-readiness")
+    def log_readiness(
+        body: LogReadinessRequest,
+        identity: LocalIdentity = Depends(require_local_identity),
+    ) -> dict[str, Any]:
+        """Check logging without diagnosing, enabling categories, or expanding the selected scope."""
+        subscription = _validate_uuid(body.subscription)
+        group = _validate_resource_group(body.resource_group)
+        account = _validate_account(body.account) if body.account is not None else None
+        try:
+            return check_log_readiness(identity.credential, subscription, group, account)
+        except ReadinessError as exc:
+            status = (
+                403 if exc.failure.code == "readiness.access_denied"
+                else 400 if exc.failure.code == "readiness.unsupported_api" else 502
+            )
+            raise _ApiError(status, exc.failure) from exc
+
+    @router.post("/pre-checks")
+    def pre_checks(
+        body: LogReadinessRequest,
+        identity: LocalIdentity = Depends(require_local_identity),
+    ) -> dict[str, Any]:
+        """Run read-only access probes and return copy-only guidance, never executing scripts."""
+        subscription = _validate_uuid(body.subscription)
+        group = _validate_resource_group(body.resource_group)
+        account = _validate_account(body.account) if body.account is not None else None
+        try:
+            return run_prechecks(identity.credential, subscription, group, account)
+        except ReadinessError as exc:
+            raise _ApiError(502, exc.failure) from exc
 
     return router
 

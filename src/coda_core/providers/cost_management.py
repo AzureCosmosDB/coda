@@ -18,6 +18,7 @@ Reader" instead of guessing dollars.
 from __future__ import annotations
 
 import json
+import math
 import time
 import urllib.error
 import urllib.request
@@ -101,9 +102,21 @@ class ThroughputCost:
 class CostManagementProvider:
     """Read-only actual-cost queries over a subscription or a sub-scope resource."""
 
-    def __init__(self, credential: TokenCredential, subscription_id: str) -> None:
+    def __init__(
+        self, credential: TokenCredential, subscription_id: str, *,
+        timeout_seconds: float | None = None, max_retries: int = _RATE_LIMIT_MAX_RETRIES,
+    ) -> None:
         self._credential = credential
         self._subscription_id = subscription_id
+        if timeout_seconds is not None and (
+            isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(timeout_seconds) or timeout_seconds <= 0
+        ):
+            raise ValueError("Cost query timeout must be positive.")
+        if type(max_retries) is not int or max_retries < 0:
+            raise ValueError("Cost query retries must be a nonnegative integer.")
+        self._timeout_seconds = timeout_seconds
+        self._max_retries = max_retries
 
     def _scope(self, scope: str | None) -> str:
         """Default to the subscription scope; accept any ARM scope (e.g. a resource id)."""
@@ -120,17 +133,18 @@ class CostManagementProvider:
         url = f"{_MGMT}/{scope}/providers/Microsoft.CostManagement/query?api-version={_API_VERSION}"
         data = json.dumps(body).encode("utf-8")
         backoff = _RATE_LIMIT_DEFAULT_BACKOFF_S
-        for attempt in range(_RATE_LIMIT_MAX_RETRIES + 1):
+        for attempt in range(self._max_retries + 1):
             token = self._credential.get_token(_SCOPE).token
             req = urllib.request.Request(  # noqa: S310 - fixed https management endpoint
                 url, data=data, method="POST",
                 headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
             )
             try:
-                with urllib.request.urlopen(req) as resp:  # noqa: S310
+                options = {"timeout": self._timeout_seconds} if self._timeout_seconds is not None else {}
+                with urllib.request.urlopen(req, **options) as resp:  # noqa: S310
                     return json.loads(resp.read().decode("utf-8")).get("properties", {})
             except urllib.error.HTTPError as exc:
-                if exc.code != 429 or attempt == _RATE_LIMIT_MAX_RETRIES:
+                if exc.code != 429 or attempt == self._max_retries:
                     raise
                 retry_after = exc.headers.get("Retry-After") if exc.headers else None
                 wait_s = float(retry_after) if retry_after and str(retry_after).isdigit() else backoff

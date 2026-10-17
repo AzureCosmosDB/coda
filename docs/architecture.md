@@ -27,6 +27,16 @@ The public repository contains the product, curated documentation, package metad
 package tests. It is a generated distribution, not a second independently maintained codebase;
 see [contribution policy](../CONTRIBUTING.md).
 
+`coda_core.log_readiness` provides an optional account/resource-group logging pre-check, exposed
+by the existing local web API. It reads ARM diagnostic settings/categories and account-scoped
+table observations without running detectors. It reuses capability/source selection and registry
+requirements, keeps configuration distinct from data availability, and makes no resource changes.
+
+`coda_core.prechecks` adds ARM/ARG, metrics and optional cost access probes using one SDK identity.
+`coda_core.remediation` produces copy-only PowerShell/admin requests for issue dialogs; it never
+executes a fix. ARG discovery shares the bounded read-only management client with pre-checks.
+Reported administrative permissions guide presentation but do not override Azure authorization.
+
 ## What happens during a diagnosis
 
 1. **Choose scope and credentials.** The browser talks to the loopback FastAPI service. MCP uses
@@ -46,6 +56,12 @@ see [contribution policy](../CONTRIBUTING.md).
 
 The shipped diagnostic path does not call an LLM. An AI client can call the MCP tools and interpret
 their output, but that client's model service is separate from CODA.
+
+DX-003, DX-010, and optional DX-016 read-charge enrichment prefer five-minute request aggregates,
+with raw-log compatibility when aggregates are unavailable. Source selection and cache keys are
+consistent within a run; errors are not a reason to silently switch sources. DX-002/DX-007 still
+require raw request logs for activity-level query-charge joins. See
+[Log Analytics readiness](detections/log-analytics-readiness.md) for configuration and window limits.
 
 ## Services and outbound connections
 

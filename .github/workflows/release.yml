@@ -157,6 +157,7 @@ jobs:
           test "${#wheels[@]}" -eq 1
           test "${#sdists[@]}" -eq 1
           gh release create "$GITHUB_REF_NAME" \
+            --title "CODA $GITHUB_REF_NAME (Preview)" \
             --verify-tag \
             --prerelease \
             --notes-file release-notes.md \

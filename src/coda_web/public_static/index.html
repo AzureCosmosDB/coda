@@ -543,6 +543,10 @@ select {
 .sev-dot.d-ok { background: var(--cp-success); }
 .sev-dot.d-quiet { background: var(--cp-text-muted); opacity: 0.5; }
 .sev-dot.d-err { background: var(--cp-text-muted); }
+.log-ready { color: var(--cp-success); font-size: 1.25rem; font-weight: 700; }
+.precheck-dialog { width: min(900px, 92vw); max-height: 90vh; overflow: auto; background: var(--cp-surface); color: var(--cp-text); border: 1px solid var(--cp-border); border-radius: 10px; padding: 1.25rem; }
+.precheck-dialog::backdrop { background: var(--cp-overlay); }
+.precheck-script { width: 100%; min-height: 18rem; max-height: 45vh; resize: vertical; padding: .75rem; font-family: Consolas, "Courier New", monospace; color: var(--cp-text); background: var(--cp-bg); border: 1px solid var(--cp-border); }
 .subhead { margin: 0.85rem 0 0.4rem; font-size: 0.95rem; }
 .calibrating {
   margin-top: 0.5rem;
@@ -684,8 +688,10 @@ tr.clickable:hover {
         <div class="tb-group actions">
           <button class="btn primary" id="analyzeAccount">Analyze account</button>
           <button class="btn secondary" id="scanResourceGroup" disabled>Scan resource group</button>
+          <button class="btn secondary" id="checkLogReadiness" disabled aria-describedby="logReadinessScope" title="Checks read permissions/access for ARM, Resource Graph discovery, Azure Monitor metrics, Log Analytics configuration/data, and optional subscription Cost Management. Read-only; suggested fixes are copied, never executed by CODA.">Run Pre-Checks</button>
         </div>
       </div>
+      <p class="muted" id="logReadinessScope">Select an account for pre-checks, or leave Account empty to check the resource group.</p>
     </section>
 
     <div class="status-bar" id="statusBar"><span class="spinner">⏳</span> Ready.</div>
@@ -695,6 +701,27 @@ tr.clickable:hover {
   </main>
 </div>
 
+<dialog id="preCheckFixDialog" class="precheck-dialog" aria-labelledby="preCheckFixTitle">
+  <div class="section-header"><h3 id="preCheckFixTitle">Pre-check details</h3><button class="btn secondary" id="closePreCheckFix" type="button">Close</button></div>
+  <p id="preCheckFixSummary"></p>
+  <p class="muted" id="preCheckFixScope"></p>
+  <p class="muted" id="preCheckFixIdentity"></p>
+  <p id="preCheckFixMessage"></p>
+  <p class="muted" id="preCheckFixReason"></p>
+  <section id="preCheckScriptSection" hidden>
+    <p><strong>PowerShell (Azure CLI required)</strong> — preview by default; review before using <code>-Apply</code>.</p>
+    <textarea id="preCheckScript" class="precheck-script" readonly spellcheck="false" aria-label="PowerShell remediation"></textarea>
+    <button class="btn secondary" id="copyPreCheckScript" type="button">Copy PowerShell</button>
+  </section>
+  <details id="preCheckAdminDetails">
+    <summary>Administrator request and exact scope</summary>
+    <textarea id="preCheckAdminRequest" class="precheck-script" readonly spellcheck="false" aria-label="Administrator request"></textarea>
+    <button class="btn secondary" id="copyPreCheckAdmin" type="button">Copy admin request</button>
+  </details>
+  <p class="muted" id="preCheckFixCaveat"></p>
+  <p id="preCheckCopyStatus" role="status" aria-live="polite"></p>
+</dialog>
+
 <script>
 const state = {
   accounts: [],
@@ -702,6 +729,7 @@ const state = {
   busy: false,
   lastScan: null,
   accountRequestVersion: 0,
+  precheckFixes: [],
 };
 
 const severityRank = { high: 0, medium: 1, low: 2, none: 3 };
@@ -715,6 +743,8 @@ const el = {
   accountPicker: document.getElementById("accountPicker"),
   analyzeAccount: document.getElementById("analyzeAccount"),
   scanResourceGroup: document.getElementById("scanResourceGroup"),
+  checkLogReadiness: document.getElementById("checkLogReadiness"),
+  logReadinessScope: document.getElementById("logReadinessScope"),
   statusBar: document.getElementById("statusBar"),
   results: document.getElementById("results"),
   detectorList: document.getElementById("detectorList"),
@@ -795,6 +825,12 @@ function updateControls() {
   );
   el.analyzeAccount.disabled = state.busy || !hasSub || !resourceGroup || !hasAccount;
   el.scanResourceGroup.disabled = state.busy || !hasSub || !resourceGroup;
+  el.checkLogReadiness.disabled = state.busy || !hasSub || !resourceGroup ||
+    (el.accountPicker.value !== "" && !hasAccount);
+  el.logReadinessScope.textContent = hasAccount
+    ? `Pre-checks will inspect ${selected.account}. Leave Account empty to check the whole resource group. Cost access is checked at subscription scope.`
+    : resourceGroup ? `Pre-checks will inspect NoSQL accounts in ${resourceGroup}, plus optional subscription cost access.`
+    : "Select an account for pre-checks, or leave Account empty to check the resource group.";
 }
 
 function currentMode() {
@@ -1217,15 +1253,25 @@ function groupAbstained(findings) {
   return Array.from(groups.values()).sort((a, b) => a.detection_id.localeCompare(b.detection_id));
 }
 
-function renderIncomplete(findings) {
+function renderCostEstimateIssue(issue) {
+  if (!issue) return "";
+  return `<div class="callout" data-cost-estimate-issue>
+    <strong>Cost estimate unavailable</strong>
+    <p>${escapeHtml(issue.message)}</p>
+    <p class="muted">${escapeHtml(issue.user_action)}</p>
+    <p class="muted">Account-level enrichment only; not an additional detector/resource failure.</p>
+  </div>`;
+}
+
+function renderIncomplete(findings, costIssue = null) {
   const groups = groupAbstained(findings);
   const laBlocked = findings.filter(f => f.evidence && f.evidence.la_unavailable);
-  if (!groups.length && !laBlocked.length) return "";
+  if (!groups.length && !laBlocked.length && !costIssue) return "";
   const incompleteCount = groups.reduce((total, group) => total + group.count, 0);
   const abstained = groups.length ? `
     <ul>
       ${groups.map(g => `<li><strong>${escapeHtml(g.title)}</strong> (${escapeHtml(g.detection_id)}) — ${escapeHtml(g.summary)} <span class="muted">· ${g.count} detector/resource evaluation(s)</span></li>`).join("")}
-    </ul>` : `<p class="muted">No abstained checks.</p>`;
+    </ul>` : "";
   const callouts = laBlocked.length ? `
     <div class="callout">
       <strong>Log Analytics prevented ${laBlocked.length} detector/resource evaluation(s).</strong>
@@ -1234,9 +1280,12 @@ function renderIncomplete(findings) {
     </div>` : "";
   return `
     <details>
-      <summary>Detector/resource evaluations we couldn't complete (${incompleteCount})</summary>
+      <summary>${incompleteCount || laBlocked.length
+        ? `Detector/resource evaluations we couldn't complete (${incompleteCount})${costIssue ? " · cost estimate unavailable" : ""}`
+        : "Cost estimate we couldn't complete"}</summary>
       ${callouts}
       ${abstained}
+      ${renderCostEstimateIssue(costIssue)}
     </details>`;
 }
 
@@ -1283,7 +1332,7 @@ function renderAccountReport(report) {
         ${actionable.length ? actionable.map(f => renderFindingCard(f, report)).join("") : `<div class="empty">No actionable findings in this report.</div>`}
       </div>
     </section>
-    ${renderIncomplete(report.findings || [])}`;
+    ${renderIncomplete(report.findings || [], report.cost_estimate_issue)}`;
 }
 
 function renderFindingsByDetector(scan) {
@@ -1396,6 +1445,7 @@ function renderShallowScan(scan) {
 }
 
 function renderDeepScan(scan) {
+  const missingEstimates = (scan.per_account || []).filter(row => row.cost_estimate_issue);
   el.results.innerHTML = `
     <div class="headline">
       <div class="panel tile"><div class="k">Accounts scanned</div><div class="v">${number(scan.accounts_scanned)}</div></div>
@@ -1410,7 +1460,12 @@ function renderDeepScan(scan) {
     <section class="panel section">
       <div class="section-header"><h3>Accounts in ${escapeHtml(scan.resource_group)}</h3><span class="muted">Click a row to drill in.</span></div>
       ${renderPerAccount(scan)}
-    </section>`;
+    </section>
+    ${missingEstimates.length ? `<details>
+      <summary>Accounts with incomplete cost estimates (${missingEstimates.length})</summary>
+      ${missingEstimates.map(row => `<section><h4>${escapeHtml(row.account)}</h4>
+        ${renderCostEstimateIssue(row.cost_estimate_issue)}</section>`).join("")}
+    </details>` : ""}`;
   el.results.querySelectorAll("tr[data-row]").forEach(row => {
     row.addEventListener("click", () => {
       const item = (state.lastScan.per_account || [])[Number(row.dataset.row)];
@@ -1582,6 +1637,171 @@ async function scanResourceGroup() {
   }
 }
 
+function formatLogObservationTime(value) {
+  // The API retains precise UTC evidence; display only minutes in the browser's local time zone.
+  const timestamp = new Date(value);
+  if (Number.isNaN(timestamp.getTime())) return "Invalid timestamp";
+  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(timestamp);
+}
+
+function precheckFixButton(remediation) {
+  if (!remediation) return "";
+  const index = state.precheckFixes.push(remediation) - 1;
+  return `<button class="btn secondary" type="button" data-precheck-fix="${index}">View fix</button>`;
+}
+
+function precheckServiceRows(checks) {
+  return (checks || []).map(check => `<tr>
+    <td><strong>${escapeHtml(check.label)}</strong>${check.optional ? ' <span class="muted">(optional)</span>' : ""}</td>
+    <td>${escapeHtml(check.message)}</td>
+    <td>${check.status === "passed"
+      ? '<span class="log-ready" role="img" aria-label="Check passed">✓</span>'
+      : precheckFixButton(check.remediation)}</td>
+  </tr>`).join("");
+}
+
+function renderLogReadiness(report) {
+  if (!Array.isArray(report.accounts)) throw new Error("Log readiness returned an invalid account result.");
+  state.precheckFixes = [];
+  const configurationLabels = {
+    configured: "Configured · resource specific",
+    not_configured: "Category not enabled for Log Analytics",
+    missing_workspace: "No Log Analytics destination",
+    wrong_mode: "Legacy table mode · use resource specific",
+    unsupported: "Category not advertised on this account",
+    unknown: "Configuration could not be verified",
+  };
+  const dataLabels = {
+    recent: "Recent data readable",
+    older_data: "Readable data · no records in the last 24 hours",
+    empty: "No records in the 30-day probe window",
+    missing: "No accessible table records yet",
+    error: "Data could not be verified",
+  };
+  const detectorLabels = {
+    available: "log inputs available",
+    needs_data: "needs recent data",
+    needs_setup: "check log setup",
+    unverified: "could not verify log inputs",
+  };
+  const scope = report.account || report.resource_group;
+  el.results.innerHTML = `
+    <section class="panel section" aria-label="Log readiness results">
+      <div class="section-header"><h3>Pre-Checks — ${escapeHtml(scope)}</h3><span class="pill">Read-only · fixes are copy-only</span></div>
+      <p>${escapeHtml(report.note)}</p>
+      <p class="muted">Checked ${number(report.accounts_checked)} account(s).
+        Read probes do not prove complete history or sufficient traffic for a detector.</p>
+      ${report.scope_checks?.length ? `<div style="overflow-x:auto"><table><thead><tr><th>Check</th><th>Observation</th><th>Action</th></tr></thead>
+        <tbody>${precheckServiceRows(report.scope_checks)}</tbody></table></div>` : ""}
+      ${report.accounts.length ? "" : '<p>No accessible NoSQL accounts were found in the selected scope.</p>'}
+    </section>
+    ${report.accounts.map(account => {
+      if (account.error) return `<section class="panel section">
+        <h3>${escapeHtml(account.account)}</h3>
+        <p class="error">${escapeHtml(account.error.message)}</p>
+        <p>${escapeHtml(account.error.user_action)}</p></section>`;
+      if (!Array.isArray(account.sources) || !Array.isArray(account.detectors)) {
+        throw new Error("Log readiness returned incomplete source details.");
+      }
+      return `<section class="panel section" data-readiness-account="${escapeHtml(account.account)}">
+        <div class="section-header"><h3>${escapeHtml(account.account)}</h3>
+          <span class="pill">${account.status === "unverified" ? "Some checks could not be verified" : "Account pre-checks"}</span></div>
+        ${account.access_checks?.length ? `<div style="overflow-x:auto"><table><thead><tr><th>Check</th><th>Observation</th><th>Action</th></tr></thead>
+          <tbody>${precheckServiceRows(account.access_checks)}</tbody></table></div>` : ""}
+        <div style="overflow-x:auto"><table>
+          <thead><tr><th>Table / category</th><th>Configuration</th><th>Data observation</th><th>Help</th></tr></thead>
+          <tbody>${account.sources.map(source => {
+            const configuration = source.configuration;
+            const data = source.data;
+            const error = configuration.error || data.error;
+            const logsAvailable = !error && configuration.status === "configured" &&
+              ["recent", "older_data"].includes(data.status);
+            return `<tr data-log-table="${escapeHtml(source.table)}">
+              <td><strong>${escapeHtml(source.table)}</strong><div class="muted">${escapeHtml(source.category)}</div></td>
+              <td>${escapeHtml(configurationLabels[configuration.status] || "Unknown")}
+                ${(configuration.workspaces || []).map(workspace => `<div class="muted" title="${escapeHtml(workspace)}">${escapeHtml(workspace.split("/").pop())}</div>`).join("")}</td>
+              <td>${escapeHtml(dataLabels[data.status] || "Unknown")}
+                ${data.last_seen ? `<div class="muted">Last record (local): ${escapeHtml(formatLogObservationTime(data.last_seen))}</div>` : ""}
+                ${error ? `<div class="error">${escapeHtml(error.message)}</div><div class="muted">${escapeHtml(error.user_action)}</div>` : ""}</td>
+              <td>${logsAvailable
+                ? '<span class="log-ready" role="img" aria-label="Logs available" title="Logging configured and data readable; see the observation for freshness.">✓</span>'
+                : precheckFixButton(source.remediation)}</td>
+            </tr>`;
+          }).join("")}</tbody></table></div>
+        <ul>${account.detectors.map(detector => `<li><strong>${escapeHtml(detector.id)}</strong>
+          ${escapeHtml(detector.name)}${detector.optional ? " (optional enrichment only)" : ""}:
+          ${escapeHtml(detectorLabels[detector.status] || "unverified")}</li>`).join("")}</ul>
+        ${account.multiple_destinations ? '<p class="muted">Multiple workspaces are configured. Their collection history can differ, and resource-context queries can include duplicate exports.</p>' : ""}
+      </section>`;
+    }).join("")}`;
+  el.results.querySelectorAll("[data-precheck-fix]").forEach(button => {
+    button.addEventListener("click", () => openPrecheckFix(Number(button.dataset.precheckFix)));
+  });
+}
+
+function openPrecheckFix(index) {
+  const fix = state.precheckFixes[index];
+  if (!fix) return;
+  document.getElementById("preCheckFixTitle").textContent = fix.title;
+  document.getElementById("preCheckFixSummary").textContent = fix.summary;
+  document.getElementById("preCheckFixScope").textContent = `Scope: ${fix.scope}`;
+  document.getElementById("preCheckFixIdentity").textContent = fix.requester_object_id
+    ? `Requester object ID: ${fix.requester_object_id} · tenant: ${fix.tenant_id}`
+    : "Requester identity is not verified; an administrator must confirm it before assigning access.";
+  document.getElementById("preCheckFixMessage").textContent = fix.message;
+  document.getElementById("preCheckFixReason").textContent = fix.reason || "";
+  document.getElementById("preCheckFixCaveat").textContent = fix.caveat;
+  document.getElementById("preCheckScriptSection").hidden = !fix.script;
+  document.getElementById("preCheckScript").value = fix.script || "";
+  document.getElementById("preCheckAdminRequest").value = fix.admin_request;
+  document.getElementById("preCheckAdminDetails").hidden = !fix.administrator_needed && !fix.script;
+  document.getElementById("preCheckAdminDetails").open = !fix.script;
+  document.getElementById("preCheckCopyStatus").textContent = "";
+  document.getElementById("preCheckFixDialog").showModal();
+}
+
+async function copyPrecheckText(id) {
+  try {
+    await navigator.clipboard.writeText(document.getElementById(id).value);
+    document.getElementById("preCheckCopyStatus").textContent = "Copied. CODA has not executed anything.";
+  } catch {
+    document.getElementById("preCheckCopyStatus").textContent = "Copy was not available. Select the text and copy it manually.";
+  }
+}
+
+document.getElementById("closePreCheckFix").addEventListener("click", () => document.getElementById("preCheckFixDialog").close());
+document.getElementById("copyPreCheckScript").addEventListener("click", () => copyPrecheckText("preCheckScript"));
+document.getElementById("copyPreCheckAdmin").addEventListener("click", () => copyPrecheckText("preCheckAdminRequest"));
+
+async function checkLogReadiness() {
+  const subscription = currentSubscription();
+  const resourceGroup = el.resourceGroupPicker.value;
+  const accountValue = el.accountPicker.value;
+  const selected = accountValue !== "" ? state.accounts[Number(accountValue)] : null;
+  if (!subscription || !resourceGroup || (accountValue !== "" &&
+      (!selected || selected.resource_group !== resourceGroup))) {
+    setStatus("Select a valid subscription, resource group and optional account before checking logs.", true);
+    return;
+  }
+  const body = { subscription, resource_group: resourceGroup };
+  if (selected) body.account = selected.account;
+  setBusy(true, `Running read-only pre-checks for ${selected ? selected.account : resourceGroup}…`);
+  try {
+    const report = await apiPost("/api/pre-checks", body);
+    if (subscription !== currentSubscription() || resourceGroup !== el.resourceGroupPicker.value ||
+        accountValue !== el.accountPicker.value) {
+      setStatus("Selection changed. Run pre-checks again for the new scope.");
+      return;
+    }
+    renderLogReadiness(report);
+    setStatus(`Pre-checks completed for ${report.accounts_checked} account(s). No fixes executed; analysis remains available.`);
+  } catch (err) {
+    setStatus(err.message, true);
+  } finally {
+    setBusy(false);
+  }
+}
+
 el.subscriptionPicker.addEventListener("change", () => {
   resetAccounts();
   updateControls();
@@ -1591,6 +1811,7 @@ el.resourceGroupPicker.addEventListener("change", populateAccountsForSelectedGro
 el.accountPicker.addEventListener("change", updateControls);
 el.analyzeAccount.addEventListener("click", analyzeSelectedAccount);
 el.scanResourceGroup.addEventListener("click", scanResourceGroup);
+el.checkLogReadiness.addEventListener("click", checkLogReadiness);
 
 const themeToggle = document.getElementById("themeToggle");
 function renderThemeToggle() {

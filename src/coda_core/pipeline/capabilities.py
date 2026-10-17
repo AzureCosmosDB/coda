@@ -16,15 +16,20 @@ table) is **detected** and the customer is **guided** to add a resource-specific
 supported with a second query path. Gating is **per table** so a partially-configured customer (e.g.
 ``DataPlaneRequests`` on but ``QueryRuntimeStatistics`` off) gets "enable category X" on the exact
 detections that need it — instead of a misleading "no cross-partition queries" all-clear.
+
+Request-total consumers have an additional capability satisfied by five-minute aggregates or raw
+logs. Selection prefers five-minute logs and records the source; per-request query joins still
+require the raw-table capability.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
-from coda_core.providers.log_analytics import LogAnalyticsQueryError
+from coda_core.providers.log_analytics import DataPlaneSource, LogAnalyticsQueryError
 
 # --- Capability tags ------------------------------------------------------------------
 # RBAC-class data sources (one credential role each).
@@ -32,10 +37,11 @@ CAP_METRICS = "metrics"                  # Azure Monitor metrics (Monitoring Rea
 CAP_ARM = "arm"                          # ARM control-plane read (Reader)
 CAP_COST_MANAGEMENT = "cost_management"  # Cost Management / Consumption (Cost Management Reader) [FinOps]
 
-# Per-table Log Analytics capabilities. The tag *is* the data dependency at table granularity, so a
-# detection requires exactly the resource-specific table(s) it queries.
+# Physical-table capabilities remain distinct from the aggregate-compatible request capability.
 CAP_LA_DATAPLANE = "la:CDBDataPlaneRequests"
 CAP_LA_QUERYSTATS = "la:CDBQueryRuntimeStatistics"
+# Aggregate-only detectors can use either source; raw remains mandatory for activity-ID joins.
+CAP_LA_REQUEST_AGGREGATES = "la:request_aggregates"
 
 
 @dataclass(frozen=True)
@@ -78,6 +84,12 @@ CAPABILITIES: dict[str, Capability] = {
         "diagnostic settings (populates CDBQueryRuntimeStatistics).",
         la_table="CDBQueryRuntimeStatistics", category="QueryRuntimeStatistics",
     ),
+    CAP_LA_REQUEST_AGGREGATES: Capability(
+        CAP_LA_REQUEST_AGGREGATES, "Request-log aggregates",
+        "Enable 'DataPlaneRequests5M' in **resource-specific** mode "
+        "(CDBDataPlaneRequests5M). Existing raw DataPlaneRequests logs are also supported.",
+        la_table="CDBDataPlaneRequests5M", category="DataPlaneRequests5M",
+    ),
 }
 
 # All per-table Log Analytics capabilities (the set we probe to diagnose diagnostic-settings mode).
@@ -94,6 +106,30 @@ LA_PARTIAL = "partial"          # some required CDB* tables present, at least on
 LA_PROBE_ERROR = "probe_error"  # table availability could not be established because a read failed
 
 
+@dataclass(frozen=True)
+class LogTableObservation:
+    """One actual table probe; callers must not equate missing rows with missing configuration."""
+
+    table: str
+    state: str
+    row_count: int = 0
+    last_seen: datetime | None = None
+    error: str | None = None
+    error_type: str | None = None
+    http_status: int | None = None
+    service_code: str | None = None
+
+
+def log_source_tables(capability: str) -> tuple[str, ...]:
+    """Return accepted physical tables in preference order, shared by diagnosis and readiness."""
+    if capability == CAP_LA_REQUEST_AGGREGATES:
+        return (DataPlaneSource.FIVE_MINUTE.value, DataPlaneSource.RAW.value)
+    descriptor = CAPABILITIES[capability]
+    if descriptor.la_table is None:
+        raise ValueError(f"Not a Log Analytics capability: {capability}")
+    return (descriptor.la_table,)
+
+
 def la_mode_guidance(mode: str, missing_tables: frozenset[str]) -> str:
     """One actionable sentence explaining an LA shortfall, tailored to the misconfiguration."""
     cats = ", ".join(sorted(
@@ -101,16 +137,16 @@ def la_mode_guidance(mode: str, missing_tables: frozenset[str]) -> str:
         if c.la_table in missing_tables and c.category
     )) or "the required"
     if mode == LA_NO_PROVIDER or mode == LA_NOT_ENABLED:
-        return ("Cosmos DB diagnostic settings are not exporting resource logs. Add a diagnostic "
-                f"setting in **resource-specific** mode with the {cats} category(ies) to a Log "
-                "Analytics workspace.")
+        return ("CODA has no accessible records for the required resource logs. Verify a diagnostic "
+                f"setting in **resource-specific** mode with the {cats} category(ies) and a Log "
+                "Analytics destination. If already configured, check activity, ingestion and access.")
     if mode == LA_LEGACY_MODE:
-        return ("Diagnostic logs are going to the legacy **AzureDiagnostics** table; CODA needs "
-                "**resource-specific** tables. Add a second diagnostic setting in resource-specific "
-                f"mode with the {cats} category(ies) (a resource can have multiple settings).")
+        return ("Only legacy **AzureDiagnostics** records were found; these checks need "
+                "**resource-specific** tables. Verify resource-specific collection with the "
+                f"{cats} category(ies), including activity and ingestion if already configured.")
     if mode == LA_PARTIAL:
-        return (f"Enable the {cats} category(ies) in **resource-specific** mode on the account's "
-                "diagnostic settings — they are currently off, so these detections cannot run.")
+        return (f"No accessible records were found for the {cats} category(ies). Verify "
+                "**resource-specific** diagnostic settings, activity, ingestion and access.")
     return ""
 
 
@@ -122,6 +158,8 @@ class CapabilitySet:
     la_mode: str = LA_OK                          # LA_* constant
     missing_tables: frozenset[str] = frozenset()  # required LA tables that are absent/empty
     probe_errors: tuple[tuple[str, str], ...] = ()  # capability key + bounded provider error
+    dataplane_source: DataPlaneSource | None = None
+    table_observations: tuple[LogTableObservation, ...] = ()
 
     def has(self, capability: str) -> bool:
         return capability in self.available
@@ -161,25 +199,57 @@ class CapabilitySet:
         return " ".join(hints)
 
 
-def _table_probe(
-    probe: Callable[[str], list[dict]], table: str
-) -> tuple[bool, str | None]:
-    """Return row presence plus any real read failure for one table.
+def probe_log_table(
+    probe: Callable[[str], list[dict]], table: str, *, include_latest: bool = False,
+) -> LogTableObservation:
+    """Observe table access without inventing configuration facts or swallowing read failures.
 
-    Log Analytics reports an unconfigured table as a semantic "could not be resolved" error; that is
-    genuine capability absence. Other exceptions are provider/read failures and must not be presented
-    as diagnostic-settings configuration advice.
+    Ordinary diagnosis retains its existing count-only query. Readiness also requests the latest
+    record timestamp; neither result proves continuous collection or detector-level sample sufficiency.
     """
     try:
-        rows = probe(f"{table} | summarize n = count()")
+        suffix = ", last_seen = max(TimeGenerated)" if include_latest else ""
+        rows = probe(f"{table} | summarize n = count(){suffix}")
+        if not rows:
+            return LogTableObservation(table, "empty")
+        count = rows[0].get("n")
+        if (
+            isinstance(count, bool) or not isinstance(count, (int, float))
+            or not math.isfinite(count) or count < 0 or int(count) != count
+        ):
+            raise ValueError("Log table probe returned an invalid row count.")
+        latest = rows[0].get("last_seen") if include_latest else None
+        if include_latest and count == 0 and latest is not None:
+            raise ValueError("An empty log table probe returned a last-record timestamp.")
+        if include_latest and count > 0 and (
+            not isinstance(latest, datetime) or latest.tzinfo is None
+        ):
+            raise ValueError("Log table probe returned an invalid last-record timestamp.")
+        return LogTableObservation(
+            table, "present" if count else "empty", int(count),
+            latest.astimezone(timezone.utc) if latest is not None else None,
+        )
     except LogAnalyticsQueryError as exc:
         if exc.is_missing_table:
-            return False, None
-        return False, f"{type(exc).__name__}: {exc}"[:500]
+            return LogTableObservation(table, "missing")
+        return LogTableObservation(
+            table, "error", error=f"{type(exc).__name__}: {exc}"[:500],
+            error_type=type(exc).__name__, service_code=exc.code,
+        )
     except Exception as exc:  # noqa: BLE001 - transport/auth/provider failures remain explicit errors
-        detail = str(exc)
-        return False, f"{type(exc).__name__}: {detail}"[:500]
-    return bool(rows) and (rows[0].get("n") or 0) > 0, None
+        return LogTableObservation(
+            table, "error", error=f"{type(exc).__name__}: {exc}"[:500],
+            error_type=type(exc).__name__, http_status=getattr(exc, "status_code", None),
+            service_code=getattr(getattr(exc, "error", None), "code", None),
+        )
+
+
+def _table_probe(
+    probe: Callable[[str], list[dict]], table: str,
+) -> tuple[bool, str | None]:
+    """Preserve the existing capability-probe contract over shared observation handling."""
+    result = probe_log_table(probe, table)
+    return result.row_count > 0, result.error
 
 
 def resolve_capabilities(
@@ -191,6 +261,7 @@ def resolve_capabilities(
     metrics_available: bool = True,
     arm_available: bool = True,
     cost_available: bool = False,
+    include_latest: bool = False,
 ) -> CapabilitySet:
     """Resolve the available capabilities for one account, probing the live workspace once per table.
 
@@ -215,11 +286,25 @@ def resolve_capabilities(
     def probe(kql: str) -> list[dict]:
         return la.query_resource(account_resource_id, kql, span)
 
+    table_results: dict[str, LogTableObservation] = {}
+
+    def table_probe(table: str) -> tuple[bool, str | None]:
+        """Probe a physical table once even when it satisfies multiple capabilities."""
+        if table not in table_results:
+            table_results[table] = probe_log_table(probe, table, include_latest=include_latest)
+        result = table_results[table]
+        return result.row_count > 0, result.error
+
     present: dict[str, bool] = {}
     probe_errors: dict[str, str] = {}
+    dataplane_source = None
     for cap in sorted(required_la_caps):
-        table = CAPABILITIES[cap].la_table
-        has_rows, error = _table_probe(probe, table)
+        for table in log_source_tables(cap):
+            has_rows, error = table_probe(table)
+            if has_rows or error is not None:
+                break
+        if cap == CAP_LA_REQUEST_AGGREGATES and has_rows:
+            dataplane_source = DataPlaneSource(table)
         if has_rows:
             present[cap] = True
             available.add(cap)
@@ -234,7 +319,7 @@ def resolve_capabilities(
         mode = LA_OK
     elif all(not v for v in present.values()):
         # Nothing resource-specific at all → distinguish "wrong mode" from "not enabled".
-        legacy_rows, legacy_error = _table_probe(probe, "AzureDiagnostics")
+        legacy_rows, legacy_error = table_probe("AzureDiagnostics")
         if legacy_error:
             mode = LA_PROBE_ERROR
             for cap in required_la_caps:
@@ -249,12 +334,16 @@ def resolve_capabilities(
         if not present[c] and c not in probe_errors
     )
     return CapabilitySet(
-        frozenset(available), mode, missing_tables, tuple(sorted(probe_errors.items()))
+        frozenset(available), mode, missing_tables, tuple(sorted(probe_errors.items())),
+        dataplane_source,
+        tuple(table_results.values()),
     )
 
 
 __all__ = [
     "CAP_METRICS", "CAP_ARM", "CAP_COST_MANAGEMENT", "CAP_LA_DATAPLANE", "CAP_LA_QUERYSTATS",
+    "CAP_LA_REQUEST_AGGREGATES",
+    "LogTableObservation", "probe_log_table", "log_source_tables",
     "Capability", "CAPABILITIES", "LA_CAPABILITIES",
     "LA_OK", "LA_NO_PROVIDER", "LA_NOT_ENABLED", "LA_LEGACY_MODE", "LA_PARTIAL", "LA_PROBE_ERROR",
     "CapabilitySet", "resolve_capabilities", "la_mode_guidance",
