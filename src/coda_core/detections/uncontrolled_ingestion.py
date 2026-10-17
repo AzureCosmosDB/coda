@@ -7,14 +7,16 @@ throughput-control feature, throughput buckets, priority-based execution, queue 
 distinct from DX-005's "provision more RU/s": you can smooth the ingestion instead of (or in addition
 to) paying for the peak.
 
-Signal & data source: **Log Analytics** ``CDBDataPlaneRequests`` (verified columns ``OperationName``,
-``RequestCharge``, ``StatusCode``, ``UserAgent``). Writes are ``Create``/``Upsert``/``Replace``/
+Signal & data source: **Log Analytics** ``CDBDataPlaneRequests5M`` when available, with raw
+``CDBDataPlaneRequests`` compatibility. Aggregates use ``RequestCount`` and ``TotalRequestCharge``,
+not row counts or unweighted means. Writes are ``Create``/``Upsert``/``Replace``/
 ``Delete``/``Patch``/``Execute`` (grounded against live data); everything else (``Read``/``Query``/
 ``QueryPlan``/``ReadFeed``/``Head``) is a read.
   * ``write_ru_pct`` = write-op RU ÷ total RU  → is the workload write-dominant?
   * ``throttle_rate`` = 429 count ÷ request count → is it throttling?
-  * ``burst_factor`` = peak per-minute write RU ÷ avg per-minute write RU → supporting evidence of
-    burstiness (an "uncontrolled" shape), surfaced in the finding but not a hard gate.
+  * ``burst_factor`` = peak write RU ÷ average write RU across observed write buckets: five-minute
+    buckets for aggregates, one-minute buckets for raw. The interval is explicit in evidence and
+    recommendations; burstiness remains supporting evidence, not a hard gate.
 
 Trigger: ``write_ru_pct >= 80%`` AND ``throttle_rate >= 10%``. Severity by throttle rate (>= 20% high).
 The dominant write ``UserAgent`` is surfaced as context (it identifies Spark/bulk connectors when
@@ -31,53 +33,69 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from coda_core.providers.base import TimeWindow
-from coda_core.providers.log_analytics import LogAnalyticsProvider
+from coda_core.providers.log_analytics import DataPlaneSource, LogAnalyticsProvider
 
 WRITE_OPS = ("Create", "Upsert", "Replace", "Delete", "Patch", "Batch", "Execute")
 
 
-def production_window(now: datetime | None = None) -> TimeWindow:
-    anchor = now or datetime.now(timezone.utc)
+def production_window(
+    now: datetime | None = None, source: DataPlaneSource = DataPlaneSource.RAW,
+) -> TimeWindow:
+    """Retain a full production day while avoiding a partial final five-minute bucket."""
+    anchor = source.anchor(now or datetime.now(timezone.utc))
     return TimeWindow(anchor - timedelta(days=1), anchor, timedelta(hours=1))
 
 
-def _container_base_kql(database: str, container: str) -> str:
+def _container_base_kql(
+    database: str, container: str, source: DataPlaneSource = DataPlaneSource.RAW,
+    window: TimeWindow | None = None,
+) -> str:
     """Shared one-container KQL predicate; runner uses these helpers for exact cache priming."""
     db = database.replace("'", "")
     coll = container.replace("'", "")
-    return f"CDBDataPlaneRequests | where DatabaseName == '{db}' and CollectionName == '{coll}' "
+    return source.query_table(window) + f"| where DatabaseName == '{db}' and CollectionName == '{coll}' "
 
 
 def _writes_literal() -> str:
     return ", ".join(f"'{w}'" for w in WRITE_OPS)
 
 
-def aggregate_kql(database: str, container: str) -> str:
+def aggregate_kql(
+    database: str, container: str, source: DataPlaneSource = DataPlaneSource.RAW,
+    window: TimeWindow | None = None,
+) -> str:
     """KQL for DX-010's RU/request/throttle aggregate for one container."""
     return (
-        _container_base_kql(database, container)
-        + "| summarize totalRu = sum(RequestCharge), "
-          f"writeRu = sumif(RequestCharge, OperationName in ({_writes_literal()})), "
-          "reqs = count(), throttles = countif(StatusCode == 429)"
+        _container_base_kql(database, container, source, window)
+        + f"| summarize totalRu = sum({source.charge}), "
+          f"writeRu = sumif({source.charge}, OperationName in ({_writes_literal()})), "
+          f"reqs = {source.count}, throttles = {source.count_if('StatusCode == 429')}"
+          f"{source.invalid_rows}"
     )
 
 
-def burst_kql(database: str, container: str) -> str:
-    """KQL for DX-010's per-minute write burst aggregate for one container."""
+def burst_kql(
+    database: str, container: str, source: DataPlaneSource = DataPlaneSource.RAW,
+    window: TimeWindow | None = None,
+) -> str:
+    """KQL for write bursts at the selected source's explicitly reported resolution."""
     return (
-        _container_base_kql(database, container)
+        _container_base_kql(database, container, source, window)
         + f"| where OperationName in ({_writes_literal()}) "
-          "| summarize ru = sum(RequestCharge) by bin(TimeGenerated, 1m) "
+          f"| summarize ru = sum({source.charge}) by bin(TimeGenerated, {source.burst_interval}) "
           "| summarize peak = max(ru), avg = avg(ru)"
     )
 
 
-def user_agent_kql(database: str, container: str) -> str:
+def user_agent_kql(
+    database: str, container: str, source: DataPlaneSource = DataPlaneSource.RAW,
+    window: TimeWindow | None = None,
+) -> str:
     """KQL for DX-010's dominant write client lookup for one container."""
     return (
-        _container_base_kql(database, container)
+        _container_base_kql(database, container, source, window)
         + f"| where OperationName in ({_writes_literal()}) "
-          "| summarize n = count() by UserAgent | top 1 by n"
+          f"| summarize n = {source.count} by UserAgent | top 1 by n"
     )
 
 
@@ -121,6 +139,8 @@ def classify(
     write_ru: float, total_ru: float, total_requests: float, throttled_requests: float,
     burst_factor: float, dominant_user_agent: str | None,
     config: IngestionConfig | None = None,
+    *,
+    burst_interval: str = "1m",
 ) -> IngestionVerdict:
     """Map write-dominance + throttling to an uncontrolled-ingestion verdict (pure)."""
     cfg = config or IngestionConfig()
@@ -133,6 +153,7 @@ def classify(
                        "severity_high_pct": cfg.severity_high_pct},
         "write_ru_pct": round(write_ru_pct, 1), "throttle_rate_pct": round(throttle_rate, 2),
         "burst_factor": round(burst_factor, 2), "dominant_user_agent": dominant_user_agent,
+        "burst_interval": burst_interval,
     }
 
     if total_requests < cfg.min_total_requests:
@@ -150,9 +171,10 @@ def classify(
 
     severity = "high" if throttle_rate >= cfg.severity_high_pct else "medium"
     ua = f" Dominant client: `{dominant_user_agent}`." if dominant_user_agent else ""
+    burst_label = "five-minute " if burst_interval == "5m" else ""
     action = (
         f"This container is write-dominant ({write_ru_pct:.0f}% of RU on writes) and throttling at "
-        f"{throttle_rate:.0f}% (peak-to-average write burst ~{burst_factor:.1f}×), the signature of "
+        f"{throttle_rate:.0f}% (peak-to-average {burst_label}write burst ~{burst_factor:.1f}×), the signature of "
         f"uncontrolled ingestion.{ua} Add application-side rate control rather than only provisioning "
         f"for the peak: bound the ingestion concurrency and honor `retry-after` on 429; use the SDK's "
         f"throughput-control feature (Java local/global groups, or the Spark connector) or throughput "
@@ -176,6 +198,7 @@ def detect_uncontrolled_ingestion(
     window: TimeWindow,
     *,
     config: IngestionConfig | None = None,
+    source: DataPlaneSource = DataPlaneSource.RAW,
 ) -> IngestionVerdict:
     """Run DX-010 after the pipeline has established the required LA capability.
 
@@ -185,25 +208,39 @@ def detect_uncontrolled_ingestion(
     cfg = config or IngestionConfig()
     span = (window.start, window.end)
     try:
-        agg = la.query_resource(account_resource_id, aggregate_kql(database, container), span)
-        burst = la.query_resource(account_resource_id, burst_kql(database, container), span)
-        ua = la.query_resource(account_resource_id, user_agent_kql(database, container), span)
+        source.validate_window(window)
+        agg = la.query_resource(
+            account_resource_id, aggregate_kql(database, container, source, window), span,
+        )
+        source.validate_rows(agg, counts=("reqs", "throttles"), charges=("totalRu", "writeRu"))
+        burst = la.query_resource(
+            account_resource_id, burst_kql(database, container, source, window), span,
+        )
+        ua = la.query_resource(
+            account_resource_id, user_agent_kql(database, container, source, window), span,
+        )
     except Exception as exc:  # noqa: BLE001 - preserve a failed detector as an explicit abstention
-        return _abstain("query_error", f"Log Analytics query failed: {exc}")
+        verdict = _abstain("query_error", f"Log Analytics query failed: {exc}")
+        verdict.methodology.update(source.evidence(window))
+        return verdict
 
     if not agg:
-        return _abstain(
+        verdict = _abstain(
             "insufficient_data", "No recent data-plane traffic for this database/container."
         )
+        verdict.methodology.update(source.evidence(window))
+        return verdict
     row = agg[0]
     total_ru = float(row.get("totalRu") or 0.0)
     write_ru = float(row.get("writeRu") or 0.0)
     reqs = float(row.get("reqs") or 0.0)
     throttles = float(row.get("throttles") or 0.0)
     if reqs <= 0:
-        return _abstain(
+        verdict = _abstain(
             "insufficient_data", "No recent data-plane traffic for this database/container."
         )
+        verdict.methodology.update(source.evidence(window))
+        return verdict
 
     burst_factor = 0.0
     if burst:
@@ -212,4 +249,9 @@ def detect_uncontrolled_ingestion(
         burst_factor = (peak / avg) if avg else 0.0
 
     dominant_ua = (ua[0].get("UserAgent") if ua else None) or None
-    return classify(write_ru, total_ru, reqs, throttles, burst_factor, dominant_ua, cfg)
+    verdict = classify(
+        write_ru, total_ru, reqs, throttles, burst_factor, dominant_ua, cfg,
+        burst_interval=source.burst_interval,
+    )
+    verdict.methodology.update(source.evidence(window))
+    return verdict

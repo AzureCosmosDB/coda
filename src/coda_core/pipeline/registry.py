@@ -46,6 +46,7 @@ from coda_core.framework.cost_rate import (
 from coda_core.pipeline.capabilities import (
     CAP_LA_DATAPLANE,
     CAP_LA_QUERYSTATS,
+    CAP_LA_REQUEST_AGGREGATES,
     CAPABILITIES,
     CapabilitySet,
 )
@@ -139,6 +140,7 @@ class AccountDetectionAdapter:
     title: str
     run: Callable[[AccountDetectionContext], Finding]
     requires: frozenset[str] = frozenset()
+    optional_requires: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -473,9 +475,12 @@ def _run_dx010(ctx: DetectionContext) -> Finding:
             recommended_action="", agent_kit_rule=None, threshold_status=THRESHOLD_VALIDATED,
             evidence={"abstained": "no Log Analytics provider", "la_unavailable": True},
         )
+    if ctx.dataplane_source is None:
+        raise ValueError("No request-log source was selected for DX-010.")
     v = ui.detect_uncontrolled_ingestion(
         ctx.la, ctx.account_resource_id, o.database, o.container,
-        ctx.window_for(ui.production_window(ctx.now)),
+        ctx.window_for(ui.production_window(ctx.now, ctx.dataplane_source)),
+        source=ctx.dataplane_source,
     )
     if v.root_cause in ("log_analytics_unavailable", "insufficient_data", "query_error"):
         status = STATUS_ABSTAINED
@@ -791,7 +796,7 @@ REGISTRY: list[DetectionAdapter] = [
     DetectionAdapter("DX-007", "Shard-key misalignment", _is_container, _run_dx007,
                      requires=frozenset({CAP_LA_QUERYSTATS, CAP_LA_DATAPLANE})),
     DetectionAdapter("DX-010", "Uncontrolled ingestion", _is_container, _run_dx010,
-                     requires=frozenset({CAP_LA_DATAPLANE})),
+                     requires=frozenset({CAP_LA_REQUEST_AGGREGATES})),
     DetectionAdapter("DX-004", "Idle container", _is_metrics_scoped, _run_dx004),
     DetectionAdapter("DX-005", "Under-provisioning / throttling", _is_metrics_scoped, _run_dx005),
     DetectionAdapter("DX-006", "Hot partition", _is_metrics_scoped, _run_dx006),
@@ -902,10 +907,22 @@ def _run_dx016(ctx: AccountDetectionContext) -> Finding:
         summary = (f"{v.consistency_level} consistency across {v.region_count} regions — premium "
                    f"latency/availability cost")
         window = ctx.window_for(cons.production_window(ctx.now))
+        if ctx.dataplane_source is not None:
+            window = ctx.window_for(cons.production_window(ctx.now, ctx.dataplane_source))
         if ctx.la is None:
             evidence["read_ru_enrichment"] = {
                 "status": "unavailable",
                 "reason": "log_analytics_provider_not_configured",
+                "observation_window": {
+                    "start_utc": window.start.isoformat(),
+                    "end_utc": window.end.isoformat(),
+                    "semantics": "[start,end)",
+                },
+            }
+        elif ctx.dataplane_source is None:
+            evidence["read_ru_enrichment"] = {
+                "status": "unavailable",
+                "reason": ctx.dataplane_error or "request_log_source_unavailable",
                 "observation_window": {
                     "start_utc": window.start.isoformat(),
                     "end_utc": window.end.isoformat(),
@@ -918,6 +935,7 @@ def _run_dx016(ctx: AccountDetectionContext) -> Finding:
                     ctx.la,
                     ctx.account_resource_id,
                     window,
+                    source=ctx.dataplane_source,
                 )
                 evidence["read_ru_enrichment"] = read_ru
                 if read_ru["status"] == "observed":
@@ -1197,7 +1215,10 @@ def _run_dx014(ctx: AccountDetectionContext) -> Finding:
 
 ACCOUNT_REGISTRY: list[AccountDetectionAdapter] = [
     AccountDetectionAdapter("DX-008", "Multi-region writes antipattern", _run_dx008),
-    AccountDetectionAdapter("DX-016", "Expensive consistency", _run_dx016),
+    AccountDetectionAdapter(
+        "DX-016", "Expensive consistency", _run_dx016,
+        optional_requires=frozenset({CAP_LA_REQUEST_AGGREGATES}),
+    ),
     AccountDetectionAdapter("DX-014", "Serverless candidate", _run_dx014),
     AccountDetectionAdapter("DX-019", "PITR on non-prod", _run_dx019),
     AccountDetectionAdapter("DX-020", "Error-code analysis", _run_dx020),
@@ -1210,9 +1231,12 @@ ACCOUNT_REGISTRY: list[AccountDetectionAdapter] = [
 # --- DX-003: shared-throughput starvation (database-scoped, Log Analytics) -------------
 
 def _run_dx003(ctx: DatabaseDetectionContext) -> Finding:
-    win = ctx.window_for(sht.production_window(ctx.now))
+    if ctx.dataplane_source is None:
+        raise ValueError("No request-log source was selected for DX-003.")
+    win = ctx.window_for(sht.production_window(ctx.now, ctx.dataplane_source))
     v = sht.detect_shared_throughput_starvation(
         ctx.la, ctx.account_resource_id, ctx.database, ctx.shared_ru, win,
+        source=ctx.dataplane_source,
     )
     if v.root_cause in ("log_analytics_unavailable", "insufficient_data", "query_error"):
         status = STATUS_ABSTAINED
@@ -1236,7 +1260,7 @@ def _run_dx003(ctx: DatabaseDetectionContext) -> Finding:
 
 DATABASE_REGISTRY: list[DatabaseDetectionAdapter] = [
     DatabaseDetectionAdapter("DX-003", "Shared-throughput starvation", _run_dx003,
-                             requires=frozenset({CAP_LA_DATAPLANE})),
+                             requires=frozenset({CAP_LA_REQUEST_AGGREGATES})),
 ]
 
 

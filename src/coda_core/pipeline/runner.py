@@ -11,8 +11,10 @@ Ties the three scope layers together for one account:
 from __future__ import annotations
 
 import concurrent.futures
+import logging
 import os
 import threading
+import urllib.error
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
@@ -23,12 +25,15 @@ from coda_core.framework.cost_rate import (
     RATE_SCOPE_ACCOUNT,
     RATE_SCOPE_SUBSCRIPTION_FALLBACK,
     EffectiveRate,
+    CostEstimateIssue,
+    cost_estimate_issue,
     derive_effective_rate,
 )
 from coda_core.pipeline.capabilities import (
     CAP_COST_MANAGEMENT,
     CAP_LA_DATAPLANE,
     CAP_LA_QUERYSTATS,
+    CAP_LA_REQUEST_AGGREGATES,
     resolve_capabilities,
 )
 from coda_core.pipeline.context import (
@@ -56,7 +61,11 @@ from coda_core.providers.arm import ArmProvider, account_config_from_arm
 from coda_core.providers.azure_monitor import AzureMonitorMetricsProvider
 from coda_core.providers.base import TimeWindow
 from coda_core.providers.cost_management import CostManagementProvider
-from coda_core.providers.log_analytics import CachingLogAnalyticsProvider, LogAnalyticsProvider
+from coda_core.providers.log_analytics import (
+    CachingLogAnalyticsProvider,
+    DataPlaneSource,
+    LogAnalyticsProvider,
+)
 from coda_core.providers.retail_prices import RetailPricesProvider
 
 DEFAULT_EVAL_HOURS = 24
@@ -70,6 +79,7 @@ CAPABILITY_EXISTENCE_DAYS = 30
 RATE_DERIVATION_DAYS = 30
 DEFAULT_UNIT_CONCURRENCY = 4
 UNIT_CONCURRENCY_ENV = "CODA_DIAGNOSE_UNIT_CONCURRENCY"
+_LOGGER = logging.getLogger(__name__)
 
 
 class _ThreadLocalUnitProviders:
@@ -178,8 +188,8 @@ def _prime_log_analytics_cache(
 ) -> None:
     """Batch account-wide LA reads and seed exact per-detector cache keys.
 
-    This preserves detection code and report semantics: detectors still ask for their original
-    one-container/one-database KQL, but the shared cache can answer from a smaller number of batched
+    Detectors ask for their source-specific one-container/one-database KQL, but the shared cache
+    can answer from a smaller number of batched
     account queries. Capability resolution has already established table availability over its longer
     existence window, so an empty analysis-window batch is cached as empty telemetry rather than
     reclassified as missing diagnostics. Any batch failure falls back to normal per-unit queries.
@@ -194,7 +204,11 @@ def _prime_log_analytics_cache(
     if not containers and not database_offers:
         return
 
-    data_window = ui.production_window(run_now)
+    source = caps.dataplane_source
+    data_window = (
+        ui.production_window(run_now, source) if source is not None
+        else ui.production_window(run_now)
+    )
     data_span = (data_window.start, data_window.end)
     predicate = _container_predicate(containers) if containers else ""
     writes = ", ".join(f"'{w}'" for w in ui.WRITE_OPS)
@@ -235,26 +249,27 @@ def _prime_log_analytics_cache(
             qs_fut = ex.submit(_read, qs_kql, qs_span)
 
         dp_futs = None
-        if containers and caps.has(CAP_LA_DATAPLANE):
+        if containers and source is not None and caps.has(CAP_LA_REQUEST_AGGREGATES):
             agg_kql = (
-                "CDBDataPlaneRequests "
-                f"| where {predicate} "
-                "| summarize totalRu = sum(RequestCharge), "
-                f"writeRu = sumif(RequestCharge, OperationName in ({writes})), "
-                "reqs = count(), throttles = countif(StatusCode == 429) "
+                source.query_table(data_window)
+                + f"| where {predicate} "
+                f"| summarize totalRu = sum({source.charge}), "
+                f"writeRu = sumif({source.charge}, OperationName in ({writes})), "
+                f"reqs = {source.count}, throttles = {source.count_if('StatusCode == 429')}"
+                f"{source.invalid_rows} "
                 "by DatabaseName, CollectionName"
             )
             burst_kql = (
-                "CDBDataPlaneRequests "
-                f"| where ({predicate}) and OperationName in ({writes}) "
-                "| summarize ru = sum(RequestCharge) by DatabaseName, CollectionName, "
-                "bin(TimeGenerated, 1m) "
+                source.query_table(data_window)
+                + f"| where ({predicate}) and OperationName in ({writes}) "
+                f"| summarize ru = sum({source.charge}) by DatabaseName, CollectionName, "
+                f"bin(TimeGenerated, {source.burst_interval}) "
                 "| summarize peak = max(ru), avg = avg(ru) by DatabaseName, CollectionName"
             )
             ua_kql = (
-                "CDBDataPlaneRequests "
-                f"| where ({predicate}) and OperationName in ({writes}) "
-                "| summarize n = count() by DatabaseName, CollectionName, UserAgent "
+                source.query_table(data_window)
+                + f"| where ({predicate}) and OperationName in ({writes}) "
+                f"| summarize n = {source.count} by DatabaseName, CollectionName, UserAgent "
                 "| summarize arg_max(n, UserAgent) by DatabaseName, CollectionName"
             )
             dp_futs = {
@@ -265,14 +280,15 @@ def _prime_log_analytics_cache(
 
         dbs = None
         shared_fut = None
-        if database_offers and caps.has(CAP_LA_DATAPLANE):
+        if database_offers and source is not None and caps.has(CAP_LA_REQUEST_AGGREGATES):
             dbs = [dbo.database for dbo in database_offers]
             db_literals = ", ".join(_kql_literal(db) for db in dbs)
             shared_kql = (
-                "CDBDataPlaneRequests "
-                f"| where DatabaseName in ({db_literals}) and isnotempty(CollectionName) "
-                "| summarize requests = count(), throttled = countif(StatusCode == 429), "
-                "ru = sum(RequestCharge) by DatabaseName, CollectionName"
+                source.query_table(data_window)
+                + f"| where DatabaseName in ({db_literals}) and isnotempty(CollectionName) "
+                f"| summarize requests = {source.count}, "
+                f"throttled = {source.count_if('StatusCode == 429')}, "
+                f"ru = sum({source.charge}){source.invalid_rows} by DatabaseName, CollectionName"
             )
             shared_fut = ex.submit(_read, shared_kql, data_span)
 
@@ -298,16 +314,18 @@ def _prime_log_analytics_cache(
                 ua_by_unit = _group_rows(ua_raw)
                 for db, container in containers:
                     zero = [{"totalRu": 0.0, "writeRu": 0.0, "reqs": 0, "throttles": 0}]
+                    if source.invalid_rows:
+                        zero[0]["invalid_rows"] = 0
                     la.prime_query_resource(
-                        account_resource_id, ui.aggregate_kql(db, container), data_span,
+                        account_resource_id, ui.aggregate_kql(db, container, source, data_window), data_span,
                         agg_by_unit.get((db, container), zero),
                     )
                     la.prime_query_resource(
-                        account_resource_id, ui.burst_kql(db, container), data_span,
+                        account_resource_id, ui.burst_kql(db, container, source, data_window), data_span,
                         burst_by_unit.get((db, container), []),
                     )
                     la.prime_query_resource(
-                        account_resource_id, ui.user_agent_kql(db, container), data_span,
+                        account_resource_id, ui.user_agent_kql(db, container, source, data_window), data_span,
                         ua_by_unit.get((db, container), []),
                     )
 
@@ -320,22 +338,45 @@ def _prime_log_analytics_cache(
                     for (row_db, _), group in grouped.items():
                         if row_db == db:
                             rows.extend(group)
-                    la.prime_query_resource(account_resource_id, sht.traffic_kql(db), data_span, rows)
+                    la.prime_query_resource(
+                        account_resource_id, sht.traffic_kql(db, source, data_window), data_span, rows
+                    )
+
+
+def _cost_query_issue(exc: Exception, query_scope: str) -> CostEstimateIssue:
+    """Classify billing failures safely; retain the reason without changing fallback/retry policy."""
+    status = exc.code if isinstance(exc, urllib.error.HTTPError) else getattr(exc, "status_code", None)
+    status = status if type(status) is int and 100 <= status <= 599 else None
+    reason = (
+        "rate_limited" if status == 429 else
+        "authentication" if status == 401 or type(exc).__name__ in {
+            "ClientAuthenticationError", "CredentialUnavailableError",
+        } else
+        "access_denied" if status == 403 or isinstance(exc, PermissionError) else
+        "timeout" if isinstance(exc, TimeoutError) or (
+            isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, TimeoutError)
+        ) else
+        "service_unavailable" if status is not None and status >= 500 else "query_failed"
+    )
+    issue = cost_estimate_issue(reason, query_scope, http_status=status)
+    _LOGGER.warning("Cost enrichment unavailable: %s (scope=%s)", issue.code, query_scope)
+    return issue
 
 
 def _derive_effective_rate(
     cost: CostManagementProvider | None, account_resource_id: str, run_now: datetime,
     caps,
-) -> EffectiveRate | None:
+) -> tuple[EffectiveRate | None, CostEstimateIssue | None]:
     """Derive a customer-bill $/RU/s rate without masking account-query failures.
 
     The account-attributed amortized rate is preferred. A subscription-amortized rate is queried only
     after that account query succeeds but has no positive finite rate, which covers Azure billing
     attribution latency for newly provisioned accounts. An account-query exception fails closed
     immediately so an auth or transient failure is never hidden by a broader query (ADR-0051).
+    Return the usable rate or one account-level explanation for why dollar enrichment is unavailable.
     """
     if cost is None or not caps.has(CAP_COST_MANAGEMENT):
-        return None
+        return None, cost_estimate_issue("not_configured", "not_queried")
     start = (run_now - timedelta(days=RATE_DERIVATION_DAYS)).date()
     try:
         account_cost = cost.cosmos_throughput_cost(
@@ -343,33 +384,37 @@ def _derive_effective_rate(
             run_now.date(),
             resource_id=account_resource_id,
         )
-    except Exception:  # noqa: BLE001 - cost is a best-effort enrichment; never fail the diagnosis
-        return None
-    account_rate = derive_effective_rate(
-        account_cost.cost,
-        account_cost.usage,
-        account_cost.currency,
-        rate_scope=RATE_SCOPE_ACCOUNT,
-        meters=account_cost.meters,
-    )
+        account_rate = derive_effective_rate(
+            account_cost.cost,
+            account_cost.usage,
+            account_cost.currency,
+            rate_scope=RATE_SCOPE_ACCOUNT,
+            meters=account_cost.meters,
+        )
+    except Exception as exc:  # noqa: BLE001 - retain a safe reason; capacity diagnosis remains valid
+        return None, _cost_query_issue(exc, RATE_SCOPE_ACCOUNT)
     if account_rate is not None:
-        return account_rate
+        return account_rate, None
     try:
         subscription_cost = cost.cosmos_throughput_cost(start, run_now.date())
-    except Exception:  # noqa: BLE001 - fallback failure keeps the diagnosis capacity-only
-        return None
-    return derive_effective_rate(
-        subscription_cost.cost,
-        subscription_cost.usage,
-        subscription_cost.currency,
-        rate_scope=RATE_SCOPE_SUBSCRIPTION_FALLBACK,
-        meters=subscription_cost.meters,
+        subscription_rate = derive_effective_rate(
+            subscription_cost.cost,
+            subscription_cost.usage,
+            subscription_cost.currency,
+            rate_scope=RATE_SCOPE_SUBSCRIPTION_FALLBACK,
+            meters=subscription_cost.meters,
+        )
+    except Exception as exc:  # noqa: BLE001 - fallback failure remains visible and capacity-only
+        return None, _cost_query_issue(exc, RATE_SCOPE_SUBSCRIPTION_FALLBACK)
+    return (
+        (subscription_rate, None) if subscription_rate is not None
+        else (None, cost_estimate_issue("no_usable_rate", RATE_SCOPE_SUBSCRIPTION_FALLBACK))
     )
 
 
 def default_eval_window(now: datetime | None = None, hours: int = DEFAULT_EVAL_HOURS) -> TimeWindow:
-    """Recent window used by eval mode (skips age floors) to exercise the wiring on fresh data."""
-    anchor = now or datetime.now(timezone.utc)
+    """Build source-compatible relative eval windows without moving an explicitly pinned end."""
+    anchor = now if now is not None else DataPlaneSource.FIVE_MINUTE.anchor(datetime.now(timezone.utc))
     return TimeWindow(anchor - timedelta(hours=hours), anchor, timedelta(hours=1))
 
 
@@ -447,10 +492,12 @@ def run_diagnostics(
         la=la, account_resource_id=account_resource_id, span=cap_span,
         cost_available=cost is not None,
     )
+    if eval_window is None and caps.dataplane_source is DataPlaneSource.FIVE_MINUTE:
+        window = default_eval_window(now=caps.dataplane_source.anchor(run_now))
     # Derive the customer's effective $/RU/s rate once per run from their amortized bill. Account rows
     # are preferred; subscription rows are a provenance-labelled billing-latency fallback (ADR-0051).
     # None means bill-derived savings findings stay capacity-only.
-    effective_rate = _derive_effective_rate(cost, account_resource_id, run_now, caps)
+    effective_rate, cost_issue = _derive_effective_rate(cost, account_resource_id, run_now, caps)
     _prime_log_analytics_cache(la, account_resource_id, container_offers, database_offers, run_now, caps)
 
     findings = []
@@ -461,6 +508,8 @@ def run_diagnostics(
         scope_provisioned_ru=scope_provisioned_ru, resource_group=resource_group, arm=arm,
         retail_prices=retail_prices, throughput_offers=tuple(offers), la=la,
         effective_rate=effective_rate,
+        dataplane_source=caps.dataplane_source,
+        dataplane_error=caps.probe_error_for(frozenset({CAP_LA_REQUEST_AGGREGATES})),
     )
     for acct_adapter in ACCOUNT_REGISTRY:
         findings.append(run_account(acct_adapter, acct_ctx, caps))
@@ -474,6 +523,7 @@ def run_diagnostics(
             la=worker_la, account=account, account_resource_id=account_resource_id,
             database=dbo.database, shared_ru=dbo.provisioned_ru, mode=mode, eval_window=window,
             now=run_now,
+            dataplane_source=caps.dataplane_source,
         )
         unit_findings = []
         for db_adapter in DATABASE_REGISTRY:
@@ -525,6 +575,7 @@ def run_diagnostics(
             offer=offer, mode=mode, eval_window=window, now=run_now,
             resource_created_at=resource_created_at, scope_provisioned_ru=scope_provisioned_ru,
             la=worker_la, effective_rate=effective_rate,
+            dataplane_source=caps.dataplane_source,
         )
         unit_findings = []
         for adapter in REGISTRY:
@@ -568,6 +619,7 @@ def run_diagnostics(
         generated_at=now_iso(), summary=summary, findings=findings,
         account_resource_id=account_resource_id,
         account_endpoint=getattr(acct, "document_endpoint", None),
+        cost_estimate_issue=cost_issue,
     )
 
 

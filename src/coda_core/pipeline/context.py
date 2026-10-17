@@ -17,7 +17,7 @@ from coda_core.framework.cost_rate import EffectiveRate
 from coda_core.providers.arm import AccountConfig, ArmProvider, ThroughputOffer
 from coda_core.providers.azure_monitor import AzureMonitorMetricsProvider
 from coda_core.providers.base import TimeWindow
-from coda_core.providers.log_analytics import LogAnalyticsProvider
+from coda_core.providers.log_analytics import DataPlaneSource, LogAnalyticsProvider
 from coda_core.providers.retail_prices import RetailPricesProvider
 
 MODE_PRODUCTION = "production"
@@ -39,6 +39,7 @@ class DetectionContext:
                                             # detections (e.g. DX-002); None => those detections skip.
     effective_rate: EffectiveRate | None = None  # customer's bill-derived $/RU/s rate (ADR-0028);
                                                  # None => Cost Management absent → capacity-only findings.
+    dataplane_source: DataPlaneSource | None = DataPlaneSource.RAW
 
     def window_for(self, production_window: TimeWindow) -> TimeWindow:
         """Pick the detection's production window, or the shared eval window in eval mode."""
@@ -75,6 +76,8 @@ class AccountDetectionContext:
     throughput_offers: tuple[ThroughputOffer, ...] = ()
     la: LogAnalyticsProvider | None = None
     effective_rate: EffectiveRate | None = None
+    dataplane_source: DataPlaneSource | None = DataPlaneSource.RAW
+    dataplane_error: str | None = None
 
     def window_for(self, production_window: TimeWindow) -> TimeWindow:
         """Pick the detection's production window, or the shared eval window in eval mode."""
@@ -97,6 +100,7 @@ class DatabaseDetectionContext:
     mode: str = ""
     eval_window: TimeWindow | None = None
     now: datetime | None = None
+    dataplane_source: DataPlaneSource | None = DataPlaneSource.RAW
 
     def window_for(self, production_window: TimeWindow) -> TimeWindow:
         return self.eval_window if self.mode == MODE_EVAL else production_window

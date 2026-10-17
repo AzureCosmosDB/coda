@@ -189,8 +189,23 @@ def _run(
     return result
 
 
+def resolved_venv_path(root: Path) -> Path:
+    """Use one absolute path representation for deep installs and interpreter provenance checks."""
+    root = root.resolve()
+    if os.name == "nt":
+        absolute = str(root)
+        if not absolute.startswith("\\\\?\\"):
+            absolute = (
+                "\\\\?\\UNC\\" + absolute[2:] if absolute.startswith("\\\\")
+                else "\\\\?\\" + absolute
+            )
+        root = Path(absolute)
+    return root
+
+
 def _create_venv(root: Path) -> tuple[Path, Path]:
-    """Create an isolated virtual environment and return its real entry-point paths."""
+    """Create isolated entry points with Windows extended paths so pip can install deep SDK trees."""
+    root = resolved_venv_path(root)
     venv.EnvBuilder(with_pip=True, clear=True).create(root)
     python, coda = venv_paths(root)
     if not python.is_file():

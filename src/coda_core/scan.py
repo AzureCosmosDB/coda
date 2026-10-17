@@ -87,7 +87,9 @@ class AccountScanResult:
                 "units_scanned": self.units_scanned, "actionable": self.actionable,
                 "abstained": self.abstained, "la_missing": self.la_missing,
                 "recoverable_ru": round(self.recoverable_ru), "status": self.status,
-                "error": self.error}
+                "error": self.error,
+                **({"cost_estimate_issue": self.report["cost_estimate_issue"]}
+                   if self.report and self.report.get("cost_estimate_issue") else {})}
 
 
 @dataclass
