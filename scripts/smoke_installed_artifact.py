@@ -204,12 +204,13 @@ def resolved_venv_path(root: Path) -> Path:
 
 
 def _create_venv(root: Path) -> tuple[Path, Path]:
-    """Create isolated entry points with Windows extended paths so pip can install deep SDK trees."""
+    """Bootstrap pip in isolation so older bundles do not scan invalid extended-path cwd entries."""
     root = resolved_venv_path(root)
-    venv.EnvBuilder(with_pip=True, clear=True).create(root)
+    venv.EnvBuilder(with_pip=False, clear=True).create(root)
     python, coda = venv_paths(root)
     if not python.is_file():
         raise SmokeError(f"virtual-environment interpreter missing: {python}")
+    _run([str(python), "-I", "-m", "ensurepip", "--upgrade", "--default-pip"])
     return python, coda
 
 

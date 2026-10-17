@@ -48,7 +48,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Missing log records, empty cost/metric data, and HTTP 429 responses no longer imply missing
   permissions. Suggested fixes preserve existing diagnostic exports and the original requester.
 - Package verification supports deeply nested Windows paths without requiring a machine-wide
-  long-path setting change.
+  long-path setting change. Python 3.12 bootstraps pip in isolation and reports bootstrap errors
+  with their underlying output.
 
 ### Known limitations
 
