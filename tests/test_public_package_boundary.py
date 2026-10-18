@@ -1,9 +1,12 @@
-"""Verify public packaging and route boundaries, not Azure telemetry or detections."""
+"""Verify public packaging, installation guidance, and routes, not Azure telemetry or detections."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -32,6 +35,84 @@ _STRUCTURAL_TOKENS = (
     'name="depth"',
     'value="shallow"',
 )
+
+
+def _latest_install_examples() -> dict[str, str]:
+    """Read the actual install commands in either the authoritative or exported README layout."""
+    root = Path(__file__).resolve().parents[1]
+    source = root / "governance" / "public" / "README.md"
+    readme = (source if source.is_file() else root / "README.md").read_text(encoding="utf-8")
+    blocks = re.findall(
+        r"<!-- latest-release-(powershell|bash) -->\n```(?:powershell|bash)\n(.*?)\n```",
+        readme, re.DOTALL,
+    )
+    assert len(blocks) == 2 and {shell for shell, _ in blocks} == {"powershell", "bash"}
+    return dict(blocks)
+
+
+@pytest.mark.parametrize("shell", ["powershell", "bash"])
+def test_latest_install_selects_published_preview_and_verifies_before_install(shell):
+    """Every public PR guards the version-free selector and same-tag, fail-closed install order."""
+    script = _latest_install_examples()[shell]
+    selector = next(line for line in script.splitlines() if "gh release list " in line)
+    for flag in ("--exclude-drafts", "--order desc", "--limit 1", "--json tagName",
+                 "--jq '.[0].tagName'"):
+        assert flag in selector
+    assert "AzureCosmosDB/coda" in script
+    assert "--exclude-pre-releases" not in script
+    assert "/releases/latest" not in script
+    assert not re.search(r"\bv?\d+\.\d+\.\d+\b", script), "Do not pin automatic installs."
+    download = next(line for line in script.splitlines() if line.startswith("gh release download "))
+    assert re.search(r'gh release download "?\$tag"? ', download)
+    assert "--pattern SHA256SUMS.txt" in download
+    assert re.search(r'--pattern "?\$wheel"? ', download)
+    assert '"coda-$version-py3-none-any.whl"' in script
+    assert "--clobber" not in script
+    check = script.index("python -c ")
+    install = script.index('python -m pip install "./$wheel"')
+    assert script.index("gh release download ") < check < install
+    if shell == "powershell":
+        assert "IsNullOrWhiteSpace($tag)" in script
+        assert "$version = $tag -replace '^v', ''" in script
+        assert 'if ($LASTEXITCODE -ne 0)' in script[script.index("gh release download "):check]
+        assert "throw " in script[script.index("gh release download "):check]
+        assert 'if ($LASTEXITCODE -ne 0)' in script[check:install]
+        assert "throw " in script[check:install]
+    else:
+        assert script.startswith("set -euo pipefail\n")
+        assert 'version="${tag#v}"' in script
+        assert 'test -n "$tag"' in script
+        assert "|| true" not in script
+
+
+@pytest.mark.parametrize("shell", ["powershell", "bash"])
+@pytest.mark.parametrize("case", ["valid", "tampered", "missing-wheel", "missing-checksums", "missing-entry"])
+def test_documented_checksum_command_rejects_unverified_wheels(tmp_path, shell, case):
+    """Execute the README's real checksum code offline, including corruption and missing inputs."""
+    script = _latest_install_examples()[shell]
+    line = next(line for line in script.splitlines() if line.startswith("python -c "))
+    code = shlex.split(line)[2]
+    wheel = tmp_path / "coda-1.2.3-py3-none-any.whl"
+    wheel.write_bytes(b"synthetic release wheel")
+    checksums = tmp_path / "SHA256SUMS.txt"
+    checksums.write_text(
+        f"{hashlib.sha256(wheel.read_bytes()).hexdigest()}  {wheel.name}\n", encoding="utf-8",
+    )
+    if case == "tampered":
+        wheel.write_bytes(b"changed after publication")
+    elif case == "missing-wheel":
+        wheel.unlink()
+    elif case == "missing-checksums":
+        checksums.unlink()
+    elif case == "missing-entry":
+        checksums.write_text(f"{'0' * 64}  unrelated.whl\n", encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", code, wheel.name],
+        cwd=tmp_path, capture_output=True, text=True, timeout=30, check=False,
+    )
+    assert (result.returncode == 0) == (case == "valid")
+    if case == "valid":
+        assert "SHA-256 verified" in result.stdout
 
 
 def test_public_app_import_graph_excludes_internal_modules():

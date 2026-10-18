@@ -7,6 +7,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.17.2] - 2026-10-17
+
+### Changed
+
+- Install the newest published release, including Previews, with copy-paste GitHub CLI instructions
+  for PowerShell and Bash. Wheel and checksum downloads are pinned to one selected tag, and a
+  failed download or checksum check stops installation.
+- Keep manual downloads and version-pinned installation available. CI now guards the automatic
+  installation examples against stale versions and missing checksum verification.
+
 ## [0.17.1] - 2026-10-17
 
 ### Preview status
