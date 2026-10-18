@@ -109,9 +109,9 @@ Choose a release wheel for normal use, or clone/download the repository to run f
 If the [Releases page](https://github.com/AzureCosmosDB/coda/releases) has no release yet, use the
 source option below.
 
-### Option 1: Download a release
+### Option 1: Install the latest release
 
-Create an isolated environment:
+In a new, empty working folder, create an isolated environment:
 
 ```console
 python -m venv .venv
@@ -120,6 +120,61 @@ python -m venv .venv
 Activate it with `.\.venv\Scripts\Activate.ps1` in Windows PowerShell, or
 `source .venv/bin/activate` on macOS/Linux. If PowerShell blocks activation, use
 `.\.venv\Scripts\python.exe` and `.\.venv\Scripts\coda.exe` directly instead.
+If your system names Python `python3`, use that name for the initial environment-creation command.
+
+For automatic downloads, install [GitHub CLI](https://cli.github.com/) and sign in with
+`gh auth login` if needed. This is separate from the Azure sign-in used when running CODA.
+The commands below select the newest non-draft release, **including Preview releases**. There is
+no version to replace, and the wheel and checksums come from the same selected tag. A newer source
+checkout or merged PR is not selected until its release is published.
+
+Run the block for your shell in the activated environment. Downloads intentionally fail if files
+already exist; use a fresh working folder rather than mixing releases.
+
+#### Windows PowerShell
+
+<!-- latest-release-powershell -->
+```powershell
+$ErrorActionPreference = "Stop"
+$repo = "AzureCosmosDB/coda"
+$tag = gh release list --repo $repo --exclude-drafts --order desc --limit 1 --json tagName --jq '.[0].tagName'
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($tag)) { throw "Could not select a published CODA release." }
+$version = $tag -replace '^v', ''
+$wheel = "coda-$version-py3-none-any.whl"
+gh release download $tag --repo $repo --pattern $wheel --pattern SHA256SUMS.txt
+if ($LASTEXITCODE -ne 0) { throw "Release download failed." }
+python -c "import hashlib,pathlib,sys; wheel=pathlib.Path(sys.argv[1]); rows=[line.split() for line in pathlib.Path('SHA256SUMS.txt').read_text(encoding='utf-8').splitlines()]; expected=next(row[0] for row in rows if len(row)==2 and row[1].lstrip('*')==wheel.name); actual=hashlib.sha256(wheel.read_bytes()).hexdigest(); sys.exit('SHA-256 mismatch') if actual!=expected else print('SHA-256 verified')" $wheel
+if ($LASTEXITCODE -ne 0) { throw "Checksum verification failed; nothing was installed." }
+python -m pip install "./$wheel"
+if ($LASTEXITCODE -ne 0) { throw "Installation failed." }
+```
+
+#### macOS / Linux (Bash)
+
+<!-- latest-release-bash -->
+```bash
+set -euo pipefail
+repo="AzureCosmosDB/coda"
+tag=$(gh release list --repo "$repo" --exclude-drafts --order desc --limit 1 --json tagName --jq '.[0].tagName')
+test -n "$tag" || { echo "Could not select a published CODA release." >&2; exit 1; }
+version="${tag#v}"
+wheel="coda-$version-py3-none-any.whl"
+gh release download "$tag" --repo "$repo" --pattern "$wheel" --pattern SHA256SUMS.txt
+python -c "import hashlib,pathlib,sys; wheel=pathlib.Path(sys.argv[1]); rows=[line.split() for line in pathlib.Path('SHA256SUMS.txt').read_text(encoding='utf-8').splitlines()]; expected=next(row[0] for row in rows if len(row)==2 and row[1].lstrip('*')==wheel.name); actual=hashlib.sha256(wheel.read_bytes()).hexdigest(); sys.exit('SHA-256 mismatch') if actual!=expected else print('SHA-256 verified')" "$wheel"
+python -m pip install "./$wheel"
+```
+
+For optional MCP support, after either block installs the verified wheel, run:
+
+```console
+python -m pip install "./${wheel}[mcp]"
+```
+
+The base installation already includes the web UI; MCP is the only optional extra.
+
+#### Manual download or a specific version
+
+If you do not want to use GitHub CLI, or need to pin a particular release, use the following steps.
 
 Download `coda-<version>-py3-none-any.whl` and `SHA256SUMS.txt` from the same
 [GitHub Release](https://github.com/AzureCosmosDB/coda/releases). Replace `<version>` with the
@@ -149,7 +204,6 @@ pip install "coda[mcp] @ https://github.com/AzureCosmosDB/coda/releases/download
 
 For a downloaded wheel with MCP support, use
 `python -m pip install "./coda-<version>-py3-none-any.whl[mcp]"`.
-The base installation already includes the web UI; MCP is the only optional extra.
 
 ### Option 2: Clone or download the source
 
