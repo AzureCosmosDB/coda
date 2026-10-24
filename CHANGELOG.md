@@ -7,6 +7,38 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.17.7] - 2026-10-23
+
+### Added
+
+- DX-024 (indexing cost risk): flags containers whose index storage is more than 30% of their
+  data storage (Low), or larger than the data itself (Medium). It runs on every NoSQL container,
+  including shared-throughput and serverless containers, and needs no Log Analytics. Paths you
+  already excluded from indexing are reported as evidence.
+
+### Changed
+
+- DX-002 (cross-partition query fan-out) and DX-007 (shard-key misalignment) now flag fan-out by
+  query pattern instead of query cost, because each partition visit adds cost and latency even
+  when it is cheap. Fan-out below 0.1 queries per second is not reported. Severity depends on the
+  number of physical partitions and the fan-out query rate.
+- Source preparation only; this entry does not publish or replace the v0.17.1 Preview release.
+
+### Fixed
+
+- DX-017 keeps its urgent High finding when a physical partition is already at or above 50 GiB,
+  even when another partition has a less urgent growth projection.
+- Accounts that send diagnostic logs to more than one Log Analytics workspace no longer have
+  their log-based totals counted once per workspace. Single-workspace accounts are unaffected.
+
+## [0.17.3] - 2026-10-22
+
+### Changed
+
+- Preserve the full commit SHA pins for all GitHub Actions in package CI and release workflows
+  when generating future public updates.
+- Source preparation only; this entry does not publish or replace the v0.17.1 Preview release.
+
 ## [0.17.2] - 2026-10-17
 
 ### Changed

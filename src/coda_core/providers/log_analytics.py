@@ -29,6 +29,27 @@ from coda_core.providers.base import TimeWindow
 _T = TypeVar("_T")
 
 
+def primary_destination_filter(table: str, window: TimeWindow | None = None) -> str:
+    """Keep only the one Log Analytics workspace holding the most rows of ``table``.
+
+    An account can send the same diagnostic categories to several workspaces (up to five diagnostic
+    settings). A resource-context query returns every copy the caller can read, so totals summed
+    across copies double (or worse, when two such tables are joined). Each copy is ingested
+    independently and can differ slightly, so we select the most complete one (``TenantId`` is the
+    workspace ID; ties break deterministically) rather than de-duplicating rows across copies. The
+    choice is account-wide per table, so per-container and batched queries select the same copy.
+    """
+    bounds = (
+        f"| where TimeGenerated >= datetime({window.start.isoformat()}) "
+        f"and TimeGenerated < datetime({window.end.isoformat()}) "
+        if window is not None else ""
+    )
+    return (
+        f"| where TenantId == toscalar({table} {bounds}| summarize destinationRows = count() by TenantId "
+        "| sort by destinationRows desc, TenantId asc | take 1 | project TenantId) "
+    )
+
+
 class DataPlaneSource(str, Enum):
     """One request-log source; aggregates and raw records must never be added together."""
 
@@ -84,15 +105,16 @@ class DataPlaneSource(str, Enum):
             raise ValueError("Five-minute request logs require five-minute-aligned window boundaries.")
 
     def query_table(self, window: TimeWindow | None = None) -> str:
-        """Enforce half-open bucket bounds explicitly rather than relying on API endpoint rules."""
+        """Enforce half-open bucket bounds and a single diagnostic destination (no double counting)."""
         if self is self.RAW:
-            return f"{self.value} "
+            return f"{self.value} " + primary_destination_filter(self.value)
         if window is None:
             raise ValueError("Five-minute request queries require an explicit observation window.")
         self.validate_window(window)
         return (
             f"{self.value} | where TimeGenerated >= datetime({window.start.isoformat()}) "
             f"and TimeGenerated < datetime({window.end.isoformat()}) "
+            + primary_destination_filter(self.value, window)
         )
 
     def validate_rows(self, rows: list[dict], *, counts: tuple[str, ...], charges: tuple[str, ...]) -> None:
@@ -120,7 +142,8 @@ class DataPlaneSource(str, Enum):
             "source_resolution": "PT5M" if self is self.FIVE_MINUTE else "per_request",
             "coverage_note": (
                 "Table availability and row counts do not establish collection continuity. "
-                "Resource-context queries can include multiple diagnostic destinations."
+                "When several diagnostic destinations exist, only the workspace with the most "
+                "rows is counted."
             ),
             "observation_window": {
                 "start_utc": window.start.isoformat(),

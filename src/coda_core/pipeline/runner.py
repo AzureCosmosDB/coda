@@ -42,16 +42,21 @@ from coda_core.pipeline.context import (
     AccountDetectionContext,
     DatabaseDetectionContext,
     DetectionContext,
+    InventoryDetectionContext,
     ServerlessDetectionContext,
 )
 from coda_core.pipeline.registry import (
     ACCOUNT_REGISTRY,
     DATABASE_REGISTRY,
+    INVENTORY_REGISTRY,
     REGISTRY,
     SERVERLESS_REGISTRY,
+    _account_unit,
+    _error_finding,
     run_account,
     run_container,
     run_database,
+    run_inventory,
     run_serverless,
     threshold_status_for,
 )
@@ -65,6 +70,7 @@ from coda_core.providers.log_analytics import (
     CachingLogAnalyticsProvider,
     DataPlaneSource,
     LogAnalyticsProvider,
+    primary_destination_filter,
 )
 from coda_core.providers.retail_prices import RetailPricesProvider
 
@@ -232,12 +238,14 @@ def _prime_log_analytics_cache(
             qs_span = (query_window.start, query_window.end)
             qs_kql = (
                 "CDBQueryRuntimeStatistics "
-                f"| where {predicate} "
+                + primary_destination_filter("CDBQueryRuntimeStatistics")
+                + f"| where {predicate} "
                 "| project DatabaseName, CollectionName, ActivityId, CorrelatedActivityId, "
                 "QueryText, PartitionKeyRangeId "
                 "| join kind=leftouter ("
                 "CDBDataPlaneRequests "
-                f"| where {predicate} "
+                + primary_destination_filter("CDBDataPlaneRequests")
+                + f"| where {predicate} "
                 "| summarize ru = sum(RequestCharge) by ActivityId"
                 ") on ActivityId "
                 "| summarize partitionsHit = dcount(PartitionKeyRangeId), queryRU = sum(ru) "
@@ -600,6 +608,32 @@ def run_diagnostics(
         metrics_offers, _run_container_unit, concurrency=unit_concurrency
     ):
         findings.extend(unit_findings)
+
+    # All-container inventory pass (DX-024 indexing cost): every container regardless of throughput
+    # model, enumerated once from ARM with its indexing policy. An enumeration failure degrades to one
+    # account-level abstention per inventory detection rather than aborting the run.
+    if INVENTORY_REGISTRY:
+        try:
+            inventory = arm.list_container_indexing(resource_group, account)
+        except Exception as exc:  # noqa: BLE001 - degrade gracefully; never abort the run
+            inventory = []
+            for inv_adapter in INVENTORY_REGISTRY:
+                findings.append(_error_finding(
+                    inv_adapter.detection_id, inv_adapter.title, _account_unit(acct_ctx), exc,
+                ))
+
+        def _run_inventory_unit(_idx: int, cont) -> list:
+            worker_metrics, _, _ = worker_providers.current()
+            inv_ctx = InventoryDetectionContext(
+                metrics=worker_metrics, account=account, account_resource_id=account_resource_id,
+                container=cont, mode=mode, eval_window=window, now=run_now,
+            )
+            return [run_inventory(a, inv_ctx, caps) for a in INVENTORY_REGISTRY]
+
+        for unit_findings in _ordered_parallel_map(
+            inventory, _run_inventory_unit, concurrency=unit_concurrency
+        ):
+            findings.extend(unit_findings)
 
     findings = correlate(findings)
     # Honesty policy (single source of truth): stamp each finding's threshold_status by whether the

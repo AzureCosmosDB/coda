@@ -21,6 +21,7 @@ from coda_core.detections import cross_partition_query as cpq
 from coda_core.detections import error_analysis as ea
 from coda_core.detections import hot_partition as hp
 from coda_core.detections import idle_container as idle
+from coda_core.detections import indexing_cost as ic
 from coda_core.detections import mode_switch as ms
 from coda_core.detections import multi_region_write as mrw
 from coda_core.detections import over_provisioning as op
@@ -54,6 +55,7 @@ from coda_core.pipeline.context import (
     AccountDetectionContext,
     DatabaseDetectionContext,
     DetectionContext,
+    InventoryDetectionContext,
     ServerlessDetectionContext,
 )
 from coda_core.pipeline.finding import (
@@ -80,12 +82,12 @@ from coda_core.providers.retail_prices import (
 # source of truth, applied as a policy pass in the runner so the customer report never overclaims.
 THRESHOLD_VALIDATED_DETECTIONS = frozenset({
     "DX-001",  # over-provisioning: 1%/5% materiality + 30% peak (fleet-utilization-distribution.md)
-    "DX-002",  # cost-gated cross-partition fan-out: ≥60% fan-out AND avg RU ≥10 (fleet p90) → ~6.7% tail (ADR-0033)
+    "DX-002",  # structural fan-out (avg fan-out ≥1.5, ≥10% share), severity by partitions × rate (ADR-0068)
     "DX-003",  # shared-pool monopolization 60% (55% of shared DBs) + throttle (grounded)
     "DX-004",  # idle ≈ 0 requests (definitional)
     "DX-005",  # throttle 5%/20% ≈ p25/p50 of fleet throttle dist; 90% saturation = 99.8% fleet
     "DX-006",  # shares DX-005's fleet-validated 90% saturation cutoff
-    "DX-007",  # cost-gated shard-key misalignment: dominant expensive fan-out (reuses DX-002; ADR-0033)
+    "DX-007",  # structural shard-key misalignment: ≥60% fan-out share, reuses DX-002 severity (ADR-0068)
     "DX-008",  # multi-region-writes config fact (deterministic)
     "DX-009",  # partition-merge: multi-partition + low RU (86% of multi-partition are ≤6000 RU)
     "DX-010",  # uncontrolled ingestion: write-RU ≥80% (20.2% of fleet; per-op RU telemetry) + throttle ≥10%/20%
@@ -99,6 +101,7 @@ THRESHOLD_VALIDATED_DETECTIONS = frozenset({
     "DX-018",  # serverless throttle 5%/20% (fleet throttle distribution)
     "DX-019",  # paid continuous tier + non-production config facts (deterministic)
     "DX-022",  # multi-region + provisioned + PRPA-disabled config facts (deterministic)
+    "DX-024",  # index/data >0.3 Low (27.5% of fleet), >1.0 Medium (3.3%) (dx024-indexing-ratio.md)
 })
 
 # Finding-only remediation routing for DX-021's detector-authored dominant category.
@@ -163,6 +166,16 @@ class ServerlessDetectionAdapter:
     requires: frozenset[str] = frozenset()
 
 
+@dataclass(frozen=True)
+class InventoryDetectionAdapter:
+    """An all-container detection (DX-024); runs per ARM-enumerated container, any throughput model."""
+
+    detection_id: str
+    title: str
+    run: Callable[[InventoryDetectionContext], Finding]
+    requires: frozenset[str] = frozenset()
+
+
 def _account_unit(ctx: AccountDetectionContext) -> UnitRef:
     return UnitRef(account=ctx.account, database="", container=None, level="account",
                    resource_id=ctx.account_resource_id)
@@ -178,6 +191,14 @@ def _serverless_unit(ctx: ServerlessDetectionContext) -> UnitRef:
         account=ctx.account, database=ctx.database, container=ctx.container, level="container",
         resource_id=(f"{ctx.account_resource_id}/sqlDatabases/{ctx.database}"
                      f"/containers/{ctx.container}"),
+    )
+
+
+def _inventory_unit(ctx: InventoryDetectionContext) -> UnitRef:
+    c = ctx.container
+    return UnitRef(
+        account=ctx.account, database=c.database, container=c.container, level="container",
+        resource_id=f"{ctx.account_resource_id}/sqlDatabases/{c.database}/containers/{c.container}",
     )
 
 
@@ -375,6 +396,18 @@ def run_serverless(
         return _error_finding(adapter.detection_id, adapter.title, _serverless_unit(ctx), exc)
 
 
+def run_inventory(
+    adapter: InventoryDetectionAdapter, ctx: InventoryDetectionContext,
+    caps: CapabilitySet | None = None,
+) -> Finding:
+    if caps is not None and (missing := caps.missing(adapter.requires)):
+        return gated_finding(adapter.detection_id, adapter.title, _inventory_unit(ctx), missing, caps)
+    try:
+        return adapter.run(ctx)
+    except Exception as exc:  # noqa: BLE001
+        return _error_finding(adapter.detection_id, adapter.title, _inventory_unit(ctx), exc)
+
+
 # --- DX-002: cross-partition query fan-out (Log Analytics; container + serverless) ----
 
 def _dx002_finding(
@@ -400,9 +433,14 @@ def _dx002_finding(
     elif v.is_cross_partition:
         status = STATUS_FINDING
         summary = (f"{v.cross_partition_pct:.0f}% of queries fan out across ~{v.container_partitions} "
-                   f"partitions (worst shape averages {v.worst_shape_fanout:.1f})")
+                   f"partitions at ~{v.fanout_queries_per_sec:.2f} fan-out queries/s "
+                   f"(worst shape averages {v.worst_shape_fanout:.1f})")
     elif v.root_cause == "single_partition_container":
         status, summary = STATUS_NOT_DETECTED, "Single-partition container — queries cannot fan out"
+    elif v.root_cause == "occasional_fanout":
+        status = STATUS_NOT_DETECTED
+        summary = (f"{v.cross_partition_pct:.0f}% of queries fan out, but only occasionally "
+                   f"(~{v.fanout_queries_per_sec:.2f}/s) — normal cross-partition use")
     else:
         status, summary = STATUS_NOT_DETECTED, "Queries are partition-scoped"
     return Finding(
@@ -442,10 +480,11 @@ def _shardkey_finding(
     elif v.is_misaligned:
         status = STATUS_FINDING
         summary = (f"{v.cross_partition_pct:.0f}% of queries fan out across ~{v.container_partitions} "
-                   f"partitions — the partition key is structurally misaligned (re-key)")
+                   f"partitions at ~{v.fanout_queries_per_sec:.2f} fan-out queries/s — the partition "
+                   f"key is structurally misaligned (re-key)")
     else:
         status = STATUS_NOT_DETECTED
-        summary = "Partition key aligned with the workload (no dominant cross-partition fan-out)"
+        summary = "Partition key aligned with the workload (no sustained dominant cross-partition fan-out)"
     return Finding(
         detection_id="DX-007", title="Shard-key misalignment", unit=unit, status=status,
         severity=v.severity, summary=summary, recommended_action=v.recommended_action,
@@ -1315,4 +1354,39 @@ SERVERLESS_REGISTRY: list[ServerlessDetectionAdapter] = [
                                requires=frozenset({CAP_LA_QUERYSTATS, CAP_LA_DATAPLANE})),
     ServerlessDetectionAdapter("DX-007", "Shard-key misalignment", _run_dx007_serverless,
                                requires=frozenset({CAP_LA_QUERYSTATS, CAP_LA_DATAPLANE})),
+]
+
+
+# --- DX-024: indexing cost risk (all containers; ADR-0069) -----------------------------
+
+def _run_dx024(ctx: InventoryDetectionContext) -> Finding:
+    c = ctx.container
+    v = ic.detect_indexing_cost(
+        ctx.metrics, ctx.account_resource_id, c.database, c.container,
+        ctx.window_for(ic.production_window(ctx.now)),
+        indexing_mode=c.indexing_mode, excluded_paths=c.excluded_paths,
+    )
+    if v.root_cause == "insufficient_data":
+        status = STATUS_ABSTAINED
+        summary = f"Insufficient data: {v.methodology.get('abstained', v.root_cause)}"
+    elif v.is_risk:
+        status = STATUS_FINDING
+        summary = (f"Index storage is {v.ratio:.0%} of data storage "
+                   f"({v.user_excluded_path_count} user-excluded path(s)) — likely over-indexed")
+    elif v.root_cause == "indexing_disabled":
+        status, summary = STATUS_NOT_DETECTED, "Indexing is disabled (mode none)"
+    else:
+        status = STATUS_NOT_DETECTED
+        summary = f"Index storage is {v.ratio:.0%} of data storage (within 30%)"
+    return Finding(
+        detection_id="DX-024", title="Indexing cost risk", unit=_inventory_unit(ctx), status=status,
+        severity=v.severity, summary=summary, recommended_action=v.recommended_action,
+        agent_kit_rule="index-exclude-unused" if v.is_risk else None,
+        threshold_status=threshold_status_for("DX-024"),
+        evidence={**v.methodology, "index_bytes": v.index_bytes, "data_bytes": v.data_bytes},
+    )
+
+
+INVENTORY_REGISTRY: list[InventoryDetectionAdapter] = [
+    InventoryDetectionAdapter("DX-024", "Indexing cost risk", _run_dx024),
 ]

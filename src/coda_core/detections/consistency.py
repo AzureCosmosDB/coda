@@ -23,7 +23,11 @@ from datetime import datetime, timedelta
 
 from coda_core.providers.arm import AccountConfig
 from coda_core.providers.base import TimeWindow
-from coda_core.providers.log_analytics import DataPlaneSource, LogAnalyticsProvider
+from coda_core.providers.log_analytics import (
+    DataPlaneSource,
+    LogAnalyticsProvider,
+    primary_destination_filter,
+)
 
 # Consistency levels stronger than the Session default, normalised to lowercase for comparison.
 _PREMIUM_LEVELS = {"strong", "boundedstaleness", "bounded_staleness"}
@@ -60,6 +64,7 @@ def read_request_charge_kql(
         if source is DataPlaneSource.FIVE_MINUTE else ""
     )
     return f"""{source.value}
+{primary_destination_filter(source.value, window)}
 | where TimeGenerated >= datetime({window.start.isoformat()})
     and TimeGenerated < datetime({window.end.isoformat()})
 | where _ResourceId =~ {_kql_string(resource_id)}
