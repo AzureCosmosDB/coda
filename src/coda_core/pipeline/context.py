@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from coda_core.framework.cost_rate import EffectiveRate
-from coda_core.providers.arm import AccountConfig, ArmProvider, ThroughputOffer
+from coda_core.providers.arm import AccountConfig, ArmProvider, ContainerIndexing, ThroughputOffer
 from coda_core.providers.azure_monitor import AzureMonitorMetricsProvider
 from coda_core.providers.base import TimeWindow
 from coda_core.providers.log_analytics import DataPlaneSource, LogAnalyticsProvider
@@ -124,6 +124,27 @@ class ServerlessDetectionContext:
     eval_window: TimeWindow
     now: datetime
     la: LogAnalyticsProvider | None = None  # Log Analytics for LA-backed serverless detections (DX-002)
+
+    def window_for(self, production_window: TimeWindow) -> TimeWindow:
+        return self.eval_window if self.mode == MODE_EVAL else production_window
+
+
+@dataclass(frozen=True)
+class InventoryDetectionContext:
+    """Context for all-container inventory detections (DX-024 indexing cost).
+
+    Unlike :class:`DetectionContext` (one per throughput offer), this covers **every** container —
+    dedicated, shared-database and serverless — enumerated once from ARM with its indexing policy.
+    Metrics + ARM only (no Log Analytics, no provisioned RU).
+    """
+
+    metrics: AzureMonitorMetricsProvider
+    account: str
+    account_resource_id: str
+    container: ContainerIndexing
+    mode: str
+    eval_window: TimeWindow
+    now: datetime
 
     def window_for(self, production_window: TimeWindow) -> TimeWindow:
         return self.eval_window if self.mode == MODE_EVAL else production_window

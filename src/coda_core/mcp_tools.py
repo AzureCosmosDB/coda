@@ -18,6 +18,7 @@ from coda_core.pipeline import default_eval_window, run_diagnostics
 from coda_core.pipeline.registry import (
     ACCOUNT_REGISTRY,
     DATABASE_REGISTRY,
+    INVENTORY_REGISTRY,
     REGISTRY,
     SERVERLESS_REGISTRY,
     threshold_status_for,
@@ -50,6 +51,7 @@ def list_detectors() -> dict:
     for reg, scope in (
         (REGISTRY, "container"), (ACCOUNT_REGISTRY, "account"),
         (DATABASE_REGISTRY, "database"), (SERVERLESS_REGISTRY, "serverless"),
+        (INVENTORY_REGISTRY, "container"),
     ):
         for a in reg:
             entry = by_id.setdefault(a.detection_id, {

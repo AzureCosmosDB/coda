@@ -44,6 +44,30 @@ class ThroughputOffer:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class ContainerIndexing:
+    """One container plus the indexing-policy facts DX-024 needs (mode + excluded paths)."""
+
+    database: str
+    container: str
+    indexing_mode: str | None      # "consistent" | "lazy" | "none" (None when ARM omits it)
+    excluded_paths: tuple[str, ...]
+
+
+def container_indexing_from_arm(database: str, cont) -> ContainerIndexing:
+    """Parse an ARM ``SqlContainerGetResults`` into :class:`ContainerIndexing`. Pure (no I/O)."""
+    resource = getattr(cont, "resource", None)
+    policy = getattr(resource, "indexing_policy", None)
+    mode = getattr(policy, "indexing_mode", None)
+    mode = str(getattr(mode, "value", mode)).lower() if mode is not None else None
+    paths = tuple(
+        p.path for p in (getattr(policy, "excluded_paths", None) or ())
+        if getattr(p, "path", None)
+    )
+    return ContainerIndexing(database=database, container=cont.name, indexing_mode=mode,
+                             excluded_paths=paths)
+
+
 def _f(value) -> float | None:
     return float(value) if value is not None else None
 
@@ -347,3 +371,17 @@ class ArmProvider:
             for cont in sql.list_sql_containers(resource_group, account, db.name):
                 pairs.append((db.name, cont.name))
         return pairs
+
+    def list_container_indexing(self, resource_group: str, account: str) -> list[ContainerIndexing]:
+        """Enumerate every container with its indexing policy (DX-024 inventory).
+
+        Covers dedicated, shared-database and serverless containers alike — indexing cost applies
+        regardless of throughput model. The container list response already carries
+        ``resource.indexingPolicy``, so this is one ``list_*`` call per database. Read-only.
+        """
+        sql = self._client.sql_resources
+        out: list[ContainerIndexing] = []
+        for db in sql.list_sql_databases(resource_group, account):
+            for cont in sql.list_sql_containers(resource_group, account, db.name):
+                out.append(container_indexing_from_arm(db.name, cont))
+        return out

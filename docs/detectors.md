@@ -2,14 +2,14 @@
 
 [Getting started](../README.md) | [Permissions](permissions.md) | [Log Analytics setup](detections/log-analytics-readiness.md)
 
-CODA contains **23 read-only detectors** for Azure Cosmos DB. The local web experience discovers
+CODA contains **24 read-only detectors** for Azure Cosmos DB. The local web experience discovers
 NoSQL accounts. Checks run only where their resource type, throughput mode, configuration, and
-available data make them applicable; 23 registered detectors does not mean 23 checks on every container.
+available data make them applicable; 24 registered detectors does not mean 24 checks on every container.
 
 ## Data and interpretation
 
 **Configuration** comes from ARM; **metrics** come from Azure Monitor without diagnostic settings.
-**Logs** require resource-specific `CDB*` tables. Nineteen checks do not require Log Analytics, but
+**Logs** require resource-specific `CDB*` tables. Twenty checks do not require Log Analytics, but
 that does **not** mean they all work immediately: metrics history, sample counts, and resource age
 can still be prerequisites.
 
@@ -43,6 +43,7 @@ production coverage. The browser uses production mode.
 | DX-021 | Throttling by operation | Account requests by operation/status | 7 days |
 | DX-022 | Per-region autoscale opportunity | Region/autoscale configuration | Current configuration |
 | DX-023 | Reserved-capacity candidate | Provisioned-throughput baseline | Current configuration |
+| DX-024 | Indexing cost risk | Index/data storage metrics + indexing policy | 6 hours (latest value) |
 
 Windows describe what is requested, not a guarantee of complete collected history. For example,
 DX-004 has a seven-day minimum resource-age guard while requesting 30 days of metrics; several
@@ -113,11 +114,13 @@ rates before buying a one- or three-year reservation. No guaranteed saving is as
 
 ### DX-002 - Cross-partition query fan-out
 
-Finds query shapes that fan out across partitions **and** are expensive: the current cost gate is
-an average logical query charge of at least 10 RU. Requires **both `CDBQueryRuntimeStatistics` and
-`CDBDataPlaneRequests`** to join partition fan-out with request charges. Minimum traffic and fan-out
-thresholds also apply. Review partition-key filters, indexes, and access patterns; cheap fan-out alone
-is not a finding.
+Finds containers where a material share of queries (at least 10%) fan out across partitions (average
+fan-out of at least 1.5 partitions per query). Requires **both `CDBQueryRuntimeStatistics` and
+`CDBDataPlaneRequests`**, and at least 50 queries in the window. Fan-out is flagged structurally:
+latency grows with every partition checked even when the RU charge is low, so request charge is
+reported as evidence rather than used as a gate. Severity scales with physical partition count and
+fan-out query rate; below 0.1 fan-out queries per second the result is reported as occasional, not a
+finding. Review partition-key filters, indexes, and access patterns.
 
 ### DX-003 - Shared-throughput starvation
 
@@ -141,10 +144,11 @@ does not remove uneven demand. Physical-partition metrics alone do not identify 
 
 ### DX-007 - Shard-key misalignment
 
-Escalates widespread expensive fan-out into a possible partition-key/access-pattern mismatch rather
-than a single inefficient query. Requires **both `CDBQueryRuntimeStatistics` and
-`CDBDataPlaneRequests`**; the structural share considers cost-gated query shapes (at least 10 RU on
-average), not every cheap scan. Review the model and query patterns before undertaking repartitioning.
+Escalates widespread fan-out into a possible partition-key/access-pattern mismatch rather than a
+single inefficient query. Requires **both `CDBQueryRuntimeStatistics` and `CDBDataPlaneRequests`**;
+it flags when at least 60% of queries fan out across two or more physical partitions at a material
+rate, with the same partition-count × rate severity as DX-002. Review the model and query patterns
+before undertaking repartitioning.
 
 ### DX-009 - Partition merge candidate
 
@@ -218,6 +222,16 @@ and physical partitions can split. Inspect trend quality and logical-key distrib
 Identifies multi-region provisioned accounts without per-region/per-partition autoscale enabled.
 Confirm that the relevant throughput is autoscale and that regional/partition demand differs before
 acting. This configuration-led recommendation does not measure or guarantee a saving.
+
+### DX-024 - Indexing cost risk
+
+Compares a container's latest index storage with its data storage. Every indexed path adds write RU
+to each insert and replace, and the default policy indexes every property. Flags **Low** when the
+index exceeds 30% of the data and **Medium** when the index is larger than the data. Runs on every
+NoSQL container (dedicated, shared-throughput, and serverless) and is not suppressed when the policy
+already excludes paths; the exclusion count is reported as evidence. Containers with indexing mode
+`none` are not flagged. A high ratio can be legitimate (e.g. composite, spatial, or vector indexes
+your queries need), so confirm which paths are queried before excluding any.
 
 ## Acting on findings
 

@@ -6,16 +6,15 @@ problem is the **partition key itself** (the data model), not individual queries
 is to **re-key** the container (migration-class), not tweak queries.
 
 Signal: identical to DX-002 — ``CDBQueryRuntimeStatistics`` fan-out (``dcount(PartitionKeyRangeId)`` per
-``CorrelatedActivityId``), now **cost-gated** (ADR-0033): a shape counts toward the fan-out share only
-if it also averages >= the RU gate, so DX-007 fires when *expensive* fan-out dominates — the
-fleet-grounded refinement that promotes it to ``validated`` (pure fan-out over-flagged ~64-77% of
-multi-partition collections; the cost gate isolates the ~3-7% real tail —
-``docs/evidence/dx002-dx007-fanout-validation.md``). DX-007 reuses
+``CorrelatedActivityId``). Like DX-002 it is **structural, not cost-gated** (ADR-0068, superseding
+ADR-0033's RU gate): DX-007 fires when fan-out dominates (>= 60% of query executions) at a material
+volume (>= DX-002's minimum fan-out rate), and its severity uses the same partition-count and
+volume bands as DX-002 (:func:`cross_partition_query.fanout_severity`). DX-007 reuses
 :func:`cross_partition_query.detect_cross_partition_queries` and applies a higher, structural
 threshold; it therefore requires **both** the ``QueryRuntimeStatistics`` and ``DataPlaneRequests``
 categories. There is **no** independent "is the partition key in the filter" signal: query text is
 anonymized (``p1``/``p2``) and ``AggregatedQueryRuntimeStatistics5M`` does not exist, so misalignment is
-**inferred from expensive-fan-out dominance**, not read from field names (ADR-0024).
+**inferred from fan-out dominance**, not read from field names (ADR-0024).
 
 Correlation: when DX-007 fires it **supersedes DX-002** on the same container in the rollup — re-keying
 subsumes per-query fixes. Read-only / diagnose-only.
@@ -39,7 +38,6 @@ def production_window(now: datetime | None = None) -> TimeWindow:
 class ShardKeyConfig:
     structural_pct: float = 60.0   # >= this share of executions fanning out => the KEY is misaligned
     min_partitions: int = 2        # needs multiple physical partitions for a key-level problem
-    severity_high_pct: float = 80.0
 
 
 @dataclass(frozen=True)
@@ -50,9 +48,10 @@ class ShardKeyVerdict:
     cross_partition_pct: float
     container_partitions: int
     worst_shape: str | None
-    severity: str  # high | medium | none
+    severity: str  # high | medium | low | none
     recommended_action: str
     methodology: dict = field(default_factory=dict)
+    fanout_queries_per_sec: float = 0.0
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -66,6 +65,7 @@ def _from_cpq(v: cpq.CrossPartitionVerdict, root_cause: str, cfg: ShardKeyConfig
         is_misaligned=False, root_cause=root_cause, cross_partition_pct=v.cross_partition_pct,
         container_partitions=v.container_partitions, worst_shape=v.worst_shape, severity="none",
         recommended_action="", methodology=method,
+        fanout_queries_per_sec=v.fanout_queries_per_sec,
     )
     base.update(kw)
     return ShardKeyVerdict(**base)
@@ -83,8 +83,9 @@ def detect_shard_key_misalignment(
 ) -> ShardKeyVerdict:
     """End-to-end DX-007 for one container, escalating DX-002's fan-out signal."""
     cfg = config or ShardKeyConfig()
+    cpq_cfg = cpq_config or cpq.CrossPartitionConfig()
     v = cpq.detect_cross_partition_queries(
-        la, account_resource_id, database, container, window, config=cpq_config
+        la, account_resource_id, database, container, window, config=cpq_cfg
     )
 
     # Propagate the non-judgable cases (abstain) so the report's LA guardrail still fires.
@@ -92,16 +93,19 @@ def detect_shard_key_misalignment(
         return _from_cpq(v, v.root_cause, cfg)
 
     misaligned = (
-        v.cross_partition_pct >= cfg.structural_pct and v.container_partitions >= cfg.min_partitions
+        v.cross_partition_pct >= cfg.structural_pct
+        and v.container_partitions >= cfg.min_partitions
+        and v.fanout_queries_per_sec >= cpq_cfg.min_rate_qps
     )
     if not misaligned:
-        # Aligned, single-partition, or only a per-query problem (DX-002's domain) — not structural.
+        # Aligned, single-partition, occasional, or only a per-query problem (DX-002's domain).
         return _from_cpq(v, "not_misaligned", cfg)
 
-    severity = "high" if v.cross_partition_pct >= cfg.severity_high_pct else "medium"
+    severity = cpq.fanout_severity(v.container_partitions, v.fanout_queries_per_sec, cpq_cfg)
     action = (
         f"{v.cross_partition_pct:.0f}% of this container's query executions fan out across "
-        f"~{v.container_partitions} physical partitions — the **partition key is structurally "
+        f"~{v.container_partitions} physical partitions (about {v.fanout_queries_per_sec:.2f} fan-out "
+        f"queries per second) — the **partition key is structurally "
         f"misaligned** with the workload (this is the data model, not a single bad query). Re-key the "
         f"container so the dominant query filter becomes the partition key. This is migration-class: "
         f"create a new container with the corrected key, backfill the data, and cut over. Per-query "

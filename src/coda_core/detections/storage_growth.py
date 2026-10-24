@@ -137,7 +137,7 @@ def detect_storage_growth(
     *,
     config: StorageGrowthConfig | None = None,
 ) -> StorageGrowthVerdict:
-    """End-to-end DX-017 for one container: project the fastest-growing partition to the limit."""
+    """Report a full partition first; otherwise select the soonest projected limit."""
     per_partition = metrics.get_metric_split(
         account_resource_id, "PhysicalPartitionSizeInfo", window,
         split_dimension="PhysicalPartitionId",
@@ -149,6 +149,9 @@ def detect_storage_growth(
     for series in per_partition.values():
         current, rate = _linear_rate_per_day(series)
         v = classify(current, rate, config)
+        if v.root_cause == "at_or_over_limit":
+            # An already-full partition is more urgent than any future projection.
+            return v
         if soonest is None:
             soonest = v
         elif v.days_to_limit is not None and (
