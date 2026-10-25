@@ -98,7 +98,8 @@ interpreting the four log-dependent detectors as a full-window observation.
 | DX-016 Optional consistency-cost enrichment | `CDBDataPlaneRequests5M`, or raw `CDBDataPlaneRequests` | 1 day; the configuration finding does not require it |
 
 The two query detectors join request charges from `CDBDataPlaneRequests` because query statistics
-alone do not provide the RU cost needed by their cost gate.
+alone do not provide request charge. RU is reported as evidence only, not used as a finding
+gate. Share, fan-out query rate and physical partition count drive the structural decisions.
 
 Five-minute production analysis retains a full 24 hours ending at the latest completed UTC
 five-minute boundary. Its end can therefore precede the report time by less than five minutes.

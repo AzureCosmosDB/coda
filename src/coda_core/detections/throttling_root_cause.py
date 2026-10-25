@@ -17,7 +17,7 @@ throttled operation category; app-level attribution (per client `UserAgent`) is 
 enrichment tracked separately. Read-only. Thresholds are **proposals** (registry `threshold_status`).
 
 Closes the `throttling_root_cause` gap from the cosmic-kusto coverage analysis
-(`docs/exploration/cosmic-kusto-gap-buildability.md`).
+(`docs/planning/active/cosmic-kusto-gap-buildability.md`).
 """
 
 from __future__ import annotations

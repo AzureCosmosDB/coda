@@ -7,6 +7,80 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.17.12] - 2026-10-24
+
+### Preview status
+
+- Cumulative customer-visible changes since public v0.17.1 Preview. This remains a Preview:
+  fresh all-detector live acceptance and signed-in Portal-link verification remain deferred.
+  The intermediate source-preparation sections below are not separate public releases.
+
+### Added
+
+- DX-024 indexing cost risk: flags index/data storage ratios above 0.3 (Low) or 1.0 (Medium)
+  across dedicated, shared-throughput and serverless NoSQL containers, without Log Analytics.
+  Existing indexing exclusions remain evidence rather than suppressing the finding.
+
+### Changed
+
+- DX-002/DX-007 structural fan-out findings use physical partition count and query rate for
+  severity, with a 0.1 query/second floor instead of a query-cost gate.
+- Automatic installation selects the newest non-draft release including Previews, binds downloads
+  to its tag and verifies checksums. GitHub Actions remain pinned to full commit SHAs.
+
+### Fixed
+
+- Partition-merge findings now distinguish structural over-partitioning from merge eligibility.
+  Continuous backup (PITR) blocks merge and cannot be reverted to periodic backup on the existing
+  account. Unknown or migrating backup state withholds merge instructions; periodic backup still
+  requires the platform eligibility checker and SDK/connector checks.
+- Optional full-fidelity change-feed enablement is recorded only when authoritative metadata
+  supplies it, without inferring active usage. Fabric Mirroring is not assessed; no new permissions
+  or feature-disabling recommendations are introduced.
+- Shard-key misalignment uses unrounded measurements for boundary decisions. DX-017 retains its
+  urgent High finding for a physical partition already at or above 50 GiB.
+- Accounts exporting identical request logs to multiple workspaces no longer count each copy
+  as additional activity.
+
+### Known limitations
+
+- Backup eligibility is not complete merge eligibility. Full-fidelity enablement is unknown when
+  the management SDK/API omits it; active consumers and Fabric Mirroring are not discovered.
+- Package/offline checks do not prove live detector correctness. No hosted service, automatic
+  remediation, new Azure permissions or PyPI publication is introduced.
+
+## [0.17.11] - 2026-10-24
+
+### Fixed
+
+- Shard-key misalignment decisions use precise fan-out measurements rather than rounded display
+  values, preventing early findings and severity escalation immediately below the existing thresholds.
+- Source preparation only; this entry does not publish or replace the v0.17.1 Preview release.
+
+## [0.17.10] - 2026-10-24
+
+### Changed
+
+- Internal repository organization only; exported paths, diagnostic behavior, data sources,
+  prerequisites and installation are unchanged.
+- Source preparation only; this entry does not publish or replace the v0.17.1 Preview release.
+
+## [0.17.9] - 2026-10-24
+
+### Changed
+
+- Internal integration CI maintenance only; no change to diagnostics, data sources,
+  prerequisites or installation.
+- Source preparation only; this entry does not publish or replace the v0.17.1 Preview release.
+
+## [0.17.8] - 2026-10-24
+
+### Changed
+
+- Internal test maintenance only; no change to diagnostics, data sources, prerequisites or
+  installation.
+- Source preparation only; this entry does not publish or replace the v0.17.1 Preview release.
+
 ## [0.17.7] - 2026-10-23
 
 ### Added

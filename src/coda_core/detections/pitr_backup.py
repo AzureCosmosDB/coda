@@ -18,7 +18,7 @@ to confirm the required recovery window; it does not assert a dollar figure. Rea
 diagnose-only.
 
 Data source: ``AccountConfig.backup_mode`` / ``continuous_backup_tier`` (ARM), classified against
-``framework.env_classifier``. See ``docs/exploration/cosmic-kusto-gap-buildability.md`` (this closes
+``framework.env_classifier``. See ``docs/planning/active/cosmic-kusto-gap-buildability.md`` (this closes
 the ``pitr_non_prod`` gap identified there) and ADR-0046 for the pricing correction.
 """
 

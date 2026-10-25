@@ -40,7 +40,7 @@ _STRUCTURAL_TOKENS = (
 def _latest_install_examples() -> dict[str, str]:
     """Read the actual install commands in either the authoritative or exported README layout."""
     root = Path(__file__).resolve().parents[1]
-    source = root / "governance" / "public" / "README.md"
+    source = root / "release" / "public" / "governance" / "README.md"
     readme = (source if source.is_file() else root / "README.md").read_text(encoding="utf-8")
     blocks = re.findall(
         r"<!-- latest-release-(powershell|bash) -->\n```(?:powershell|bash)\n(.*?)\n```",

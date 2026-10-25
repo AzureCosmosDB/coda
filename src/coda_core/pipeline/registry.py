@@ -785,6 +785,7 @@ def _run_dx009(ctx: DetectionContext) -> Finding:
     v = pm.detect_partition_merge(
         ctx.metrics, ctx.account_resource_id, o.database, o.container, o.provisioned_ru,
         pm.recent_window(),
+        account_config=ctx.account_config,
     )
     if v.root_cause == "insufficient_data":
         status, summary = STATUS_ABSTAINED, "Insufficient data: no partition-count telemetry"
@@ -792,6 +793,15 @@ def _run_dx009(ctx: DetectionContext) -> Finding:
         status = STATUS_FINDING
         summary = (f"Over-partitioned: {v.actual_partitions} physical partitions but only "
                    f"{v.needed_partitions} needed (~{v.ru_per_partition:.0f} RU/s each)")
+        eligibility = v.methodology["merge_eligibility"]
+        if eligibility == "blocked_pitr":
+            summary += "; partition merge blocked by continuous backup (PITR)"
+        elif eligibility == "blocked_full_fidelity":
+            summary += "; partition merge blocked by enabled full-fidelity change feed"
+        elif eligibility == "unknown":
+            summary += "; merge eligibility unverified"
+        else:
+            summary += "; merge requires platform eligibility checks"
     else:
         status, summary = STATUS_NOT_DETECTED, f"Partition count is appropriate ({v.actual_partitions})"
     return Finding(

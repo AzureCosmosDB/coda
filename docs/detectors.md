@@ -28,7 +28,7 @@ production coverage. The browser uses production mode.
 | DX-006 | Hot partition | Per-partition utilization metrics | 7 days |
 | DX-007 | Shard-key misalignment | Query statistics + request logs | 1 day |
 | DX-008 | Multi-region writes antipattern | Account configuration + throughput offers | Current configuration |
-| DX-009 | Partition merge candidate | Partition count/storage metrics + throughput | 6 hours |
+| DX-009 | Partition merge candidate | Partition count/storage metrics + ARM throughput/backup policy | 6 hours |
 | DX-010 | Uncontrolled ingestion | Request logs | 1 day |
 | DX-011 | Autoscale maximum too high | Metrics + autoscale configuration | 30 days |
 | DX-012 | Manual-to-autoscale candidate | Utilization metrics + manual throughput | 30 days |
@@ -37,7 +37,7 @@ production coverage. The browser uses production mode.
 | DX-015 | Partition storage skew | Per-partition storage metrics | 7 days |
 | DX-016 | Expensive consistency | Account configuration; optional request logs | Current configuration; 1 day enrichment |
 | DX-017 | Rapid storage growth | Per-partition storage trend | 30 days |
-| DX-018 | Serverless throttling | Serverless request/utilization metrics | 7 days |
+| DX-018 | Serverless throttling | Serverless requests by status | 7 days |
 | DX-019 | Paid continuous backup on non-production | Backup/environment configuration; optional storage/prices | Current configuration |
 | DX-020 | Non-throttling errors | Account requests by status | 7 days |
 | DX-021 | Throttling by operation | Account requests by operation/status | 7 days |
@@ -154,8 +154,12 @@ before undertaking repartitioning.
 
 Compares actual physical partitions with the estimated need from throughput and storage, using
 10,000 RU/s and 50 GiB per physical partition and a minimum of one partition. Excess partitions can
-leave each with a small share of capacity. Check current service eligibility and workload skew before
-requesting a merge; CODA does not perform it.
+leave each with a small share of capacity. Continuous backup (PITR) blocks merge, and cannot be
+reverted to periodic backup on that account. CODA retains the structural finding but removes the
+merge instruction. Unknown/migrating backup state also withholds merge instructions; periodic backup
+still requires the Portal eligibility checker and all platform/SDK/connector checks. Optional
+full-fidelity enablement is dependency context, not proof of active consumption. Mirroring is not
+assessed. CODA does not merge partitions or recommend disabling protection/dependent features.
 
 ### DX-010 - Uncontrolled ingestion
 
