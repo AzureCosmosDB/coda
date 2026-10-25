@@ -42,7 +42,7 @@ Reported administrative permissions guide presentation but do not override Azure
 1. **Choose scope and credentials.** The browser talks to the loopback FastAPI service. MCP uses
    stdio. Azure credentials are resolved locally through the Azure Identity library.
 2. **Discover resources.** ARM supplies account configuration and throughput offers. The web app
-   can accelerate account discovery with Azure CLI Resource Graph; it falls back to ARM if that
+   can accelerate account discovery with Resource Graph using the same SDK credential; it falls back to ARM if that
    path is unavailable. Discovery reads subscription inventory, not every account's diagnostics.
 3. **Determine applicability and availability.** The engine distinguishes account, shared-database,
    dedicated-container, and serverless checks. It checks which resource-log tables are accessible.
@@ -74,7 +74,7 @@ configuration can add requirements.
 | Microsoft Entra ID | Acquire delegated/local Azure tokens | `login.microsoftonline.com`; your local Azure credential chain |
 | Azure Resource Manager | Account, database, container, throughput, subscription metadata and Activity Log reads | `management.azure.com`; Reader-tier resource access |
 | Azure Monitor Metrics | RU utilization, request status/operation counts, storage and partition metrics | Azure Monitor management APIs; no diagnostic-log export needed |
-| Azure Resource Graph | Optional fast web account inventory through `az graph query` | Azure Resource Manager; existing CLI login and resource-graph extension |
+| Azure Resource Graph | Optional fast web account inventory through the shared management reader | Azure Resource Manager; same SDK credential as diagnosis and pre-checks |
 | Azure Monitor Logs / Log Analytics | Resource-context KQL over the selected account's `CDB*` tables | Azure Monitor Logs API (`api.loganalytics.io` SDK default); resource/workspace log access |
 | Azure Cost Management Query API | Optional customer amortized throughput rate | `management.azure.com`; queries are read-only POSTs, normally subscription-scoped |
 | Azure Retail Prices API | Optional public list-price estimate for eligible paid continuous-backup storage | `prices.azure.com/api/retail/prices`; no Azure credentials or customer identifiers sent |
@@ -91,7 +91,7 @@ browser; those links are not automatic report uploads.
 
 Use `az login` for the simplest local workflow. `DefaultAzureCredential` can select an earlier
 credential in its chain, such as an environment-configured identity. Resource Graph discovery
-uses the Azure CLI's identity independently, so keep CLI and SDK credentials aligned.
+uses that same SDK credential, not an independent Azure CLI identity.
 CODA creates no application registration and requires no client secret.
 
 The web process has process-wide sign-in state, not per-user authenticated sessions. Bind it to

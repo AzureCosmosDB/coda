@@ -4,7 +4,7 @@
 **Azure Cosmos DB for NoSQL**. Select an account or resource group to find throughput waste,
 throttling, partition hot spots, expensive queries, and configuration risks.
 
-CODA has a browser UI and an optional MCP server. Its 23 detectors share the same Python engine;
+CODA has a browser UI and an optional MCP server. Its 24 detectors share the same Python engine;
 the web app does not require an AI model, an API key, or a hosted CODA service.
 
 **Preview release.** Package checks do not establish complete live validation of every detector.
@@ -58,7 +58,7 @@ workspace. The tables are populated in that workspace; they are not Cosmos DB co
 | DX-010 - Uncontrolled ingestion | Required | `CDBDataPlaneRequests5M` preferred; raw `CDBDataPlaneRequests` supported |
 | DX-016 - Expensive consistency | Optional read-charge enrichment; the finding uses ARM configuration | `CDBDataPlaneRequests5M` preferred; raw `CDBDataPlaneRequests` supported |
 
-The other 18 detectors do not use Log Analytics. See the
+Twenty detectors do not require Log Analytics; DX-016 can optionally use it for enrichment. See the
 [full detector-to-data-source and production-window table](docs/detectors.md#data-and-interpretation)
 for metrics, configuration, and optional cost/pricing inputs.
 

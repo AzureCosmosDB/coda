@@ -20,7 +20,7 @@ diagnose-only. Thresholds are **proposals** (registry `threshold_status`) pendin
 
 Data source: `AzureMonitorMetricsProvider.get_metric_split(TotalRequests, split_dimension=StatusCode,
 aggregation=Count)`. Closes the `error_analysis` gap from the cosmic-kusto coverage analysis
-(`docs/exploration/cosmic-kusto-gap-buildability.md`).
+(`docs/planning/active/cosmic-kusto-gap-buildability.md`).
 """
 
 from __future__ import annotations

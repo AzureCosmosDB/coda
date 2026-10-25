@@ -40,6 +40,7 @@ class DetectionContext:
     effective_rate: EffectiveRate | None = None  # customer's bill-derived $/RU/s rate (ADR-0028);
                                                  # None => Cost Management absent → capacity-only findings.
     dataplane_source: DataPlaneSource | None = DataPlaneSource.RAW
+    account_config: AccountConfig | None = None  # shared ARM snapshot for DX-009 merge restrictions
 
     def window_for(self, production_window: TimeWindow) -> TimeWindow:
         """Pick the detection's production window, or the shared eval window in eval mode."""

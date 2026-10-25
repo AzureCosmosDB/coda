@@ -37,7 +37,6 @@ from coda_core.providers.base import MetricSeries, TimeWindow
 SERVERLESS_RU_PER_PARTITION = 5000
 
 PRODUCTION_WINDOW_DAYS = 7
-AGE_FLOOR = timedelta(days=1)
 
 
 def production_window(now: datetime | None = None) -> TimeWindow:

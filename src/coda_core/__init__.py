@@ -11,4 +11,4 @@ stay swappable.
 """
 
 # Keep in sync with pyproject `version` and CHANGELOG.md on every PR.
-APP_VERSION = "0.17.7"
+APP_VERSION = "0.17.12"

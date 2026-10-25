@@ -52,7 +52,7 @@ AUTOSCALE_IDLE_FRACTION = 0.10
 
 
 def production_window(now: datetime | None = None) -> TimeWindow:
-    """The production DX-004 window: 30 days ending now, hourly buckets."""
+    """The production DX-004 window: 30 days ending now, five-minute buckets."""
     anchor = now or datetime.now(timezone.utc)
     return TimeWindow(anchor - timedelta(days=PRODUCTION_WINDOW_DAYS), anchor, GRANULARITY)
 

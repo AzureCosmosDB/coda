@@ -7,7 +7,7 @@ autoscale container scales its denominator down and still reads a low %). The co
 of the configured max**. That series answers both autoscale right-sizing questions and can be fed to
 the existing classifiers:
 
-* **DX-011** (this module): the busiest the workload ever pushed autoscale (p99 of AutoscaledRU-%-of-max)
+* **DX-011** (this module): the busiest the workload ever pushed autoscale (max of AutoscaledRU-%-of-max)
   stays well below the max -> the max is over-provisioned -> lower it. Reuses DX-001's classifier
   (``over_provisioning.classify``) on the autoscale series, so the bands, headroom, and
   capacity-materiality severity (ADR-0011/0012) are shared.

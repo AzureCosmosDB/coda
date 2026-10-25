@@ -11,6 +11,8 @@ Signal (Azure Monitor + ARM, no Log Analytics): the **actual** physical partitio
 (``PhysicalPartitionCount``) vs the count actually **needed** = max(provisioned RU/s ÷ 10,000,
 storage ÷ 50 GiB, 1). When actual exceeds needed, the container is over-partitioned. Merge is a
 platform operation (Portal/CLI), so there is no Agent Kit code remediation. Read-only / diagnose-only.
+Structural benefit is not eligibility: continuous backup blocks merge and cannot be reverted to
+periodic backup. Unknown/migrating backup state withholds merge advice (ADR-0072).
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 
+from coda_core.providers.arm import AccountConfig
 from coda_core.providers.azure_monitor import AzureMonitorMetricsProvider
 from coda_core.providers.base import TimeWindow
 
@@ -59,14 +62,78 @@ class PartitionMergeVerdict:
         return asdict(self)
 
 
-def classify(actual: int, provisioned_ru: float, storage_bytes: float) -> PartitionMergeVerdict:
+def _merge_guidance(config: AccountConfig | None) -> tuple[str, str]:
+    """Separate a known blocker from unverified eligibility without recommending feature removal."""
+    if config is None:
+        return "unknown", (
+            "Merge eligibility is unverified: account backup policy is unavailable. "
+            "Verify account configuration before considering partition merge."
+        )
+    full_fidelity = config.all_versions_and_deletes_enabled is True
+    if (config.backup_mode or "").strip().lower() == "continuous":
+        action = (
+            "Partition merge is blocked by continuous backup (PITR). Continuous backup cannot "
+            "be reverted to periodic backup on this account; disabling PITR is not a supported "
+            "way to enable merge."
+        )
+        if full_fidelity:
+            action += (
+                " All versions and deletes (full-fidelity) change feed is enabled and requires "
+                "continuous backup; enablement does not establish active consumer usage."
+            )
+        return "blocked_pitr", action
+    if full_fidelity:
+        return "blocked_full_fidelity", (
+            "Partition merge is blocked by enabled all versions and deletes (full-fidelity) "
+            "change feed, which requires continuous backup. Verify the inconsistent or missing "
+            "backup-policy metadata; do not disable features to enable merge. Enablement does "
+            "not establish active consumer usage."
+        )
+    if config.backup_migration_status or config.backup_migration_target:
+        return "unknown", (
+            "Merge eligibility is unverified: backup-policy migration metadata is present. "
+            "Verify the settled backup policy before considering partition merge."
+        )
+    if (config.backup_mode or "").strip().lower() != "periodic":
+        return "unknown", (
+            "Merge eligibility is unverified: account backup policy is missing or unrecognized. "
+            "Verify account configuration before considering partition merge."
+        )
+    return "requires_platform_validation", (
+        "Periodic backup does not establish full merge eligibility. Before considering partition "
+        "merge, use the Azure Portal partition-merge eligibility checker and review all current "
+        "platform, SDK and connector restrictions, including change-feed dependencies. "
+        "Only after those checks, consider merging partitions to consolidate RU/s. "
+        "Do not disable backup protection or dependent features to enable merge."
+    )
+
+
+def classify(
+    actual: int, provisioned_ru: float, storage_bytes: float,
+    *, account_config: AccountConfig | None = None,
+) -> PartitionMergeVerdict:
+    """Preserve structural grading while restricting action text to supported backup evidence."""
     needed = needed_partitions(provisioned_ru, storage_bytes)
     ru_slice = (provisioned_ru / actual) if actual > 0 else provisioned_ru
+    eligibility, guidance = _merge_guidance(account_config)
     base = dict(actual_partitions=actual, needed_partitions=needed, provisioned_ru=provisioned_ru,
                 storage_bytes=storage_bytes, ru_per_partition=round(ru_slice, 1),
                 methodology={"ru_per_partition_limit": RU_PER_PARTITION,
                              "gib_per_partition_limit": BYTES_PER_PARTITION // 1024**3,
-                             "needed_for_ru_storage": needed})
+                             "needed_for_ru_storage": needed,
+                             "merge_eligibility": eligibility,
+                             "backup_mode": account_config.backup_mode if account_config else None,
+                             "backup_migration_status": (
+                                 account_config.backup_migration_status if account_config else None
+                             ),
+                             "backup_migration_target": (
+                                 account_config.backup_migration_target if account_config else None
+                             ),
+                             "all_versions_and_deletes_enabled": (
+                                 account_config.all_versions_and_deletes_enabled
+                                 if account_config else None
+                             ),
+                             "mirroring_status": "not_assessed"})
 
     if actual <= 0:
         return PartitionMergeVerdict(is_over_partitioned=False, severity="none",
@@ -85,7 +152,7 @@ def classify(actual: int, provisioned_ru: float, storage_bytes: float) -> Partit
         f"{storage_bytes / 1024**3:.1f} GiB only need {needed}. Each partition therefore gets just "
         f"~{ru_slice:.0f} RU/s, so a single hot partition can throttle while the container looks "
         f"under-utilised. This usually follows scaling RU/s down (or deleting data) after a high-"
-        f"throughput/large period. Merge the partitions (Azure Portal / CLI) to consolidate the RU/s."
+        f"throughput/large period. {guidance}"
     )
     return PartitionMergeVerdict(is_over_partitioned=True, severity=severity,
                                  root_cause="over_partitioned", recommended_action=action, **base)
@@ -98,8 +165,10 @@ def detect_partition_merge(
     container: str,
     provisioned_ru: float,
     window: TimeWindow,
+    *,
+    account_config: AccountConfig | None = None,
 ) -> PartitionMergeVerdict:
-    """End-to-end DX-009 for one container."""
+    """Read structural metrics and apply backup-aware guidance from the existing ARM snapshot."""
     scope = {"DatabaseName": database, "CollectionName": container}
     pcount = metrics.get_metric(account_resource_id, "PhysicalPartitionCount", window,
                                 aggregation="Maximum", dimension_filter=scope)
@@ -107,7 +176,7 @@ def detect_partition_merge(
                                  aggregation="Maximum", dimension_filter=scope)
     pvals = pcount.values()
     if not pvals:
-        return classify(0, provisioned_ru, 0.0)
+        return classify(0, provisioned_ru, 0.0, account_config=account_config)
     actual = int(max(pvals))
     storage_bytes = max(storage.values()) if storage.values() else 0.0
-    return classify(actual, provisioned_ru, storage_bytes)
+    return classify(actual, provisioned_ru, storage_bytes, account_config=account_config)

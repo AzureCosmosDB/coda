@@ -584,6 +584,7 @@ def run_diagnostics(
             resource_created_at=resource_created_at, scope_provisioned_ru=scope_provisioned_ru,
             la=worker_la, effective_rate=effective_rate,
             dataplane_source=caps.dataplane_source,
+            account_config=account_config,
         )
         unit_findings = []
         for adapter in REGISTRY:

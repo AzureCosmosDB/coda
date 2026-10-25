@@ -143,6 +143,14 @@ def fanout_severity(partitions: int, rate_qps: float, cfg: CrossPartitionConfig)
 
 
 @dataclass(frozen=True)
+class FanoutMeasurements:
+    """Unrounded signal shared by detectors; presentation must not shift decision boundaries."""
+
+    share_pct: float = 0.0
+    rate_qps: float = 0.0
+
+
+@dataclass(frozen=True)
 class CrossPartitionVerdict:
     is_cross_partition: bool
     # cross_partition | mostly_single_partition | occasional_fanout | single_partition_container |
@@ -157,9 +165,13 @@ class CrossPartitionVerdict:
     recommended_action: str
     methodology: dict = field(default_factory=dict)
     fanout_queries_per_sec: float = 0.0  # logical fan-out queries per second over the window
+    measurements: FanoutMeasurements = field(default_factory=FanoutMeasurements, repr=False)
 
     def as_dict(self) -> dict:
-        return asdict(self)
+        """Serialize the existing rounded evidence contract, not internal decision measurements."""
+        result = asdict(self)
+        result.pop("measurements")
+        return result
 
 
 def _abstain(root_cause: str, detail: str) -> CrossPartitionVerdict:
@@ -189,8 +201,11 @@ def classify(
     container_partitions = max((s.max_fanout for s in shapes), default=0)
     cross_shapes = [s for s in shapes if s.avg_fanout >= cfg.cross_fanout_threshold]
     cross_exec = sum(s.executions for s in cross_shapes)
-    cross_pct = (100.0 * cross_exec / total) if total else 0.0
-    rate_qps = cross_exec / window_seconds if window_seconds > 0 else 0.0
+    measurements = FanoutMeasurements(
+        share_pct=(100.0 * cross_exec / total) if total else 0.0,
+        rate_qps=cross_exec / window_seconds if window_seconds > 0 else 0.0,
+    )
+    cross_pct, rate_qps = measurements.share_pct, measurements.rate_qps
     worst = max(cross_shapes, key=lambda s: s.executions, default=None)
 
     def verdict(**kw) -> CrossPartitionVerdict:
@@ -198,6 +213,7 @@ def classify(
             is_cross_partition=False, root_cause="mostly_single_partition", total_queries=total,
             cross_partition_pct=round(cross_pct, 1), container_partitions=container_partitions,
             fanout_queries_per_sec=round(rate_qps, 3),
+            measurements=measurements,
             worst_shape=None, worst_shape_fanout=0.0, severity="none", recommended_action="",
             methodology={"thresholds": {"min_queries": cfg.min_queries,
                                         "cross_fanout_threshold": cfg.cross_fanout_threshold,

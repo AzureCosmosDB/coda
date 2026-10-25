@@ -93,15 +93,15 @@ def detect_shard_key_misalignment(
         return _from_cpq(v, v.root_cause, cfg)
 
     misaligned = (
-        v.cross_partition_pct >= cfg.structural_pct
+        v.measurements.share_pct >= cfg.structural_pct
         and v.container_partitions >= cfg.min_partitions
-        and v.fanout_queries_per_sec >= cpq_cfg.min_rate_qps
+        and v.measurements.rate_qps >= cpq_cfg.min_rate_qps
     )
     if not misaligned:
         # Aligned, single-partition, occasional, or only a per-query problem (DX-002's domain).
         return _from_cpq(v, "not_misaligned", cfg)
 
-    severity = cpq.fanout_severity(v.container_partitions, v.fanout_queries_per_sec, cpq_cfg)
+    severity = cpq.fanout_severity(v.container_partitions, v.measurements.rate_qps, cpq_cfg)
     action = (
         f"{v.cross_partition_pct:.0f}% of this container's query executions fan out across "
         f"~{v.container_partitions} physical partitions (about {v.fanout_queries_per_sec:.2f} fan-out "

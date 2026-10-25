@@ -72,6 +72,11 @@ def _f(value) -> float | None:
     return float(value) if value is not None else None
 
 
+def _enum_text(value: object | None) -> str | None:
+    """Preserve SDK enums' wire values rather than their qualified Python enum names."""
+    return str(getattr(value, "value", value)) if value is not None else None
+
+
 def _is_no_offer_error(exc: Exception) -> bool:
     """True if a throughput read means "this resource has no provisioned offer".
 
@@ -108,6 +113,9 @@ class AccountConfig:
     capabilities: tuple[str, ...] = ()    # all capability names (e.g. EnableServerless, EnableMongo)
     backup_mode: str | None = None        # ARM ``backupPolicy.type``: "Continuous" (PITR) | "Periodic"
     continuous_backup_tier: str | None = None  # Continuous7Days/30Days/35Days (PITR only)
+    backup_migration_status: str | None = None  # nonempty migration metadata prevents merge advice
+    backup_migration_target: str | None = None
+    all_versions_and_deletes_enabled: bool | None = None  # enablement, not consumer activity
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -158,6 +166,11 @@ def account_config_from_arm(acct, *, subscription_name: str | None = None) -> Ac
     backup_mode = getattr(bp, "type", None) if bp is not None else None
     cont_props = getattr(bp, "continuous_mode_properties", None) if bp is not None else None
     continuous_tier = getattr(cont_props, "tier", None) if cont_props is not None else None
+    migration = getattr(bp, "migration_state", None) if bp is not None else None
+    migration_status = getattr(migration, "status", None)
+    migration_target = getattr(migration, "target_type", None)
+    # Older SDK/API models omit this flag. Absence is unknown, never evidence of disabled usage.
+    full_fidelity = getattr(acct, "enable_all_versions_and_deletes_change_feed", None)
     return AccountConfig(
         name=getattr(acct, "name", "") or "",
         api_kind=kind,
@@ -172,8 +185,13 @@ def account_config_from_arm(acct, *, subscription_name: str | None = None) -> Ac
         is_serverless="EnableServerless" in caps,
         is_pppra_enabled=bool(getattr(acct, "enable_per_region_per_partition_autoscale", False) or False),
         capabilities=cap_names,
-        backup_mode=str(backup_mode) if backup_mode is not None else None,
-        continuous_backup_tier=str(continuous_tier) if continuous_tier is not None else None,
+        backup_mode=_enum_text(backup_mode),
+        continuous_backup_tier=_enum_text(continuous_tier),
+        backup_migration_status=_enum_text(migration_status),
+        backup_migration_target=_enum_text(migration_target),
+        all_versions_and_deletes_enabled=(
+            full_fidelity if isinstance(full_fidelity, bool) else None
+        ),
     )
 
 
