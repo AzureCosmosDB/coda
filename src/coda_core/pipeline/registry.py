@@ -104,6 +104,21 @@ THRESHOLD_VALIDATED_DETECTIONS = frozenset({
     "DX-024",  # index/data >0.3 Low (27.5% of fleet), >1.0 Medium (3.3%) (dx024-indexing-ratio.md)
 })
 
+# Conditional investigation only: account status counts do not establish a request sequence.
+DX020_AGENT_KIT_RULES = {
+    404: "sdk-conditional-create-etag",
+    409: "sdk-conditional-create-etag",
+    412: "sdk-etag-concurrency",
+}
+
+
+def dx020_agent_kit_rule(status: str, dominant_code: int | None) -> str | None:
+    """Select verified guidance only for findings dominated by an explicitly mapped status."""
+    if status != STATUS_FINDING or dominant_code is None:
+        return None
+    return DX020_AGENT_KIT_RULES.get(dominant_code)
+
+
 # Finding-only remediation routing for DX-021's detector-authored dominant category.
 DX021_AGENT_KIT_RULES = {
     "write": "sdk-ingestion-rate-control",
@@ -692,9 +707,10 @@ def _run_dx015(ctx: DetectionContext) -> Finding:
     )
 
 
-# --- DX-012: manual -> autoscale candidate (spiky duty cycle) -------------------------
+# --- DX-011: autoscale maximum right-sizing -----------------------------------------
 
 def _run_dx011(ctx: DetectionContext) -> Finding:
+    """Keep the utilization finding while distinguishing analytical reductions from no-op targets."""
     o = ctx.offer
     v = asig.detect_autoscale_max_over_provisioned(
         ctx.metrics, ctx.account_resource_id, o.database, o.container, o.provisioned_ru,
@@ -707,14 +723,28 @@ def _run_dx011(ctx: DetectionContext) -> Finding:
         status, summary = STATUS_ABSTAINED, f"Insufficient data: {v.methodology.get('abstained', '')}"
     elif v.is_over_provisioned:
         status = STATUS_FINDING
-        summary = (f"Autoscale max set too high (peak provisioned {v.trigger_pct:.1f}% of "
-                   f"{o.provisioned_ru:.0f} RU/s max); ~{v.wasted_ru:.0f} RU/s recoverable by "
-                   f"lowering the max")
+        if v.recommended_ru < o.provisioned_ru:
+            summary = (f"Autoscale max set too high (peak provisioned {v.trigger_pct:.1f}% of "
+                       f"{o.provisioned_ru:.0f} RU/s max); ~{v.wasted_ru:.0f} RU/s recoverable by "
+                       f"lowering the max")
+        else:
+            summary = (f"Autoscale max is at the modeled minimum "
+                       f"(peak provisioned {v.trigger_pct:.1f}% of max); no reduction is available")
     else:
         status = STATUS_NOT_DETECTED
         summary = f"Autoscale max is appropriate (peak provisioned {v.trigger_pct:.1f}% of max)"
-    action = (f"Lower the autoscale max {o.provisioned_ru:.0f} -> {v.recommended_ru:.0f} RU/s"
-              if v.is_over_provisioned else "")
+    action = ""
+    if v.is_over_provisioned:
+        action = (
+            f"Review lowering the autoscale max {o.provisioned_ru:.0f} -> "
+            f"{v.recommended_ru:.0f} RU/s (analytical target). "
+            if v.recommended_ru < o.provisioned_ru else
+            "The autoscale maximum is already at the modeled minimum; no reduction is available. "
+        )
+        action += (
+            "Validate service increments and resource-specific minimum maxima before changing "
+            "configuration; the model does not establish service eligibility."
+        )
     return Finding(
         detection_id="DX-011", title="Autoscale max over-provisioned", unit=_unit(ctx), status=status,
         severity=v.severity, summary=summary, recommended_action=action,
@@ -949,12 +979,18 @@ def _dx008_summary(
 # --- DX-016: expensive consistency (account-scoped) -----------------------------------
 
 def _run_dx016(ctx: AccountDetectionContext) -> Finding:
+    """Preserve the ARM finding and separate read-RU trade-offs from optional log observations."""
     v = cons.detect_expensive_consistency(ctx.config)
     evidence = dict(v.methodology)
     if v.is_expensive:
         status = STATUS_FINDING
-        summary = (f"{v.consistency_level} consistency across {v.region_count} regions — premium "
-                   f"latency/availability cost")
+        summary = (
+            f"{v.consistency_level} consistency in 1 region — local quorum reads can cost twice "
+            "the read RU of Session"
+            if v.region_count == 1 else
+            f"{v.consistency_level} consistency across {v.region_count} regions — higher read RU "
+            "and cross-region latency/availability trade-offs"
+        )
         window = ctx.window_for(cons.production_window(ctx.now))
         if ctx.dataplane_source is not None:
             window = ctx.window_for(cons.production_window(ctx.now, ctx.dataplane_source))
@@ -1137,6 +1173,7 @@ def _run_dx019(ctx: AccountDetectionContext) -> Finding:
 # --- DX-020: non-throttling error-code analysis (account-scoped, metrics only) ---------
 
 def _run_dx020(ctx: AccountDetectionContext) -> Finding:
+    """Translate unchanged status-only detection into conditional investigation guidance."""
     window = ctx.window_for(ea.production_window())
     series = ctx.metrics.get_metric_split(
         ctx.account_resource_id, "TotalRequests", window,
@@ -1155,7 +1192,8 @@ def _run_dx020(ctx: AccountDetectionContext) -> Finding:
     return Finding(
         detection_id="DX-020", title="Error-code analysis", unit=_account_unit(ctx), status=status,
         severity=v.severity, summary=summary, recommended_action=v.recommended_action,
-        agent_kit_rule=None, threshold_status=threshold_status_for("DX-020"), evidence=v.methodology,
+        agent_kit_rule=dx020_agent_kit_rule(status, v.dominant_code),
+        threshold_status=threshold_status_for("DX-020"), evidence=v.methodology,
     )
 
 

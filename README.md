@@ -20,6 +20,7 @@ findings and estimated savings depend on your workload and available evidence.*
 | Guide | What you will find |
 |---|---|
 | [Detector reference](docs/detectors.md) | Every detector, its data sources, analysis window, and recommended next step |
+| [Local agent integration](docs/agent-integration.md) | VS Code/Copilot, Codex, Cursor, Claude Code, and on-demand Agent Kit guidance |
 | [Permissions and sign-in](docs/permissions.md) | Microsoft Entra authentication, RBAC roles and scopes, optional cost access |
 | [Log Analytics setup and readiness](docs/detections/log-analytics-readiness.md) | Required categories, resource-specific tables, collection time, and troubleshooting |
 | [Architecture and data flow](docs/architecture.md) | Components, Azure services, outbound connections, and data handling |
@@ -279,6 +280,10 @@ reverse proxy. This is a single-user local application, not an authenticated mul
 
 ### Use an MCP client
 
+See [local agent integration](docs/agent-integration.md) for all four client configurations,
+identity/privacy boundaries, tool workflow and acceptance steps. The same Python engine serves
+each host; no IDE-specific detector port or running browser UI is needed.
+
 With the `mcp` extra installed, configure your client to start:
 
 ```console
@@ -303,12 +308,16 @@ The client must be able to find the installed executable and Azure credentials. 
 inherit your activated environment, set `command` to the full path of that environment's `coda`
 executable. For source installs you can instead configure `uv` with the checkout's working directory.
 
-Ask the client to list detectors or diagnose a specific account. MCP also exposes subscription
+First ask the client to call `list_detectors` and `explain_finding` for a detector such as DX-011.
+Both are offline; the installed wheel contains all 24 customer methodology pages.
+Then explicitly request diagnosis of a specific account. MCP also exposes subscription
 scan tools; explicitly request resource-group/account filters for large subscriptions. The
 `coda` terminal launcher has `web` and `mcp` commands, not a `coda diagnose` command.
 
 MCP reports are returned to your chosen client. Its model/provider may process those reports under
 its own privacy settings; review that policy before sharing customer telemetry with an AI service.
+For actionable findings, the existing `agent_kit_rule` identifies the rule to load on demand
+from the separately installed Agent Kit. CODA never applies that remediation.
 
 ## Troubleshooting
 

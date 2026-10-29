@@ -1,21 +1,23 @@
 """DX-020: Error-code analysis (non-throttling hard errors).
 
 Throttling (HTTP 429) is its own story — DX-005 (provisioned) and DX-018 (serverless) own it. But a
-Cosmos account can also return a material share of **non-429** errors that signal an
-**application / SDK / configuration** problem rather than a capacity one, and adding RU/s won't fix
-any of them:
+Cosmos account can also return a material share of **non-429** errors. These warrant investigation
+of application / SDK / configuration or service-side issues; status counts alone do not prove the
+cause, and adding RU/s is not a general remedy:
 
 * **400 Bad Request** — malformed requests or invalid queries (an app/SDK bug).
-* **404 Not Found** — read-before-write or lookups for items that don't exist (often *expected*, but a
-  high rate can mean a broken access pattern).
+* **404 Not Found** — missing resources/items or incorrect id/partition-key context; missing-item
+  lookups can be expected, and counts cannot establish a read-before-create sequence.
 * **409 Conflict** — creating items with an id that already exists.
-* **412 Precondition Failed** — optimistic-concurrency (ETag) contention on hot items.
+* **412 Precondition Failed** — an ETag/precondition may have rejected a write as intended; this
+  is not proof of a hot item or missing concurrency control.
 * **408 / 449** — request timeout / "retry with" concurrency retry.
 * **5xx** — service-side errors.
 
 This detection reads **Azure Monitor Metrics only** (`TotalRequests` split by `StatusCode`, Count) —
 no Log Analytics required — so it runs immediately. It is **advisory** (ADR-0012): it surfaces the
-error mix and points at the app/SDK/config, and asserts no dollar or RU/s figure. Read-only /
+error mix and offers conditional, status-specific investigation, not request-sequence detection.
+It asserts no dollar or RU/s figure. Read-only /
 diagnose-only. Thresholds are **proposals** (registry `threshold_status`) pending fleet grounding.
 
 Data source: `AzureMonitorMetricsProvider.get_metric_split(TotalRequests, split_dimension=StatusCode,
@@ -44,10 +46,10 @@ _ERROR_MEANINGS: dict[int, str] = {
     400: "Bad Request — malformed requests or invalid queries (application/SDK issue)",
     401: "Unauthorized — authentication failures",
     403: "Forbidden — authorization/RBAC or firewall failures",
-    404: "Not Found — read-before-write or lookups for missing items (often expected; confirm intended)",
+    404: "Not Found — missing resources/items or incorrect id/partition-key context (may be expected)",
     408: "Request Timeout",
     409: "Conflict — creating an item with an id that already exists",
-    412: "Precondition Failed — optimistic-concurrency (ETag) contention on hot items",
+    412: "Precondition Failed — ETag/precondition rejected (may be expected protection)",
     413: "Request Entity Too Large — payload exceeds limits",
     449: "Retry With — transient concurrency retry",
     500: "Internal Server Error — service-side",
@@ -135,12 +137,39 @@ def detect_error_patterns(status_code_counts: dict) -> ErrorAnalysisVerdict:
     severity = ("high" if rate >= SEVERITY_HIGH_PCT
                 else "medium" if rate >= SEVERITY_MEDIUM_PCT else "low")
     dom_meaning = _ERROR_MEANINGS.get(dominant_code, f"HTTP {dominant_code}")
+    guidance_limits = (
+        "Conditional investigation only: status counts alone cannot identify the operation or item, "
+        "or establish a read-404-then-insert sequence."
+    )
+    method.update(dominant_code=dominant_code, guidance=guidance_limits)
+    if dominant_code in (404, 409):
+        guidance = (
+            "Check expected missing-item lookups and the correct id and partition-key context. "
+            "Only if application code or traces confirm existence-check-before-create, evaluate "
+            "SDK-appropriate atomic create and handle 409 according to the intended conflict "
+            "semantics. Unconditional upsert is not equivalent to create-if-absent: it can "
+            "overwrite existing data. A 404 does not supply the missing item's ETag. "
+            "The Agent Kit conditional-create example is Java-specific; .NET ignores "
+            "IfNoneMatchEtag for writes, so it is not universal create protection."
+        )
+    elif dominant_code == 412:
+        guidance = (
+            "Inspect the actual operation and ETag/precondition handling. A 412 can be expected "
+            "protection working, not proof of missing concurrency control or a hot item. "
+            "For a confirmed read-modify-write path, re-read current state and its ETag, reapply "
+            "the intended update, and retry with bounded attempts; surface unresolved conflicts "
+            "rather than dropping the precondition or blindly retrying stale state."
+        )
+    else:
+        guidance = (
+            "Review request formation, access patterns, authentication/configuration, diagnostics "
+            "and service health for the actual status and context. 5xx can be service-side; "
+            "increasing RU/s is not a general remedy for non-429 failures."
+        )
     action = (
         f"{rate:.1f}% of requests returned non-throttling errors over the window "
-        f"(dominated by HTTP {dominant_code} at {dominant_rate:.1f}% — {dom_meaning}). These are "
-        f"application/SDK/configuration issues, not capacity — adding RU/s will not help. Investigate "
-        f"the source (request formation, access pattern, concurrency/ETag usage, or auth/config) and "
-        f"fix it client-side."
+        f"(dominated by HTTP {dominant_code} at {dominant_rate:.1f}% — {dom_meaning}). "
+        f"{guidance_limits} {guidance}"
     )
     return verdict(
         is_finding=True, root_cause="has_errors", severity=severity,

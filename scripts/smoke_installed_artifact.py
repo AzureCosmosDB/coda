@@ -7,6 +7,7 @@ Windows, macOS, or Linux GitHub runner before any project dependency is installe
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import queue
@@ -26,10 +27,14 @@ from typing import BinaryIO
 
 _EXPECTED_TOOLS = {
     "diagnose_account",
+    "diagnose_account_shallow",
     "explain_finding",
     "list_detectors",
     "scan_subscription",
+    "scan_subscription_shallow",
 }
+_EXPECTED_DETECTORS = {f"DX-{number:03d}" for number in range(1, 25)}
+_METHODOLOGY_PREFIX = "coda_core/detector_methodology/"
 PUBLIC_INDEX_URL = "https://pypi.org/simple"
 
 
@@ -84,8 +89,8 @@ def find_single_wheel(dist: Path) -> Path:
     return wheels[0].resolve()
 
 
-def assert_wheel_contents(wheel: Path) -> None:
-    """Require public entry-point files and reject private/internal package content."""
+def assert_wheel_contents(wheel: Path) -> dict[str, str]:
+    """Require public files and return the exact methodology for subsequent wire comparison."""
     required = {
         "coda_core/cli.py",
         "coda_core/mcp_server.py",
@@ -98,6 +103,10 @@ def assert_wheel_contents(wheel: Path) -> None:
     }
     with zipfile.ZipFile(wheel) as archive:
         names = {name.replace("\\", "/") for name in archive.namelist()}
+        methodology_bytes = {
+            name.replace("\\", "/"): archive.read(name) for name in archive.namelist()
+            if name.replace("\\", "/").startswith(_METHODOLOGY_PREFIX)
+        }
     missing = required - names
     if missing:
         raise SmokeError(f"wheel omitted required public files: {sorted(missing)}")
@@ -113,6 +122,21 @@ def assert_wheel_contents(wheel: Path) -> None:
     entry_points = [name for name in names if name.endswith(".dist-info/entry_points.txt")]
     if len(entry_points) != 1:
         raise SmokeError(f"wheel must contain one entry_points.txt, found {len(entry_points)}")
+    expected_paths = {
+        f"{_METHODOLOGY_PREFIX}{did.lower()}.md" for did in _EXPECTED_DETECTORS
+    }
+    if set(methodology_bytes) != expected_paths:
+        raise SmokeError("wheel methodology must contain exactly the 24 registered detector pages")
+    methodology = {}
+    for did in sorted(_EXPECTED_DETECTORS):
+        try:
+            text = methodology_bytes[f"{_METHODOLOGY_PREFIX}{did.lower()}.md"].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise SmokeError(f"wheel methodology is not UTF-8 for {did}") from exc
+        if not text.startswith(f"# {did}:"):
+            raise SmokeError(f"wheel methodology has the wrong detector header for {did}")
+        methodology[did] = text
+    return methodology
 
 
 def venv_paths(root: Path, *, platform: str | None = None) -> tuple[Path, Path]:
@@ -336,8 +360,45 @@ def _write_jsonrpc(stream: BinaryIO, message: dict) -> None:
     stream.flush()
 
 
-def _smoke_mcp(coda: Path, workdir: Path) -> list[str]:
-    """Initialize the packaged MCP server and validate its customer-safe tool list."""
+def _tool_payload(response: dict) -> dict:
+    """Decode standard JSON text or structured MCP output, rejecting tool errors and bad shapes."""
+    result = response.get("result")
+    if not isinstance(result, dict) or result.get("isError"):
+        raise SmokeError(f"MCP tool failed: {result!r}")
+    structured = result.get("structuredContent")
+    if structured is not None:
+        if not isinstance(structured, dict):
+            raise SmokeError("MCP structuredContent is not an object")
+        return structured
+    content = result.get("content")
+    if (
+        not isinstance(content, list) or len(content) != 1
+        or not isinstance(content[0], dict) or content[0].get("type") != "text"
+        or not isinstance(content[0].get("text"), str)
+    ):
+        raise SmokeError("MCP tool did not return one JSON text block")
+    try:
+        payload = json.loads(content[0]["text"])
+    except json.JSONDecodeError as exc:
+        raise SmokeError("MCP tool returned invalid JSON text") from exc
+    if not isinstance(payload, dict):
+        raise SmokeError("MCP tool returned a non-object JSON value")
+    return payload
+
+
+def _assert_explanation(payload: dict, did: str, expected: str) -> None:
+    """Require an actual successful explanation matching the shipped wheel, not just discovery."""
+    if (
+        payload.get("found") is not True
+        or payload.get("detection_id") != did
+        or payload.get("doc_path") != f"docs/detector-methodology/{did.lower()}.md"
+        or payload.get("methodology") != expected
+    ):
+        raise SmokeError(f"MCP explanation for {did} does not match the wheel methodology")
+
+
+def _smoke_mcp(coda: Path, workdir: Path, methodology: dict[str, str]) -> list[str]:
+    """Call the installed catalog and every explanation outside a checkout, without Azure reads."""
     stderr_path = workdir / "mcp-stderr.log"
     with stderr_path.open("wb") as stderr:
         process = subprocess.Popen(
@@ -345,6 +406,7 @@ def _smoke_mcp(coda: Path, workdir: Path) -> list[str]:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=stderr,
+            cwd=workdir,
         )
         if process.stdin is None or process.stdout is None:
             raise SmokeError("failed to open MCP stdio pipes")
@@ -379,12 +441,47 @@ def _smoke_mcp(coda: Path, workdir: Path) -> list[str]:
                 {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
             )
             listed = _response(messages, 2).get("result", {}).get("tools", [])
-            names = {tool.get("name") for tool in listed if isinstance(tool, dict)}
-            missing = _EXPECTED_TOOLS - names
-            if missing:
-                raise SmokeError(f"MCP tools/list omitted required tools: {sorted(missing)}")
+            if not isinstance(listed, list):
+                raise SmokeError("MCP tools/list did not return a list")
+            names = {
+                tool["name"] for tool in listed
+                if isinstance(tool, dict) and isinstance(tool.get("name"), str)
+            }
             if "update" in names:
                 raise SmokeError("packaged MCP tools/list exposed forbidden update tool")
+            if names != _EXPECTED_TOOLS or len(listed) != len(names):
+                raise SmokeError(f"unexpected MCP tool catalog: {sorted(map(str, names))}")
+            request_id = 2
+
+            def call(name: str, arguments: dict) -> dict:
+                """Send one sequential offline tool call and require a successful object result."""
+                nonlocal request_id
+                request_id += 1
+                _write_jsonrpc(process.stdin, {
+                    "jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments},
+                })
+                return _tool_payload(_response(messages, request_id))
+
+            catalog = call("list_detectors", {})
+            detectors = catalog.get("detectors")
+            if not isinstance(detectors, list):
+                raise SmokeError("MCP detector catalog is not a list")
+            ids = {
+                item["detection_id"] for item in detectors
+                if isinstance(item, dict) and isinstance(item.get("detection_id"), str)
+            }
+            if (
+                ids != _EXPECTED_DETECTORS or catalog.get("count") != len(ids)
+                or len(detectors) != len(ids) or set(methodology) != ids
+            ):
+                raise SmokeError("MCP detector catalog does not match the shipped methodology")
+            for did in sorted(ids):
+                payload = call("explain_finding", {"detection_id": did})
+                _assert_explanation(payload, did, methodology[did])
+            unknown = call("explain_finding", {"detection_id": "DX-999"})
+            if unknown.get("found") is not False or unknown.get("detection_id") != "DX-999":
+                raise SmokeError("MCP unknown detector did not return the not-found contract")
             return sorted(name for name in names if isinstance(name, str))
         finally:
             process.stdin.close()
@@ -414,7 +511,7 @@ def run_smoke(
         if not wheelhouse.is_dir():
             raise SmokeError(f"wheelhouse is not a directory: {wheelhouse}")
     wheel = find_single_wheel(dist)
-    assert_wheel_contents(wheel)
+    methodology = assert_wheel_contents(wheel)
     runtime_constraint, mcp_constraint = constraint_paths(dist, no_constraints=no_constraints)
     if workdir.exists():
         shutil.rmtree(workdir)
@@ -487,7 +584,12 @@ def run_smoke(
         )
         if not mcp_coda.is_file():
             raise SmokeError(f"installed coda launcher missing: {mcp_coda}")
-        result["mcp"]["tools"] = _smoke_mcp(mcp_coda, workdir)
+        result["mcp"]["tools"] = _smoke_mcp(mcp_coda, workdir, methodology)
+        result["mcp"]["explained_detectors"] = sorted(methodology)
+        result["mcp"]["methodology_sha256"] = {
+            did: hashlib.sha256(text.encode("utf-8")).hexdigest()
+            for did, text in sorted(methodology.items())
+        }
         result["ok"] = True
         return result
     finally:

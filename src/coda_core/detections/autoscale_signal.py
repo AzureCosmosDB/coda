@@ -40,7 +40,7 @@ def autoscaled_utilization_series(
     metrics: AzureMonitorMetricsProvider,
     account_resource_id: str,
     database: str,
-    container: str,
+    container: str | None,
     configured_max_ru: float,
     window: TimeWindow,
 ) -> MetricSeries:
@@ -73,7 +73,7 @@ def detect_autoscale_max_over_provisioned(
     metrics: AzureMonitorMetricsProvider,
     account_resource_id: str,
     database: str,
-    container: str,
+    container: str | None,
     configured_max_ru: float,
     window: TimeWindow,
     *,
@@ -81,7 +81,11 @@ def detect_autoscale_max_over_provisioned(
     scope_provisioned_ru: float | None = None,
     resource_created_at: datetime | None = None,
 ) -> OverProvisioningVerdict:
-    """DX-011: is the autoscale **max** set too high relative to what autoscale ever provisioned?"""
+    """Compare an autoscale offer's maximum with its observed peak, including shared databases.
+
+    The shared classifier separates the 1000 RU/s maximum baseline from the 10% idle floor.
+    It retains analytical sizing, not service-increment or resource-specific eligibility checks.
+    """
     # Band on the PEAK (max), not p99: for autoscale the max must cover legitimate spikes (that is
     # autoscale's purpose), and lowering it below a real peak would throttle it. An over-high max only
     # wastes the idle floor (10% of max billed even when idle), so we recommend lowering it to the
