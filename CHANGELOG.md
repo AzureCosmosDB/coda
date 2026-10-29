@@ -7,6 +7,96 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.17.14] - 2026-10-28
+
+### Preview status
+
+- Source preparation for the next Preview, with cumulative customer-visible changes since
+  public v0.17.12 Preview. Version 0.17.13 was not publicly released.
+- Fresh all-detector live acceptance and signed-in Portal-link verification remain deferred.
+  This source entry does not itself publish a tag or release.
+
+### Added
+
+- Detailed methodology for all 24 detectors, linked from the catalog and bundled with the package
+  so agents can explain a finding offline.
+- Setup guidance for VS Code/Copilot, Codex, Cursor and Claude Code using the same Python MCP
+  server, plus an on-demand workflow for the finding's Agent Kit rule.
+- Conditional Agent Kit investigation links for non-throttling error findings: dominant 404/409
+  use `sdk-conditional-create-etag`; 412 uses `sdk-etag-concurrency`. Other statuses and
+  non-findings remain unmapped, with no threshold, severity or telemetry changes.
+
+### Fixed
+
+- Autoscale right-sizing (DX-011) uses a minimum configurable maximum of 1,000 RU/s, which can
+  scale down to 100 RU/s when idle. The manual-throughput minimum remains 400 RU/s.
+- Recoverable autoscale capacity uses the 10%-of-maximum idle-floor reduction for both dedicated
+  containers and shared databases. A 4,000 maximum peaking at 400 now has a 1,000 analytical
+  target and 300 recoverable RU/s, rather than a false zero-recovery result.
+- At the modeled minimum, autoscale guidance explains that no reduction is available instead of
+  recommending an unchanged maximum.
+- Expensive consistency (DX-016) now includes single-region Strong accounts at Medium severity
+  because local quorum reads cost more RU, independently of cross-region write latency.
+- Consistency guidance explains that "premium" is not a pricing SKU, and that Session can provide
+  read-your-writes with the relevant session token. Each account has one default consistency
+  level, Strong OR Bounded Staleness, not both. Reused SDK clients manage their tokens; for
+  load-balanced web apps, flow the Cosmos response SessionToken through the web tier to the
+  end-user cookie/client context, back on a later web request, then into the handling SDK's request
+  options. Direct SDK-to-SDK synchronization is not required. Tokens stay opaque and partition-bound.
+  Session does not replace Strong's global guarantees; review application requirements and read overrides.
+- Error guidance no longer implies every non-429 failure is a client-side bug. 404s can be expected
+  lookups, 412s can be preconditions working correctly, and 5xx can be service-side.
+- Reserved-capacity guidance clarifies that Low severity is a reservation-review advisory even
+  at 250,000 RU/s, not a judgment of low throughput/utilization or small savings. The proposed
+  threshold and severity policy are unchanged; coverage and monetary savings are not measured.
+- Packaged `explain_finding` no longer requires a source checkout. Broken methodology resources
+  produce an explicit error rather than suggesting a known detector has no explanation.
+- Package checks exercise actual catalog/explanation calls and compare the results with the wheel.
+
+### Known limitations
+
+- Autoscale targets remain analytical, not service-ready settings: accepted increments and
+  resource-specific minimum maxima still require validation. A zero-recovery utilization signal
+  can remain a Low finding; this is not guaranteed savings or an hourly bill simulation.
+- Single-region Bounded Staleness policy is unchanged. Optional consistency read-charge enrichment
+  remains an upper bound, not measured savings; missing logs do not suppress a configuration finding.
+- Error rule links are conditional investigations, not evidence of a read-404-then-insert sequence,
+  operation/item, missing concurrency control or hot item. Conditional-create examples are SDK-specific:
+  .NET ignores `IfNoneMatchEtag` on writes, and unconditional upsert is not create-if-absent.
+- Native offline MCP compatibility evidence was recorded for the preceding source with
+  VS Code 1.144.0 and Codex 0.165.0. Cursor and Claude Code native runtime acceptance,
+  model-provider/GUI flows and live Azure diagnostics remain unverified.
+- Data sources, Azure permissions and diagnose-only operation are unchanged.
+
+## [0.17.13] - 2026-10-28
+
+### Preview status
+
+- Source preparation only; this version was not publicly released. Its changes are included
+  in the 0.17.14 preparation above.
+- Cumulative customer-visible changes since public v0.17.12 Preview. This remains a Preview:
+  fresh all-detector live acceptance and signed-in Portal-link verification remain deferred.
+
+### Added
+
+- Detailed methodology for all 24 detectors, linked from the catalog and bundled with the package
+  so agents can explain a finding offline.
+- Setup guidance for VS Code/Copilot, Codex, Cursor and Claude Code using the same Python MCP
+  server, plus an on-demand workflow for the finding's Agent Kit rule.
+
+### Fixed
+
+- Packaged `explain_finding` no longer requires a source checkout. Broken methodology resources
+  produce an explicit error rather than suggesting a known detector has no explanation.
+- Package checks exercise actual catalog/explanation calls and compare the results with the wheel.
+
+### Known limitations
+
+- Native offline MCP calls were checked on Windows with VS Code 1.144.0 and Codex 0.165.0.
+  Cursor and Claude Code native runtime acceptance, model-provider/GUI flows and live Azure
+  diagnostics remain unverified. Configuration recipes do not certify every client/version.
+- Detector behavior, data sources, Azure permissions and diagnose-only operation are unchanged.
+
 ## [0.17.12] - 2026-10-24
 
 ### Preview status

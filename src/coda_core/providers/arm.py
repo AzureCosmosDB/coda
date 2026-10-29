@@ -38,7 +38,7 @@ class ThroughputOffer:
     level: str  # "container" | "database"
     mode: str  # "manual" | "autoscale"
     provisioned_ru: float  # manual RU/s, or autoscale MAX RU/s (the user-set value)
-    minimum_ru: float | None  # platform/effective floor (autoscale floor ≈ 10% of max)
+    minimum_ru: float | None  # ARM minimumThroughput; not inferred to be an autoscale maximum limit
 
     def as_dict(self) -> dict:
         return asdict(self)

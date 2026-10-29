@@ -23,6 +23,9 @@ from coda_core.framework.materiality import severity as materiality_severity
 from coda_core.providers.base import DataProvider, MetricSeries, TimeWindow
 from coda_core.sufficiency import DataRequirement, evaluate_age, evaluate_series
 
+# Autoscale's configurable maximum baseline, not its scaled/billed idle floor (ADR-0016).
+AUTOSCALE_MIN_MAX_RU = 1000
+
 
 def _percentile(sorted_values: list[float], pct: float) -> float:
     """Linear-interpolation percentile (``pct`` in 0..100). Pure-Python, no numpy.
@@ -101,6 +104,8 @@ class OverProvisioningConfig:
         peaking near 100% means throttling. Recommending a downsize off p95 would
         risk telling a customer to cut capacity they actually need at peak. The
         threshold sweep (incl. a bursty fixture) is what will confirm p95 vs p99.
+    min_ru: Manual-throughput recommendation minimum only. Autoscale uses the separate
+        ``AUTOSCALE_MIN_MAX_RU`` baseline; neither is an autoscale idle billing floor.
     """
 
     band_statistic: str = "p99"
@@ -173,13 +178,16 @@ def classify(
 
     Args:
         stats: Utilization distribution from :func:`utilization_stats`.
-        provisioned_ru: The container's provisioned RU/s.
+        provisioned_ru: The offer's manual provisioned RU/s or configured autoscale maximum.
         config: Tunable methodology knobs (validated defaults — ADR-0011).
         scope_provisioned_ru: Total provisioned RU/s of the **scope in view** (container, account,
             subscription, or fleet) used as the materiality denominator. The same waste is material
             against a small account but trivial against a whole fleet — significance is
             scope-relative. If ``None``, severity falls back to absolute RU/s. CODA reports
             **capacity, not cost** (ADR-0012); capacity ≠ cost across modes/regions.
+        autoscale_billing: Use the separate 1000 RU/s maximum baseline and recover only the
+            10%-of-maximum idle-floor delta. Targets remain analytical; resource-specific
+            minima and service increments require separate validation (ADR-0016).
     """
     cfg = config or OverProvisioningConfig()
 
@@ -213,10 +221,11 @@ def classify(
     # sample, so the recommendation can never throttle a real spike.
     consumed_at_trigger = trigger / 100.0 * provisioned_ru
     peak_consumed = stats.max / 100.0 * provisioned_ru
+    min_ru = AUTOSCALE_MIN_MAX_RU if autoscale_billing else cfg.min_ru
     recommended = min(
         provisioned_ru,
         max(
-            float(cfg.min_ru),
+            float(min_ru),
             math.ceil(consumed_at_trigger * cfg.headroom),
             math.ceil(peak_consumed),
         ),
@@ -229,11 +238,9 @@ def classify(
         # between floor and peak is billed regardless of the max); it only wastes the **idle floor**
         # (10% of max, billed even at zero load). So the recoverable capacity from lowering the max is
         # the floor reduction, not (max - recommended) — using the manual formula here over-claims by
-        # ~10x (see ADR / dx-011 doc). Floor = max(platform minimum, 10% of RU).
-        def _floor(ru: float) -> float:
-            return max(float(cfg.min_ru), 0.10 * ru)
-
-        wasted_ru = max(0.0, _floor(provisioned_ru) - _floor(recommended))
+        # ~10x (see ADR-0016). Floor = 10% of max: the 1000 minimum max scales down to 100,
+        # independent of the manual 400 minimum. This is not an hourly bill simulation.
+        wasted_ru = max(0.0, 0.10 * provisioned_ru - 0.10 * recommended)
         recoverable_basis = "autoscale_idle_floor"
 
     # Severity via the shared capacity-materiality model (framework/materiality), so DX-001 and
@@ -262,7 +269,7 @@ def classify(
             "band_statistic": cfg.band_statistic,
             "bands_pct": {"idle": cfg.idle_pct, "low": cfg.low_pct, "moderate": cfg.moderate_pct},
             "headroom": cfg.headroom,
-            "min_ru": cfg.min_ru,
+            "min_ru": min_ru,
             "peak_pct": stats.max,
             "peak_saturation_pct": cfg.peak_saturation_pct,
             "peak_saturates": peak_saturates,

@@ -6,6 +6,11 @@ CODA is a **local, single-user, read-only** Python application for Azure Cosmos 
 There is no hosted CODA service to deploy. The browser UI and MCP adapter use one diagnostic
 engine; neither implements a second set of detection rules.
 
+The same stdio MCP adapter supports local agent-host integrations without a language port.
+See [agent integration](agent-integration.md) for client-specific configuration; configuration
+examples are not a claim of completed acceptance in every client/version. A TypeScript
+extension can remain a thin consumer of the Python engine rather than copy detector logic.
+
 ## Components
 
 | Public path | Responsibility |
@@ -22,10 +27,22 @@ engine; neither implements a second set of detection rules.
 | `src/coda_core/providers/` | Read-only ARM, Metrics, Log Analytics, cost, and public-price clients |
 | `src/coda_core/framework/` | Shared environment classification, utilization, and cost calculations |
 | `docs/` | User-facing setup and reference documentation |
+| `docs/detector-methodology/` | Canonical customer explanations, exported and bundled as package resources |
 
 The public repository contains the product, curated documentation, package metadata, and offline
 package tests. It is a generated distribution, not a second independently maintained codebase;
 see [contribution policy](../CONTRIBUTING.md).
+
+The detailed customer methodology has one maintained source. The build copies those exact pages
+into `coda_core/detector_methodology`, and `explain_finding` reads them offline with
+`importlib.resources`. Source/editable runs use the same public pages in the known checkout
+layout, never the caller's working directory or private engineering guides. Known detectors
+with missing/corrupt documentation fail explicitly. Documentation is not fetched from moving
+GitHub main at runtime and therefore stays with the installed engine version.
+
+Agent Kit is a separately distributed knowledge layer. Clients load the exact rule identified
+by an actionable finding on demand. A null rule is legitimate, and no rule reference grants
+permission to apply a fix. Native UI integrations need no LLM to consume diagnostic results.
 
 `coda_core.log_readiness` provides an optional account/resource-group logging pre-check, exposed
 by the existing local web API. It reads ARM diagnostic settings/categories and account-scoped

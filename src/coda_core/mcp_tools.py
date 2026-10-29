@@ -1,17 +1,17 @@
 """MCP tool logic — pure functions an agent surface (or anything) can call.
 
 These are the *capabilities* the MCP server exposes, kept free of any ``mcp`` dependency so they are
-unit-testable and reusable: the MCP wiring (``scripts/mcp_server.py``) is a thin adapter that registers
+unit-testable and reusable: ``coda_core.mcp_server`` is a thin adapter that registers
 these as tools. Every function returns plain JSON-serialisable data — the same contract the CLI emits.
 
-Surfaces (CLI, MCP, Portal) all route through this and the core ``scan`` / ``run_diagnostics``; there is
+The local web and MCP surfaces use this and the core ``scan`` / ``run_diagnostics``; there is
 no surface-specific detection logic.
 """
 
 from __future__ import annotations
 
-import glob
-import os
+from importlib.resources import files
+from importlib.resources.abc import Traversable
 from pathlib import Path
 
 from coda_core.pipeline import default_eval_window, run_diagnostics
@@ -31,9 +31,6 @@ from coda_core.providers.retail_prices import RetailPricesProvider
 from coda_core.redact import redact_report, redact_scan
 from coda_core.feedback import new_issue_url, redacted_summary
 from coda_core.scan import scan, shallow_scan, shallow_scan_account
-
-_DOCS_DIR = Path(__file__).resolve().parents[2] / "docs" / "detections"
-
 
 def _credential(credential=None):
     if credential is not None:
@@ -66,17 +63,37 @@ def list_detectors() -> dict:
     return {"count": len(detectors), "detectors": detectors}
 
 
+def _methodology_root() -> Traversable:
+    """Prefer installed resources; support only the known editable/source public-doc layout."""
+    packaged = files("coda_core").joinpath("detector_methodology")
+    if packaged.is_dir():
+        return packaged
+    package = Path(__file__).resolve().parent
+    checkout = package.parent.parent
+    if package.parent.name == "src" and (checkout / "pyproject.toml").is_file():
+        return checkout / "docs" / "detector-methodology"
+    return packaged
+
+
 def explain_finding(detection_id: str) -> dict:
-    """Return the methodology doc for a detection (e.g. ``DX-011``) so an agent can explain a finding."""
+    """Explain a registered detector offline using the methodology shipped with this engine."""
     did = detection_id.strip().upper()
-    matches = sorted(glob.glob(str(_DOCS_DIR / f"{did.lower()}-*.md")))
-    if not matches:
+    known = {item["detection_id"] for item in list_detectors()["detectors"]}
+    if did not in known:
         return {"detection_id": did, "found": False,
-                "message": f"No detection doc for {did} (it may be a config-only detector)."}
-    with open(matches[0], encoding="utf-8") as fh:
-        content = fh.read()
+                "message": f"Unknown detector {did}; use list_detectors for supported IDs."}
+    filename = f"{did.lower()}.md"
+    try:
+        content = _methodology_root().joinpath(filename).read_bytes().decode("utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise RuntimeError(
+            f"CODA methodology for {did} could not be read. "
+            "Reinstall the verified CODA wheel, or restore its public methodology source files."
+        ) from exc
+    if not content.startswith(f"# {did}:"):
+        raise RuntimeError(f"CODA methodology for {did} is invalid; reinstall the verified wheel.")
     return {"detection_id": did, "found": True,
-            "doc_path": os.path.relpath(matches[0]), "methodology": content}
+            "doc_path": f"docs/detector-methodology/{filename}", "methodology": content}
 
 
 def _feedback_payload(redacted: dict) -> dict:
@@ -157,7 +174,7 @@ def diagnose_account_shallow(
 
     The account-scoped twin of :func:`scan_subscription_shallow`: peak partition saturation + 429 rate,
     **no Log Analytics and no per-container work**, returning in ~1 s. Use it as a quick "is this
-    account OK?" check; call :func:`diagnose_account` for the full 18-detection deep report.
+    account OK?" check; call :func:`diagnose_account` for the full applicable-detector report.
     """
     cred = _credential(credential)
     return shallow_scan_account(cred, subscription, resource_group, account,
