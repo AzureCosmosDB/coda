@@ -19,11 +19,15 @@ findings and estimated savings depend on your workload and available evidence.*
 
 | Guide | What you will find |
 |---|---|
-| [Detector reference](docs/detectors.md) | Every detector, its data sources, analysis window, and recommended next step |
+| [Detector catalog and methodology](docs/detectors.md) | All 24 detectors; select a detector name for its inputs, thresholds, limitations and recommendations |
 | [Local agent integration](docs/agent-integration.md) | VS Code/Copilot, Codex, Cursor, Claude Code, and on-demand Agent Kit guidance |
 | [Permissions and sign-in](docs/permissions.md) | Microsoft Entra authentication, RBAC roles and scopes, optional cost access |
 | [Log Analytics setup and readiness](docs/detections/log-analytics-readiness.md) | Required categories, resource-specific tables, collection time, and troubleshooting |
 | [Architecture and data flow](docs/architecture.md) | Components, Azure services, outbound connections, and data handling |
+
+The `detector-methodology` folder contains the individual detector explanations. The `detections`
+folder's Log Analytics page covers shared telemetry setup, not a separate set of detectors.
+Use the catalog to browse the explanations; each detailed page links back to it.
 
 ## Safety and access boundary
 
