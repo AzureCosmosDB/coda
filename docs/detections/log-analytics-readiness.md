@@ -6,6 +6,10 @@ Four CODA detectors require Cosmos DB resource logs. Other detectors use configu
 Monitor metrics, with optional log enrichment for DX-016. **Log Analytics is not required to start
 using CODA**, and enabling it does not guarantee that a detector will find a problem.
 
+This page covers shared telemetry setup, not a separate set of detectors. For each detector's
+inputs, thresholds, limitations and recommendations, open its detailed methodology from the
+[detector catalog](../detectors.md#data-and-interpretation).
+
 ## Configure the Cosmos account
 
 These are administrator actions in Azure Portal, not operations performed by CODA:

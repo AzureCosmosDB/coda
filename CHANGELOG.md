@@ -7,6 +7,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.17.15] - Unreleased
+
+### Changed
+
+- Every detector name in the catalog table links directly to its detailed methodology, with
+  catalog backlinks retained on all 24 pages.
+- Clarify that the Log Analytics page is shared setup guidance, not a second detector catalog.
+  Existing documentation URLs are preserved.
+
+### Preview status
+
+- Documentation-only source preparation since v0.17.14 Preview; this version is not yet released.
+- Detector behavior, data sources, prerequisites and installation steps are unchanged.
+  Existing Preview and client/live-data acceptance limitations still apply.
+
 ## [0.17.14] - 2026-10-28
 
 ### Preview status

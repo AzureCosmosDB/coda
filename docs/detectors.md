@@ -6,8 +6,9 @@ CODA contains **24 read-only detectors** for Azure Cosmos DB. The local web expe
 NoSQL accounts. Checks run only where their resource type, throughput mode, configuration, and
 available data make them applicable; 24 registered detectors does not mean 24 checks on every container.
 
-Every section links to its detailed customer methodology. These same pages are included in the
-installed package and returned offline by the MCP `explain_finding` tool. See
+Select a detector name in the catalog table below to open its detailed customer methodology.
+Each methodology page links back to this catalog. The same pages are included in the installed
+package and returned offline by the MCP `explain_finding` tool. See
 [agent integration](agent-integration.md) for client setup and on-demand Agent Kit guidance.
 
 ## Data and interpretation
@@ -22,32 +23,32 @@ settings, with optional enrichment where noted. Evaluation mode available throug
 interfaces uses a shorter shared window and disables resource-age guards; it is not equivalent to
 production coverage. The browser uses production mode.
 
-| ID | Detector | Main evidence | Production window |
+| ID | Detector and detailed methodology | Main evidence | Production window |
 |---|---|---|---|
-| DX-001 | Manual over-provisioning | Metrics + throughput configuration | 30 days |
-| DX-002 | Cross-partition query fan-out | Query statistics + request logs | 1 day |
-| DX-003 | Shared-throughput starvation | Request logs + shared-pool configuration | 1 day |
-| DX-004 | Idle throughput | Metrics + throughput configuration | 30 days |
-| DX-005 | Global under-provisioning | Request/partition utilization metrics | 7 days |
-| DX-006 | Hot partition | Per-partition utilization metrics | 7 days |
-| DX-007 | Shard-key misalignment | Query statistics + request logs | 1 day |
-| DX-008 | Multi-region writes antipattern | Account configuration + throughput offers | Current configuration |
-| DX-009 | Partition merge candidate | Partition count/storage metrics + ARM throughput/backup policy | 6 hours |
-| DX-010 | Uncontrolled ingestion | Request logs | 1 day |
-| DX-011 | Autoscale maximum too high | Metrics + autoscale configuration | 30 days |
-| DX-012 | Manual-to-autoscale candidate | Utilization metrics + manual throughput | 30 days |
-| DX-013 | Autoscale-to-manual candidate | Utilization metrics + autoscale throughput | 30 days |
-| DX-014 | Serverless candidate | Account utilization metrics + configuration | 30 days |
-| DX-015 | Partition storage skew | Per-partition storage metrics | 7 days |
-| DX-016 | Expensive consistency | Account configuration; optional request logs | Current configuration; 1 day enrichment |
-| DX-017 | Rapid storage growth | Per-partition storage trend | 30 days |
-| DX-018 | Serverless throttling | Serverless requests by status | 7 days |
-| DX-019 | Paid continuous backup on non-production | Backup/environment configuration; optional storage/prices | Current configuration |
-| DX-020 | Non-throttling errors | Account requests by status | 7 days |
-| DX-021 | Throttling by operation | Account requests by operation/status | 7 days |
-| DX-022 | Per-region autoscale opportunity | Region/autoscale configuration | Current configuration |
-| DX-023 | Reserved-capacity candidate | Provisioned-throughput baseline | Current configuration |
-| DX-024 | Indexing cost risk | Index/data storage metrics + indexing policy | 6 hours (latest value) |
+| DX-001 | [Manual over-provisioning](detector-methodology/dx-001.md) | Metrics + throughput configuration | 30 days |
+| DX-002 | [Cross-partition query fan-out](detector-methodology/dx-002.md) | Query statistics + request logs | 1 day |
+| DX-003 | [Shared-throughput starvation](detector-methodology/dx-003.md) | Request logs + shared-pool configuration | 1 day |
+| DX-004 | [Idle throughput](detector-methodology/dx-004.md) | Metrics + throughput configuration | 30 days |
+| DX-005 | [Global under-provisioning](detector-methodology/dx-005.md) | Request/partition utilization metrics | 7 days |
+| DX-006 | [Hot partition](detector-methodology/dx-006.md) | Per-partition utilization metrics | 7 days |
+| DX-007 | [Shard-key misalignment](detector-methodology/dx-007.md) | Query statistics + request logs | 1 day |
+| DX-008 | [Multi-region writes antipattern](detector-methodology/dx-008.md) | Account configuration + throughput offers | Current configuration |
+| DX-009 | [Partition merge candidate](detector-methodology/dx-009.md) | Partition count/storage metrics + ARM throughput/backup policy | 6 hours |
+| DX-010 | [Uncontrolled ingestion](detector-methodology/dx-010.md) | Request logs | 1 day |
+| DX-011 | [Autoscale maximum too high](detector-methodology/dx-011.md) | Metrics + autoscale configuration | 30 days |
+| DX-012 | [Manual-to-autoscale candidate](detector-methodology/dx-012.md) | Utilization metrics + manual throughput | 30 days |
+| DX-013 | [Autoscale-to-manual candidate](detector-methodology/dx-013.md) | Utilization metrics + autoscale throughput | 30 days |
+| DX-014 | [Serverless candidate](detector-methodology/dx-014.md) | Account utilization metrics + configuration | 30 days |
+| DX-015 | [Partition storage skew](detector-methodology/dx-015.md) | Per-partition storage metrics | 7 days |
+| DX-016 | [Expensive consistency](detector-methodology/dx-016.md) | Account configuration; optional request logs | Current configuration; 1 day enrichment |
+| DX-017 | [Rapid storage growth](detector-methodology/dx-017.md) | Per-partition storage trend | 30 days |
+| DX-018 | [Serverless throttling](detector-methodology/dx-018.md) | Serverless requests by status | 7 days |
+| DX-019 | [Paid continuous backup on non-production](detector-methodology/dx-019.md) | Backup/environment configuration; optional storage/prices | Current configuration |
+| DX-020 | [Non-throttling errors](detector-methodology/dx-020.md) | Account requests by status | 7 days |
+| DX-021 | [Throttling by operation](detector-methodology/dx-021.md) | Account requests by operation/status | 7 days |
+| DX-022 | [Per-region autoscale opportunity](detector-methodology/dx-022.md) | Region/autoscale configuration | Current configuration |
+| DX-023 | [Reserved-capacity candidate](detector-methodology/dx-023.md) | Provisioned-throughput baseline | Current configuration |
+| DX-024 | [Indexing cost risk](detector-methodology/dx-024.md) | Index/data storage metrics + indexing policy | 6 hours (latest value) |
 
 Windows describe what is requested, not a guarantee of complete collected history. For example,
 DX-004 has a seven-day minimum resource-age guard while requesting 30 days of metrics; several
