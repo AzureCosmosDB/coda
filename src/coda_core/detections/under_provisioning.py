@@ -89,7 +89,7 @@ class UnderProvisioningVerdict:
     throttle_rate_pct: float
     at_capacity: bool
     uniform: bool
-    root_cause: str       # global_under_provisioning | skew_suspected | not_throttling
+    root_cause: str       # Separates the measured 429 signal from the capacity diagnosis.
     mode: str             # manual | autoscale
     recommended_action: str
     severity: str         # high | medium | low | none  (reliability)
@@ -129,8 +129,12 @@ def classify(
         base.update(kw)
         return UnderProvisioningVerdict(**base)
 
-    if not (throttling and at_capacity):
-        return verdict()
+    if not throttling:
+        return verdict(root_cause="below_throttle_threshold" if signal.throttled_requests else "not_throttling")
+    if not signal.partition_count:
+        return verdict(root_cause="insufficient_data")
+    if not at_capacity:
+        return verdict(root_cause="throttling_without_saturation")
 
     if not uniform:
         # Saturated + throttling but NOT all partitions hot -> likely a hot partition (DX-006).
@@ -180,7 +184,10 @@ def detect_under_provisioning(
                         request_series(metrics, account_resource_id, window, database, container, pool_members))
     rate, t, r = throttle_rate(total, throttled)
     if t < cfg.min_total_requests:
-        return _abstain(offer, reason="too_few_requests", detail=f"{t:.0f} requests in window")
+        result = _abstain(offer, reason="too_few_requests", detail=f"{t:.0f} requests in window")
+        return replace(result, throttle_rate_pct=rate, methodology={
+            **result.methodology, "total_requests": t, "throttled_requests": r, "throttle_rate_pct": rate,
+        })
     histories = metrics.partition_histories(
         account_resource_id, "NormalizedRUConsumption", window, database=database,
         container=container, owner_rid=offer.owner_rid, regions=regions)

@@ -1,9 +1,8 @@
 """DX-006: Hot partition (partition-key skew).
 
-A skewed partition key concentrates RU on a subset of physical partitions, so one partition
-saturates (and may throttle) while the container as a whole looks under-utilized. The remedy is the
-partition key, not more RU — distinguishing this from DX-005 (global under-provisioning) is the
-whole point of the detection.
+Physical skew concentrates RU on a subset of partitions while the offer can look under-utilized.
+Investigate logical-key distribution before recommending a key change. Offer-level 429 counts
+do not establish which partition returned a 429.
 
 Detection signal: per-partition ``NormalizedRUConsumption`` (split by ``PhysicalPartitionId``). A hot
 partition exists when the busiest partition is **saturated** (p99 >= ``saturation_pct``) **and** at
@@ -144,11 +143,8 @@ def classify(
     action = (
         f"{signal.hot_partitions} of {signal.partition_count} physical partitions saturated "
         f"(busiest p99 {signal.max_p99:.0f}%) while others have headroom (coolest p99 "
-        f"{signal.min_p99:.0f}%). Load is concentrated by the partition key. The fix is partition-key "
-        f"redesign (higher cardinality, avoid hotspots, synthetic or hierarchical keys); re-keying an "
-        f"existing container is migration-class. Per-partition/per-region autoscale only relieves the "
-        f"cost of feeding the hot partition while the key is redesigned — it does not fix the "
-        f"throttling (a single hot logical key is capped at one physical partition's ceiling)."
+        f"{signal.min_p99:.0f}%). Investigate which keys consume the most RU before changing "
+        f"throughput or redesigning the partition key."
     )
     return verdict(
         is_hot_partition=True, root_cause="hot_partition", severity=severity,
@@ -193,7 +189,7 @@ def detect_hot_partition(
     try:
         total, throttled = (read_counts(window) if read_counts is not None else
                             request_series(metrics, account_resource_id, window, database, container, pool_members))
-        rate, t, _ = throttle_rate(total, throttled)
+        rate, t, count_429 = throttle_rate(total, throttled)
     except IncompletePool as exc:
         # Partition skew is observed independently of the missing rate used for escalation.
         pressure_issue, rate, t = str(exc), 0, 0
@@ -209,7 +205,13 @@ def detect_hot_partition(
                                 "observed_cool": v.methodology["cool_partitions"],
                                 "max_p99": v.max_p99, "min_p99": v.min_p99},
     )
+    if verdict.is_hot_partition:
+        # Apply the limit after regional_verdict chooses the complete or partial-coverage advice.
+        verdict = replace(verdict, recommended_action=(
+            f"{verdict.recommended_action} These metrics cannot identify a logical partition key "
+            "or tell which partition returned a 429."))
     if pressure_issue:
         return replace(verdict, throttling=None, methodology={
             **verdict.methodology, "throttle_rate_pct": None, "throttling_unavailable": pressure_issue})
-    return verdict
+    return replace(verdict, methodology={**verdict.methodology, "throttled_requests": count_429,
+                                         "total_requests": t})

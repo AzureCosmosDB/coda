@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from coda_core.framework.cost_rate import CostEstimateIssue
 from coda_core.pipeline.finding import (
     STATUS_ABSTAINED,
+    STATUS_NOT_DETECTED,
     THRESHOLD_PROPOSAL,
     Finding,
 )
@@ -76,7 +77,9 @@ def _humanize_abstain(summary: str) -> str:
     """Turn an internal abstention reason into one plain phrase (no detector tokens leak out)."""
     text = summary.replace("Insufficient data:", "").strip()
     normalized = text.lower()
-    if normalized.startswith(("incomplete partition coverage:", "indexing metrics incomplete:")):
+    if normalized.startswith(("incomplete partition coverage:", "indexing metrics incomplete:")) or (
+        "requests returned http 429" in normalized
+    ):
         return text
     if ("minimum age unverified" in normalized or "shared member" in normalized
             or "shared-member" in normalized or "shared-pool" in normalized
@@ -163,6 +166,8 @@ def render_markdown(report: DiagnosticReport) -> str:
     but they're explained once and never lead.
     """
     s = report.summary
+    observations = [f for f in report.findings
+                    if f.status == STATUS_NOT_DETECTED and f.evidence.get("observed_throttling")]
     actionable = sorted(
         (f for f in report.findings if f.is_actionable()),
         key=lambda f: (_SEVERITY_RANK.get(f.severity, 9),
@@ -196,6 +201,8 @@ def render_markdown(report: DiagnosticReport) -> str:
         lines.append("**No actionable findings on verified offers.** Some allocations could not be evaluated.")
     elif s.abstained:
         lines.append("**No actionable findings in completed checks.** See the incomplete checks below.")
+    elif observations:
+        lines.append("**No actionable findings.** Throttling was observed; see the measurements below.")
     else:
         lines.append("**No issues to review** — everything we checked looks healthy. ✅")
     lines.append("")
@@ -219,6 +226,12 @@ def render_markdown(report: DiagnosticReport) -> str:
             "or use Run Pre-Checks to review cost-data availability.",
             "",
         ]
+
+    if observations:
+        lines += ["## Observed throttling", ""]
+        for f in observations:
+            lines.append(f"- {f.unit.describe()} (`{f.detection_id}`): {f.summary}.")
+        lines.append("")
 
     if actionable:
         lines += [
