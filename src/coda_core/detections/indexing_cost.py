@@ -26,8 +26,7 @@ import math
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 
-from coda_core.providers.azure_monitor import AzureMonitorMetricsProvider
-from coda_core.providers.base import TimeWindow
+from coda_core.providers.base import DataProvider, TimeWindow
 
 # Storage is slow-moving state; a short recent window at the metric's 5-minute grain is enough (DX-009).
 WINDOW_HOURS = 6
@@ -131,7 +130,7 @@ def _latest(series) -> float | None:
 
 
 def detect_indexing_cost(
-    metrics: AzureMonitorMetricsProvider,
+    metrics: DataProvider,
     account_resource_id: str,
     database: str,
     container: str,

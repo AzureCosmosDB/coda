@@ -7,7 +7,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.17.15] - Unreleased
+## [0.17.16] - Unreleased
 
 ### Changed
 
@@ -15,12 +15,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   catalog backlinks retained on all 24 pages.
 - Clarify that the Log Analytics page is shared setup guidance, not a second detector catalog.
   Existing documentation URLs are preserved.
+- Reduce Azure Monitor requests: indexing checks group inventory by database and request index
+  and data sizes together. Throttling and hot-partition checks reuse identical successful
+  request-count reads. Incomplete or ambiguous indexing data remains visible per container.
+
+### Fixed
+
+- Distinguish missing consumption from measured zero before recommending idle capacity for retirement.
+  If only the optional utilization read fails, keep the result supported by measured consumption.
+- Use the measured database or container's own minimum age. In mixed databases, keep the shared pool
+  separate from dedicated siblings and withhold only conclusions that depend on missing members.
+- Require verified partition coverage across regions for whole-offer pressure or balance claims;
+  retain a qualified hot/cool or storage-skew finding within a contiguous observation period in one region.
+- For MongoDB, Cassandra, Gremlin and Table, recommend verifying application write failover (Low)
+  rather than disabling multi-region writes based only on the API family.
+- Estimate throughput savings from the matching customer meter and regional billed units without
+  changing recoverable RU/s. Apply single-write autoscale or applicable regional zone factors
+  only once. Keep capacity-only results when pricing cannot be established.
 
 ### Preview status
 
-- Documentation-only source preparation since v0.17.14 Preview; this version is not yet released.
-- Detector behavior, data sources, prerequisites and installation steps are unchanged.
-  Existing Preview and client/live-data acceptance limitations still apply.
+- Cumulative changes since v0.17.14 Preview; the intervening documentation version was not
+  publicly released. This source entry does not itself publish a tag or a release.
+- Data sources, prerequisites and installation steps are unchanged. Targeted checks
+  are not fresh all-detector live acceptance or a large-account latency guarantee.
 
 ## [0.17.14] - 2026-10-28
 

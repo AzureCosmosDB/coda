@@ -1,15 +1,10 @@
 """DX-008: Multi-region writes antipattern and regional capacity footprint.
 
-Multi-region writes (the Cosmos DB feature that lets every region accept writes — enabled via the ARM
-``enableMultipleWriteLocations`` property) is almost always turned on for **RTO=0 high availability**
-(write failover), *not* to actively write from multiple regions. So "are writes spread across
-regions?" is **not** a useful waste signal — a legitimate HA account writes from one region too. What
-*is* a defensible antipattern is multi-region writes enabled where the failover benefit cannot or need
-not apply:
+Multi-region writes can serve local writes or provide availability. Account configuration describes
+which regions accept writes, not how an application will reach them during an outage.
 
-* **Mongo / Cassandra / Gremlin / Table API + multi-region writes** — these APIs' drivers cannot use
-  Cosmos DB's multi-region-write failover, so the RTO=0 benefit never materialises. Almost always a
-  misconfiguration.
+* **Mongo / Cassandra / Gremlin / Table API + multi-region writes** — Low advisory to verify
+  client write failover, not evidence of unsupported writes or a misconfiguration (ADR-0079).
 * **Non-production + multi-region writes** — dev/test/stage workloads don't need RTO=0 write failover;
   the feature adds write-conflict surface, while retaining unnecessary regions repeats provisioned
   throughput in every region. A common real case is production config cloned into a test/QA account.
@@ -17,7 +12,7 @@ not apply:
   benefit with one region (write failover needs a second region; low-latency writes need >=2). Adding
   another region separately repeats provisioned throughput there. This applies in production too.
 
-A production account with multi-region writes across two or more write regions is treated as
+A production NoSQL account with multi-region writes across two or more write regions is treated as
 **legitimate** (active-active / RTO=0 HA) and not flagged.
 
 This is a **configuration/state** detection. ARM throughput offers can quantify configured regional
@@ -33,10 +28,15 @@ from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 
 from coda_core.framework.env_classifier import classify_environment
-from coda_core.providers.arm import NON_MULTI_WRITE_APIS, AccountConfig, ThroughputOffer
+from coda_core.providers.arm import AccountConfig, ThroughputOffer
 
-# Human-readable label per API family for remediation messages.
-_API_LABEL = {"mongo": "MongoDB", "cassandra": "Cassandra", "gremlin": "Gremlin", "table": "Table"}
+# Configuration to inspect, not assumptions about which client the customer uses.
+_CLIENT_CHECKS = {
+    "mongo": ("MongoDB", "Check the preferred write region in your connection settings."),
+    "cassandra": ("Cassandra", "Check the driver's load-balancing policy and preferred regions."),
+    "gremlin": ("Gremlin", "Check whether the client uses the global endpoint or selects regional endpoints itself."),
+    "table": ("Table", "Check regional routing and fallback for the specific Table SDK and version you use."),
+}
 
 
 @dataclass(frozen=True)
@@ -62,6 +62,7 @@ def _regional_capacity(
     offers: Sequence[ThroughputOffer],
     *,
     remove_extra_regions: bool,
+    inventory_issues: tuple[str, ...],
 ) -> dict:
     """Quantify only complete, unique manual-throughput inventory from ARM."""
     evidence = {
@@ -73,6 +74,8 @@ def _regional_capacity(
     }
     if config.is_serverless:
         return {**evidence, "reason": "serverless_has_no_provisioned_throughput_footprint"}
+    if inventory_issues:
+        return {**evidence, "reason": "incomplete_offer_inventory", "issues": inventory_issues}
     if not offers:
         return {**evidence, "reason": "no_throughput_offers"}
     identities = [(offer.database, offer.container, offer.level) for offer in offers]
@@ -121,6 +124,7 @@ def _regional_capacity(
 def detect_multi_region_writes(
     config: AccountConfig,
     offers: Sequence[ThroughputOffer] = (),
+    *, inventory_issues: tuple[str, ...] = (),
 ) -> MultiRegionWriteVerdict:
     """Classify multi-region writes and attach defensible ARM capacity evidence."""
     env = classify_environment(config.name, config.tags, config.subscription_name)
@@ -136,7 +140,7 @@ def detect_multi_region_writes(
     def verdict(**kw) -> MultiRegionWriteVerdict:
         base = dict(
             is_antipattern=False, root_cause="not_multi_region_writes", severity="none",
-            multi_region_writes_enabled=config.multi_region_writes_enabled,
+            multi_region_writes_enabled=bool(config.multi_region_writes_enabled),
             write_region_count=config.write_region_count, is_mongo=config.is_mongo,
             is_non_prod=non_prod, recommended_action="", methodology=method,
         )
@@ -146,6 +150,7 @@ def detect_multi_region_writes(
             "regional_capacity": _regional_capacity(
                 config,
                 offers,
+                inventory_issues=inventory_issues,
                 remove_extra_regions=base["root_cause"] == "nonprod_multi_region_writes",
             ),
         }
@@ -154,20 +159,15 @@ def detect_multi_region_writes(
     if not config.multi_region_writes_enabled:
         return verdict(root_cause="not_multi_region_writes")
 
-    # Wrong-API: the failover benefit is impossible regardless of environment — highest confidence.
-    # The Mongo, Cassandra, Gremlin, and Table SDKs cannot use Cosmos DB's multi-region-write
-    # failover, so multi-region writes on any of them is a misconfiguration (#7).
-    if config.api in NON_MULTI_WRITE_APIS:
-        api_label = _API_LABEL[config.api]
+    if config.api in _CLIENT_CHECKS:
+        api_label, check = _CLIENT_CHECKS[config.api]
+        method.update(api_family=api_label, client_write_failover="not_assessed")
         return verdict(
-            is_antipattern=True, root_cause=f"{config.api}_multi_region_writes", severity="high",
+            is_antipattern=True, root_cause=f"{config.api}_multi_region_writes", severity="low",
             recommended_action=(
-                f"Multi-region writes are enabled on a {api_label} API account, but the {api_label} "
-                "drivers cannot use Cosmos DB's multi-region-write failover — so the RTO=0 HA benefit "
-                "never materialises while the account still carries the write-conflict surface. "
-                "Disable multi-region writes unless custom application logic depends on it. This "
-                "toggle alone does not reduce throughput provisioned in retained regions; evaluate "
-                "regional HA separately before removing any region."
+                f"Verify client write failover for your {api_label} application. {check} "
+                "Confirm in a controlled test whether writes resume within your recovery target "
+                "when the usual write region is unavailable. CODA has not tested your client."
             ),
         )
 

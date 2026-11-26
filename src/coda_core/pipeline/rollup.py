@@ -109,7 +109,7 @@ class RollupSummary:
     not_detected: int
     severity_counts: dict
     total_recoverable_ru: float
-    scope_provisioned_ru: float
+    scope_provisioned_ru: float | None
     # FinOps dollar surface: summed across actionable customer-bill-derived findings when Cost
     # Management yielded an effective rate. Finding-local regional RU/s never enters recoverable RU/s.
     total_estimated_monthly_savings: float | None = None
@@ -120,7 +120,7 @@ class RollupSummary:
         return asdict(self)
 
 
-def aggregate(findings: list[Finding], scope_provisioned_ru: float, units_scanned: int) -> RollupSummary:
+def aggregate(findings: list[Finding], scope_provisioned_ru: float | None, units_scanned: int) -> RollupSummary:
     """Roll findings up into account-level totals (RU/s + bill-derived $) over actionable findings."""
     actionable = [f for f in findings if f.is_actionable()]
     severity_counts: dict = {}

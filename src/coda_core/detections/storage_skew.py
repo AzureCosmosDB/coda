@@ -26,6 +26,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 
+from coda_core.detections.regional_skew import regional_verdict
 from coda_core.providers.arm import ThroughputOffer
 from coda_core.providers.azure_monitor import AzureMonitorMetricsProvider
 from coda_core.providers.base import MetricSeries, TimeWindow
@@ -187,6 +188,7 @@ def detect_storage_skew(
     *,
     config: StorageSkewConfig | None = None,
     resource_created_at: datetime | None = None,
+    regions: tuple[str | None, ...] = (),
 ) -> StorageSkewVerdict:
     """End-to-end DX-015 for one container."""
     cfg = config or StorageSkewConfig()
@@ -201,17 +203,17 @@ def detect_storage_skew(
                 methodology={"abstained": age_insuff.reason, "detail": age_insuff.detail},
             )
 
-    scope = {"DatabaseName": database, "CollectionName": container}
-    per_partition = metrics.get_metric_split(
-        account_resource_id, "PhysicalPartitionSizeInfo", window,
-        split_dimension="PhysicalPartitionId", dimension_filter=scope, aggregation="Maximum",
+    histories = metrics.partition_histories(
+        account_resource_id, "PhysicalPartitionSizeInfo", window, database=database,
+        container=container, owner_rid=offer.owner_rid, regions=regions,
     )
-    count, mx, mn, mean = storage_skew(per_partition)
-    skew_ratio = (mx / mean) if mean > 0 else 0.0
-    balance_ratio = (mn / mx) if mx > 0 else 1.0
-    busiest_pct = 100.0 * mx / PHYSICAL_PARTITION_LIMIT_BYTES if mx > 0 else 0.0
-    signal = StorageSkewSignal(
-        partition_count=count, max_bytes=mx, min_bytes=mn, mean_bytes=mean,
-        skew_ratio=skew_ratio, balance_ratio=balance_ratio, busiest_pct_of_limit=busiest_pct,
-    )
-    return classify(signal, cfg)
+
+    def classify_series(series):
+        count, mx, mn, mean = storage_skew(series)
+        return classify(StorageSkewSignal(
+            count, mx, mn, mean, mx / mean if mean else 0, mn / mx if mx else 1,
+            100 * mx / PHYSICAL_PARTITION_LIMIT_BYTES), cfg)
+
+    return regional_verdict(
+        histories, classify_series, skew_cause="storage_skew",
+        observations=lambda v: {"observed_max_bytes": v.max_bytes, "observed_min_bytes": v.min_bytes})

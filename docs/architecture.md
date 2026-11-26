@@ -56,6 +56,12 @@ Reported administrative permissions guide presentation but do not override Azure
 
 ## What happens during a diagnosis
 
+A mixed database has one shared throughput allocation plus one independent allocation per
+dedicated container. ARM identifies the members. Age-gated checks require age evidence for
+that exact database or container. Member-dependent reads must cover all confirmed shared
+members; unavailable membership or telemetry is reported as incomplete, not as zero traffic.
+Independent owner-scoped, dedicated-container and account-configuration findings remain eligible.
+
 1. **Choose scope and credentials.** The browser talks to the loopback FastAPI service. MCP uses
    stdio. Azure credentials are resolved locally through the Azure Identity library.
 2. **Discover resources.** ARM supplies account configuration and throughput offers. The web app
@@ -74,6 +80,12 @@ Reported administrative permissions guide presentation but do not override Azure
 The shipped diagnostic path does not call an LLM. An AI client can call the MCP tools and interpret
 their output, but that client's model service is separate from CODA.
 
+DX-005, DX-006 and DX-015 compare physical partitions within each configured region. The
+metrics provider checks the same offer's `PhysicalPartitionCount` history alongside identified
+utilization or storage series, reusing count and utilization reads across detectors. Reports
+distinguish verified coverage from observed regional skew; a missing partition or region is
+not a measured zero or evidence that an offer is balanced.
+
 DX-003, DX-010, and optional DX-016 read-charge enrichment prefer five-minute request aggregates,
 with raw-log compatibility when aggregates are unavailable. Source selection and cache keys are
 consistent within a run; errors are not a reason to silently switch sources. DX-002/DX-007 still
@@ -81,6 +93,16 @@ require raw request logs for activity-level query-charge joins. See
 [Log Analytics readiness](detections/log-analytics-readiness.md) for configuration and window limits.
 
 ## Services and outbound connections
+
+For indexing checks, the runner groups ARM-inventoried containers in the same database and
+requests `IndexUsage` and `DataUsage` together. It maps each result to its exact metric, account,
+database, container and window. Recovery reads are bounded; missing evidence is not zero. The
+under-provisioning and hot-partition checks reuse identical request counts within one offer's
+evaluation. No extra Azure permissions or background service are needed.
+
+Throughput currency estimates combine two separate inputs: ARM offer/region configuration
+determines the change in billed meter units, and Cost Management supplies the historical
+amortized price of the matching meter. Missing pricing evidence does not suppress physical findings.
 
 These are the public Azure endpoints used by the current implementation, not a complete firewall
 allowlist for every identity flow. Your proxy, tenant policy, SDK configuration, and Azure network

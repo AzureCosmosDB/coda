@@ -41,7 +41,8 @@ def redacted_summary(artifact: dict) -> list[str]:
             f"abstained: {s.get('abstained', '?')}",
             f"  • Findings: {_finding_tally(artifact.get('findings', []))}",
             f"  • Recoverable: {s.get('total_recoverable_ru', 0):,} RU/s of "
-            f"{s.get('scope_provisioned_ru', 0):,} provisioned",
+            + (f"{s['scope_provisioned_ru']:,} provisioned" if s.get("scope_provisioned_ru") is not None
+               else "unknown account capacity"),
         ]
     elif kind == "redacted-scan-v1":
         lines += [

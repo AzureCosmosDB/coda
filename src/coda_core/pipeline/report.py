@@ -33,6 +33,7 @@ class DiagnosticReport:
     account_resource_id: str | None = None
     account_endpoint: str | None = None
     cost_estimate_issue: CostEstimateIssue | None = None
+    inventory_issues: tuple[str, ...] = ()
 
     def as_dict(self) -> dict:
         return {
@@ -44,6 +45,7 @@ class DiagnosticReport:
             "generated_at": self.generated_at,
             "summary": self.summary.as_dict(),
             "findings": [f.as_dict() for f in self.findings],
+            **({"inventory_issues": list(self.inventory_issues)} if self.inventory_issues else {}),
             **({"cost_estimate_issue": self.cost_estimate_issue.as_dict()}
                if self.cost_estimate_issue is not None else {}),
         }
@@ -74,6 +76,12 @@ def _humanize_abstain(summary: str) -> str:
     """Turn an internal abstention reason into one plain phrase (no detector tokens leak out)."""
     text = summary.replace("Insufficient data:", "").strip()
     normalized = text.lower()
+    if normalized.startswith(("incomplete partition coverage:", "indexing metrics incomplete:")):
+        return text
+    if ("minimum age unverified" in normalized or "shared member" in normalized
+            or "shared-member" in normalized or "shared-pool" in normalized
+            or "mixed database" in normalized or "shared throughput owner" in normalized):
+        return text
     if "log analytics probe failed" in normalized:
         return text or "Log Analytics probe failed"
     text = normalized
@@ -176,11 +184,18 @@ def render_markdown(report: DiagnosticReport) -> str:
             f"code or in the Azure portal).",
             "",
         ]
+    if report.inventory_issues:
+        lines += ["**Incomplete throughput inventory.** Account capacity is unknown; only verified "
+                  "offers are included.", *[f"- {issue}" for issue in report.inventory_issues], ""]
     if s.actionable_findings:
         lines.append(
             f"Found **{s.actionable_findings} issue(s) to review** "
             f"({_severity_phrase(s.severity_counts)} priority)."
         )
+    elif report.inventory_issues:
+        lines.append("**No actionable findings on verified offers.** Some allocations could not be evaluated.")
+    elif s.abstained:
+        lines.append("**No actionable findings in completed checks.** See the incomplete checks below.")
     else:
         lines.append("**No issues to review** — everything we checked looks healthy. ✅")
     lines.append("")
@@ -195,10 +210,12 @@ def render_markdown(report: DiagnosticReport) -> str:
             "",
         ]
     elif s.total_recoverable_ru:
+        total = (f"out of {s.scope_provisioned_ru:,.0f} RU/s total"
+                 if s.scope_provisioned_ru is not None else "account total unknown")
         lines += [
             f"You could reclaim **{s.total_recoverable_ru:,.0f} RU/s** of provisioned capacity "
-            f"(out of {s.scope_provisioned_ru:,.0f} RU/s total). A usable customer billing rate "
-            "is needed to express this as dollar savings; see the incomplete estimates below "
+            f"({total}). A usable customer billing rate and a known billed quantity "
+            "are needed to express this as dollar savings; see the incomplete estimates below "
             "or use Run Pre-Checks to review cost-data availability.",
             "",
         ]
@@ -235,6 +252,8 @@ def render_markdown(report: DiagnosticReport) -> str:
         meta = [_SEVERITY_LABEL.get(f.severity, f.severity)]
         if f.estimated_monthly_savings is not None:
             meta.append(_finding_savings_label(f))
+        elif issue := f.evidence.get("throughput_pricing_issue"):
+            meta.append(f"Capacity only: {issue}")
         if f.recoverable_ru:
             meta.append(f"{f.recoverable_ru:,.0f} RU/s reclaimable")
         meta.append(f"ref `{f.detection_id}`")

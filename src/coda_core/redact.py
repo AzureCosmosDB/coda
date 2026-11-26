@@ -41,7 +41,7 @@ def _hash(salt: str, *parts: str | None) -> str:
 # would violate the "signal, not data" rule (ADR-0028 keeps cost in the customer's trust context).
 _DROP_EVIDENCE_KEYS = frozenset({
     "estimated_monthly_savings", "savings_currency", "effective_rate_usd_per_ru_month",
-    "rate_basis", "amortized_cost", "billed_usage_100rus_hours",
+    "rate_basis", "billing_quantity", "amortized_cost", "billed_usage_100rus_hours",
     "storage_snapshot", "retail_pricing",
 })
 

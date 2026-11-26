@@ -16,12 +16,11 @@ corroborates it.
 
 Note: we deliberately do **not** gate on ``TotalRequests`` — on live Cosmos accounts that metric is
 frequently unpopulated (returns no data at all), which would make a request-count gate read every
-container as idle. RU consumed (``TotalRequestUnits``) is the robust, always-populated signal.
+container as idle. RU consumed (``TotalRequestUnits``) is the decision signal.
 
-**Sufficiency is INVERTED vs DX-001/DX-005.** Azure Monitor pads idle windows with *zero-valued*
-points (verified), so "peak ≈ 0" is the **positive idle signal**, never "insufficient data".
-Confidence comes from the container being **old enough** to trust the silence (age ≥ floor), not
-from the presence of non-zero points.
+Azure Monitor can return *zero-valued* observations for idle windows. Measured "peak ≈ 0" is
+positive idle evidence; a successful read with no usable observations is **insufficient data**,
+not a measured zero (ADR-0076). The existing age guard remains; non-zero points are not required.
 
 Mode-aware recoverable cost: manual idle bills the **full** provisioned RU/s (all recoverable);
 autoscale idle scales to ~10% of its max (that idle floor is what's recoverable). Severity reuses
@@ -32,13 +31,15 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
+from azure.core.exceptions import AzureError
 
 from coda_core.framework.materiality import MaterialityConfig
 from coda_core.framework.materiality import severity as materiality_severity
 from coda_core.providers.arm import ThroughputOffer
 from coda_core.providers.azure_monitor import AzureMonitorMetricsProvider
 from coda_core.providers.base import TimeWindow
-from coda_core.sufficiency import evaluate_age
+from coda_core.providers.shared_offer import IncompletePool, PoolMembers, owner_scope, traffic_metric
+from coda_core.sufficiency import DataRequirement, evaluate_age, evaluate_series
 
 # Idle is a destructive-remediation detection, so it needs a LONG, high-confidence window to avoid
 # flagging periodic (e.g. monthly-batch) containers, plus an age floor (ADR-0008). PT5M granularity
@@ -46,6 +47,7 @@ from coda_core.sufficiency import evaluate_age
 PRODUCTION_WINDOW_DAYS = 30
 GRANULARITY = timedelta(minutes=5)
 AGE_FLOOR = timedelta(days=7)
+DATA_REQUIREMENT = DataRequirement(window_floor=timedelta(0), min_points=1)
 # When idle, autoscale scales down to ~10% of its configured max — that floor is what is billed
 # (and therefore recoverable on decommission). Manual recovers the full provisioned RU/s.
 AUTOSCALE_IDLE_FRACTION = 0.10
@@ -62,7 +64,7 @@ class IdleSignal:
     """What we measured for one container over the window."""
 
     peak_ru: float             # max RU consumed in any 5-min bucket (TotalRequestUnits Total) — the gate
-    max_utilization_pct: float  # max NormalizedRUConsumption (corroborating; 0 when no telemetry)
+    max_utilization_pct: float | None  # corroborating only; absence is not measured zero
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -125,7 +127,8 @@ def classify(
             mode=offer.mode, root_cause="active", recommended_action="",
             methodology={"max_idle_peak_ru": cfg.max_idle_peak_ru,
                          "peak_ru": round(signal.peak_ru, 1),
-                         "max_utilization_pct": round(signal.max_utilization_pct, 2)},
+                         "max_utilization_pct": (round(signal.max_utilization_pct, 2)
+                                                 if signal.max_utilization_pct is not None else None)},
         )
         base.update(kw)
         return IdleVerdict(**base)
@@ -161,12 +164,12 @@ def detect_idle(
     config: IdleConfig | None = None,
     scope_provisioned_ru: float | None = None,
     resource_created_at: datetime | None = None,
+    pool_members: PoolMembers | None = None,
 ) -> IdleVerdict:
     """End-to-end DX-004 for one container (manual or autoscale).
 
-    Unlike DX-001/DX-005, an empty / all-zero series is NOT an abstention here — it is the idle
-    signal. The only sufficiency guard is age: a container younger than the floor hasn't been
-    around long enough to confidently call idle (a brand-new container has no traffic *yet*).
+    Empty/all-null consumption abstains; measured zeros can establish idleness. The age guard
+    also abstains for a known young resource that has not accrued representative history.
     """
     cfg = config or IdleConfig()
 
@@ -180,18 +183,36 @@ def detect_idle(
                 methodology={"abstained": age_insuff.reason, "detail": age_insuff.detail},
             )
 
-    scope = {"DatabaseName": database} if container is None else \
-        {"DatabaseName": database, "CollectionName": container}
     # Peak RU consumed in any single bucket (spike-aware idle gate). TotalRequestUnits is populated
     # on live accounts where TotalRequests is not — see the module docstring.
-    ru = metrics.get_metric(account_resource_id, "TotalRequestUnits", window,
-                            aggregation="Total", dimension_filter=scope)
-    utilization = metrics.get_metric(account_resource_id, "NormalizedRUConsumption", window,
-                                     aggregation="Maximum", dimension_filter=scope)
+    try:
+        ru = traffic_metric(metrics, account_resource_id, "TotalRequestUnits", window,
+                            database=database, container=container, pool=pool_members, aggregation="Total")
+    except IncompletePool as exc:
+        return IdleVerdict(False, 0.0, 0.0, "none", None, offer.mode, "insufficient_data", "",
+                           {"abstained": exc.reason, "detail": str(exc)})
+    insuff = evaluate_series(ru, DATA_REQUIREMENT)
+    if insuff is not None:
+        return IdleVerdict(
+            is_idle=False, peak_ru=0.0, recoverable_ru=0.0,
+            severity="none", materiality_pct=None,
+            mode=offer.mode, root_cause="insufficient_data", recommended_action="",
+            methodology={"abstained": insuff.reason, "detail": insuff.detail},
+        )
+    utilization_issue = None
+    try:
+        utilization = metrics.get_metric(account_resource_id, "NormalizedRUConsumption", window,
+            aggregation="Maximum", dimension_filter=owner_scope(database, container, offer.owner_rid))
+    except (AzureError, IncompletePool) as exc:
+        utilization = None
+        utilization_issue = f"Optional utilization unavailable: {type(exc).__name__}"
     ru_values = ru.values()
-    util_values = utilization.values()
+    util_values = utilization.values() if utilization is not None else []
     signal = IdleSignal(
-        peak_ru=(max(ru_values) if ru_values else 0.0),
-        max_utilization_pct=(max(util_values) if util_values else 0.0),
+        peak_ru=max(ru_values),
+        max_utilization_pct=max(util_values) if util_values else None,
     )
-    return classify(signal, offer, config=cfg, scope_provisioned_ru=scope_provisioned_ru)
+    result = classify(signal, offer, config=cfg, scope_provisioned_ru=scope_provisioned_ru)
+    if utilization_issue:
+        result.methodology["utilization_issue"] = utilization_issue
+    return result

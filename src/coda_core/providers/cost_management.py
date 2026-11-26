@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from datetime import date
 
 from azure.core.credentials import TokenCredential
+from coda_core.framework.cost_rate import THROUGHPUT_METERS
 
 _MGMT = "https://management.azure.com"
 _SCOPE = "https://management.azure.com/.default"
@@ -169,6 +170,7 @@ class CostManagementProvider:
     def cosmos_throughput_cost(
         self, start: date, end: date, *, resource_id: str | None = None, scope: str | None = None,
         cost_type: str = AMORTIZED_COST,
+        meter: str | None = None,
     ) -> ThroughputCost:
         """Amortized Cosmos **provisioned-throughput** cost + billed usage over ``[start, end]``.
 
@@ -179,16 +181,32 @@ class CostManagementProvider:
 
         ``resource_id`` scopes a subscription-level query to one Cosmos account (the usual call). The
         meter classification still runs because a ResourceId filter alone can leak non-Cosmos meters
-        (e.g. Defender's "Standard 100 RU/s") attributed to the resource.
+        (e.g. Defender's "Standard 100 RU/s") attributed to the resource. Diagnosis passes the
+        exact topology-matched ``meter`` for both rate scopes. The unfiltered pre-check only tests
+        whether any throughput usage is visible; its combined totals are not used as a price.
         """
+        filters = self._resource_filter(resource_id)
+        if meter is not None:
+            if meter not in THROUGHPUT_METERS:
+                raise ValueError("Unsupported provisioned throughput billing meter")
+            dimensions = [{"dimensions": {"name": "MeterCategory", "operator": "In",
+                                           "values": [_COSMOS_METER_CATEGORY]}},
+                          {"dimensions": {"name": "Meter", "operator": "In", "values": [meter]}}]
+            if filters:
+                dimensions.append(filters["filter"])
+            filters = {"filter": {"and": dimensions}}
         body = {**self._window(start, end, cost_type),
                 "dataset": {"granularity": "None",
                             "aggregation": {"totalCost": {"name": "Cost", "function": "Sum"},
                                             "usage": {"name": "UsageQuantity", "function": "Sum"}},
                             "grouping": [{"type": "Dimension", "name": "MeterCategory"},
                                          {"type": "Dimension", "name": "Meter"}],
-                            **self._resource_filter(resource_id)}}
+                            **filters}}
         props = self._post_query(self._scope(scope), body)
+        if props.get("nextLink"):
+            raise ValueError("Incomplete throughput billing response")
+        if not isinstance(props.get("rows"), list):
+            raise ValueError("Missing throughput billing rows")
         cols = props.get("columns", [])
         rows = props.get("rows") or []
         if not rows:
@@ -199,16 +217,23 @@ class CostManagementProvider:
         meter_i = self._col_index(cols, "Meter")
         cur_i = self._col_index(cols, "Currency")
         total_cost = total_usage = 0.0
-        currency = "USD"
+        currency = None
         meters: list[str] = []
         for r in rows:
             if not is_cosmos_throughput_meter(str(r[cat_i]), str(r[meter_i])):
                 continue
+            if meter is not None and r[meter_i] != meter:
+                continue
+            row_currency = r[cur_i]
+            if not isinstance(row_currency, str) or not row_currency.strip():
+                raise ValueError("Missing throughput billing currency")
+            if currency is not None and currency != row_currency:
+                raise ValueError("Cannot combine throughput rows in different currencies")
             total_cost += float(r[cost_i])
             total_usage += float(r[use_i])
-            currency = str(r[cur_i])
+            currency = row_currency
             meters.append(str(r[meter_i]))
-        return ThroughputCost(total_cost, total_usage, currency, tuple(sorted(set(meters))))
+        return ThroughputCost(total_cost, total_usage, currency or "USD", tuple(sorted(set(meters))))
 
     @staticmethod
     def _col_index(columns: list[dict], name: str) -> int:

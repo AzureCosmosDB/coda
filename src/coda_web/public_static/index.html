@@ -964,6 +964,12 @@ function detectorImpactChips(finding) {
       && rateBasis
       && typeof rateBasis === "object"
       && rateBasis.rate_source === "customer_amortized_bill"
+      && rateBasis.meters?.length === 1
+      && rateBasis.meters[0] === "100 Multi-master RU/s"
+      && evidence.billing_quantity?.meter === rateBasis.meters[0]
+      && evidence.billing_quantity.input_basis === "removed_regional_ru"
+      && evidence.billing_quantity.input_ru === capacity.removable_extra_region_ru
+      && evidence.billing_quantity.meter_units_per_hour === capacity.removable_extra_region_ru / 100
       && (
         rateBasis.rate_scope === "account"
         || rateBasis.rate_scope === "subscription_fallback"
@@ -1236,6 +1242,7 @@ function renderFindingCard(finding, report) {
       ${portalLink(report, finding)}
       <div class="magnitude">${findingMagnitude(finding)}</div>
       <p class="summary">${escapeHtml(finding.summary)}</p>
+      ${finding.evidence?.throughput_pricing_issue ? `<p>Capacity only: ${escapeHtml(finding.evidence.throughput_pricing_issue)}</p>` : ""}
       ${finding.recommended_action ? `<p><strong>Recommended:</strong> ${escapeHtml(finding.recommended_action)}</p>` : ""}
       ${finding.threshold_status === "proposal" ? `<div class="calibrating">${escapeHtml(proposedCutoffNote(finding))}</div>` : ""}
       ${renderRelatedSignals(report, finding)}
@@ -1310,7 +1317,8 @@ function renderAccountReport(report) {
   const headlineLabel = hasEstimatedSavings
     ? "Customer bill-derived monthly savings"
     : hasRecoverableRu
-      ? `Recoverable RU/s of ${number(summary.scope_provisioned_ru)} provisioned`
+      ? (summary.scope_provisioned_ru == null ? "Recoverable RU/s (account capacity unknown)"
+            : `Recoverable RU/s of ${number(summary.scope_provisioned_ru)} provisioned`)
       : hasDetectorImpact
         ? "Quantified detector impact"
         : "Customer bill-derived savings estimate";
@@ -1332,6 +1340,7 @@ function renderAccountReport(report) {
         ${actionable.length ? actionable.map(f => renderFindingCard(f, report)).join("") : `<div class="empty">No actionable findings in this report.</div>`}
       </div>
     </section>
+    ${report.inventory_issues?.length ? `<section class="panel"><strong>Incomplete throughput inventory</strong><p>Only verified offers are included. Account capacity is unknown.</p><ul>${report.inventory_issues.map(issue => `<li>${escapeHtml(issue)}</li>`).join("")}</ul></section>` : ""}
     ${renderIncomplete(report.findings || [], report.cost_estimate_issue)}`;
 }
 
