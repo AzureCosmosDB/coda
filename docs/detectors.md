@@ -184,6 +184,8 @@ Correlates throttling with broad partition saturation to distinguish insufficien
 from a localized hot spot. Global capacity advice requires verified partition coverage in every
 configured region; partial observations can still establish regional skew. Raising throughput may be
 appropriate for global pressure but is not automatically the right response to every 429.
+The report shows measured throttling even below the alert threshold or when complete partition
+measurements do not explain the 429s.
 
 ### DX-006 - Hot partition
 
@@ -257,7 +259,8 @@ detailed methodology for SDK caveats and bounded-retry guidance.
 An account-level **proposal-threshold** analysis of which categories dominate 429s: writes, reads,
 queries, execution, or other operations. Helps prioritize ingestion control, query investigation,
 partition distribution, or capacity review. Operation mix guides investigation; it is not proof that
-one particular detector's root cause is present.
+one particular detector's root cause is present. With a missing or unreadable breakdown,
+the report retains the measured 429s and marks operation attribution incomplete.
 
 ## Configuration and storage risks
 

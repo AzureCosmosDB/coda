@@ -1299,6 +1299,8 @@ function renderIncomplete(findings, costIssue = null) {
 function renderAccountReport(report) {
   const summary = report.summary || {};
   const actionable = actionableFindings(report);
+  const observations = (report.findings || []).filter(f =>
+    f.status === "not_detected" && f.evidence?.observed_throttling);
   const hasEstimatedSavings = isFiniteNonnegativeNumber(summary.total_estimated_monthly_savings)
     && summary.total_estimated_monthly_savings > 0;
   const hasRecoverableRu = typeof summary.total_recoverable_ru === "number"
@@ -1340,6 +1342,9 @@ function renderAccountReport(report) {
         ${actionable.length ? actionable.map(f => renderFindingCard(f, report)).join("") : `<div class="empty">No actionable findings in this report.</div>`}
       </div>
     </section>
+    ${observations.length ? `<section class="panel section"><h3>Observed throttling</h3><ul>
+      ${observations.map(f => `<li>${escapeHtml(unitLabel(f.unit))} (${escapeHtml(f.detection_id)}) — ${escapeHtml(f.summary)}</li>`).join("")}
+    </ul></section>` : ""}
     ${report.inventory_issues?.length ? `<section class="panel"><strong>Incomplete throughput inventory</strong><p>Only verified offers are included. Account capacity is unknown.</p><ul>${report.inventory_issues.map(issue => `<li>${escapeHtml(issue)}</li>`).join("")}</ul></section>` : ""}
     ${renderIncomplete(report.findings || [], report.cost_estimate_issue)}`;
 }

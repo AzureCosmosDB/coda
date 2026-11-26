@@ -40,11 +40,10 @@ _QUERY_OPS = {"query", "queryplan", "readfeed"}
 _EXEC_OPS = {"execute", "executejavascript", "executestoredprocedure"}
 
 _CATEGORY_GUIDANCE = {
-    "write": ("write", "bulk/batch ingestion is outrunning capacity — use the bulk executor or "
-                       "client-side throughput control and spread writes over time (see DX-010), "
-                       "rather than only raising RU/s"),
-    "read": ("read", "point reads are throttling — this usually means a hot partition (DX-006) or "
-                     "genuine under-provisioning (DX-005), not the read path itself"),
+    "write": ("write", "check whether bulk or batch ingestion is concentrating writes (DX-010) "
+                       "before changing throughput"),
+    "read": ("read", "check for a hot physical partition (DX-006) or broad saturation (DX-005) "
+                     "before changing throughput"),
     "query": ("query", "query load is throttling — check for cross-partition fan-out / expensive "
                        "queries (DX-002 / DX-007) and add a partition-key filter or index before "
                        "adding RU/s"),
@@ -75,7 +74,7 @@ def _category_of(operation_type: str) -> str:
 @dataclass(frozen=True)
 class ThrottlingRootCauseVerdict:
     is_finding: bool
-    # decomposed | not_throttling | too_few_requests
+    # Operation attribution is distinct from observing throttling.
     root_cause: str
     severity: str  # high | medium | low | none
     total_requests: int
@@ -134,8 +133,13 @@ def detect_throttling_root_cause(
 
     if total_requests < MIN_TOTAL_REQUESTS:
         return verdict(root_cause="too_few_requests")
-    if total_throttled == 0 or rate < THROTTLE_RATE_PCT or not ops:
-        return verdict(root_cause="not_throttling")
+    if total_throttled == 0:
+        return verdict()
+    if rate < THROTTLE_RATE_PCT:
+        return verdict(root_cause="below_throttle_threshold")
+    if not ops:
+        return verdict(root_cause="insufficient_data",
+                       methodology={**method, "abstained": "missing_operation_breakdown"})
 
     dominant_op = max(ops, key=ops.get)
     dominant_share = 100.0 * ops[dominant_op] / total_throttled

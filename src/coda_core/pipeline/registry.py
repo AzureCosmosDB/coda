@@ -15,6 +15,8 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import timedelta
 
+from azure.core.exceptions import AzureError
+
 from coda_core.detections import autoscale_signal as asig
 from coda_core.detections import consistency as cons
 from coda_core.detections import cross_partition_query as cpq
@@ -686,10 +688,14 @@ def _run_dx005(ctx: DetectionContext) -> Finding:
         regions=ctx.partition_regions,
         pool_members=ctx.pool_members, read_counts=ctx.read_counts,
     )
+    throttled = v.methodology.get("throttled_requests", 0)
+    observed = _observed_429s(throttled, v.methodology.get("total_requests", 0))
     if v.root_cause == "insufficient_data":
         status, summary, rule = STATUS_ABSTAINED, _partition_abstention(v.methodology), None
-        if "throttle_rate_pct" in v.methodology:
-            summary += f"; {v.throttle_rate_pct:.1f}% of requests throttled"
+        if throttled and v.methodology.get("abstained") == "too_few_requests":
+            summary = f"{observed}; not enough requests to judge capacity"
+        elif throttled:
+            summary += f"; {observed}. A capacity diagnosis is inconclusive"
     elif v.is_under_provisioned:
         status = STATUS_FINDING
         summary = f"Throttling {v.throttle_rate_pct:.1f}% with all partitions saturated"
@@ -697,21 +703,30 @@ def _run_dx005(ctx: DetectionContext) -> Finding:
     elif v.root_cause == "skew_suspected":
         # Skew is DX-006's domain — DX-005 reports no *global* under-provisioning here.
         status = STATUS_NOT_DETECTED
-        summary = (f"Throttling {v.throttle_rate_pct:.1f}%; observed partition skew in "
-                   f"{v.methodology['witness_region']} — see DX-006")
+        summary = (f"{observed}; a hot physical partition and a cooler one were observed in "
+                   f"{v.methodology['witness_region']}. See the DX-006 hot-partition check")
         if not v.methodology["coverage_complete"]:
             summary += "; partial partition coverage"
         rule = None
     elif v.root_cause == "regional_saturation":
         status, summary, rule = (STATUS_NOT_DETECTED,
-                                 "Saturation observed in some regions, not across the offer", None)
+                                 f"{observed}; saturation was observed in some regions, not across the offer", None)
+    elif v.root_cause == "throttling_without_saturation":
+        status, summary, rule = (STATUS_NOT_DETECTED,
+                                 f"{observed}. The partition measurements showed neither broad saturation "
+                                 "nor a hot partition. They do not explain the throttling or justify more RU/s", None)
+    elif v.root_cause == "below_throttle_threshold":
+        status, summary, rule = (STATUS_NOT_DETECTED,
+                                 f"{observed}; below the {v.methodology['thresholds']['throttle_pct']:g}% "
+                                 "throttling threshold", None)
     else:
-        status, summary, rule = STATUS_NOT_DETECTED, "No sustained throttling", None
+        status, summary, rule = STATUS_NOT_DETECTED, "No HTTP 429s observed", None
     return Finding(
         detection_id="DX-005", title="Under-provisioning / throttling", unit=_unit(ctx),
         status=status, severity=v.severity, summary=summary,
         recommended_action=v.recommended_action, agent_kit_rule=rule,
-        threshold_status=THRESHOLD_VALIDATED, evidence=v.methodology,
+        threshold_status=THRESHOLD_VALIDATED, evidence={**v.methodology, "root_cause": v.root_cause,
+                                                        "observed_throttling": bool(throttled)},
     )
 
 
@@ -730,8 +745,12 @@ def _run_dx006(ctx: DetectionContext) -> Finding:
         summary = _partition_abstention(v.methodology)
     elif v.is_hot_partition:
         status = STATUS_FINDING
-        warn = ("shared-member throttling unknown; severity is a lower bound" if v.throttling is None
-                else "throttling" if v.throttling else "saturated, not throttling yet (early warning)")
+        if v.throttling is None:
+            warn = "shared-member throttling unknown; severity is a lower bound"
+        elif v.methodology["throttled_requests"]:
+            warn = _observed_429s(v.methodology["throttled_requests"], v.methodology["total_requests"])
+        else:
+            warn = "no HTTP 429s observed (early warning)"
         summary = (f"Hot partition: busiest p99 {v.max_p99:.0f}% vs coolest {v.min_p99:.0f}% "
                    f"among {v.partition_count} observed partitions in "
                    f"{v.methodology['witness_region']} ({warn})")
@@ -1274,6 +1293,18 @@ def _run_dx020(ctx: AccountDetectionContext) -> Finding:
 
 # --- DX-021: throttling root-cause decomposition (account-scoped, metrics only) --------
 
+def _observed_429s(throttled: float, total: float) -> str:
+    """Keep exact counts visible even when rounding a small positive rate would display zero."""
+    counts = f"{throttled:,.0f} of {total:,.0f} requests returned HTTP 429"
+    if not total:
+        return counts
+    rate = 100 * throttled / total
+    label = f"{rate:.3g}"
+    if rate < 1 and label == "1":
+        label = "<1"
+    return f"{counts} ({label}%)"
+
+
 def _run_dx021(ctx: AccountDetectionContext) -> Finding:
     window = ctx.window_for(trc.production_window())
     by_code = ctx.metrics.get_metric_split(
@@ -1283,25 +1314,47 @@ def _run_dx021(ctx: AccountDetectionContext) -> Finding:
     code_counts = {code: int(sum(s.values())) for code, s in by_code.items()}
     total_requests = sum(code_counts.values())
     total_throttled = code_counts.get("429", 0)
-    by_op = ctx.metrics.get_metric_split(
-        ctx.account_resource_id, "TotalRequests", window,
-        split_dimension="OperationType", dimension_filter={"StatusCode": "429"}, aggregation="Count",
-    )
-    op_throttled = {op: int(sum(s.values())) for op, s in by_op.items()}
-    v = trc.detect_throttling_root_cause(total_requests, total_throttled, op_throttled)
+    # Ask for operations only if attribution could change the result. A split failure must
+    # not discard successful status counts or turn a measured negative into an abstention.
+    v = trc.detect_throttling_root_cause(total_requests, total_throttled, {})
+    operation_error = None
+    if v.root_cause == "insufficient_data":
+        try:
+            by_op = ctx.metrics.get_metric_split(
+                ctx.account_resource_id, "TotalRequests", window, split_dimension="OperationType",
+                dimension_filter={"StatusCode": "429"}, aggregation="Count",
+            )
+        except (AzureError, ValueError) as exc:
+            operation_error = type(exc).__name__
+        else:
+            v = trc.detect_throttling_root_cause(total_requests, total_throttled,
+                                                 {op: int(sum(s.values())) for op, s in by_op.items()})
+    evidence = {**v.methodology, "root_cause": v.root_cause, "observed_throttling": bool(total_throttled)}
+    observed = _observed_429s(total_throttled, total_requests)
     if v.root_cause == "too_few_requests":
         status, summary = STATUS_ABSTAINED, "Insufficient data: not enough requests to decompose throttling"
+        if total_throttled:
+            summary = f"{observed}; not enough requests to judge the throttling rate"
+    elif v.root_cause == "insufficient_data":
+        status = STATUS_ABSTAINED
+        detail = "the operation breakdown contained no usable counts"
+        if operation_error:
+            detail = "the operation breakdown could not be read"
+            evidence.update(abstained="operation_breakdown_read_error", operation_error=operation_error)
+        summary = f"{observed}; cannot determine which operations were throttled because {detail}"
     elif v.is_finding:
         status = STATUS_FINDING
         summary = (f"{v.throttle_rate_pct:.1f}% throttled; {v.dominant_share_pct:.0f}% on "
                    f"'{v.dominant_operation}' ({v.dominant_category})")
     else:
-        status, summary = STATUS_NOT_DETECTED, "No material throttling to decompose"
+        status = STATUS_NOT_DETECTED
+        summary = (f"{observed}; below the {trc.THROTTLE_RATE_PCT:g}% throttling threshold"
+                   if total_throttled else "No HTTP 429s observed")
     return Finding(
         detection_id="DX-021", title="Throttling root cause", unit=_account_unit(ctx), status=status,
         severity=v.severity, summary=summary, recommended_action=v.recommended_action,
         agent_kit_rule=dx021_agent_kit_rule(status, v.dominant_category),
-        threshold_status=threshold_status_for("DX-021"), evidence=v.methodology,
+        threshold_status=threshold_status_for("DX-021"), evidence=evidence,
     )
 
 

@@ -7,6 +7,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.17.17] - Unreleased
+
+### Fixed
+
+- Reports distinguish observed HTTP 429s from their cause. Below-threshold throttling is
+  visible without raising an alert. A hot physical partition does not identify the logical
+  key, and a missing operation breakdown no longer hides measured throttling. Detector
+  thresholds, severity bands, permissions and installation steps are unchanged.
+
+### Preview status
+
+- Fresh all-detector live acceptance and signed-in Portal checks remain deferred.
+
 ## [0.17.16] - Unreleased
 
 ### Changed
