@@ -1,6 +1,6 @@
 """DX-003: Shared-throughput starvation.
 
-In a shared-throughput database, every container draws from one database-level RU/s pool. A single
+Only containers without dedicated throughput draw from the database-level RU/s pool. A single
 container can monopolise that pool, **starving its siblings** — they throttle (429) despite consuming
 little, while the database as a whole is at its cap. This is distinct from global under-provisioning
 (DX-005): the database *has* capacity, it's just unfairly distributed.
@@ -24,9 +24,11 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
+from math import isfinite
 
 from coda_core.providers.base import TimeWindow
 from coda_core.providers.log_analytics import DataPlaneSource, LogAnalyticsProvider
+from coda_core.providers.shared_offer import IncompletePool, PoolMembers, verified_members
 
 
 # Shared-pool throttling is a present-tense signal; a 1-day window over the data-plane logs is enough.
@@ -43,7 +45,7 @@ def traffic_kql(
     window: TimeWindow | None = None,
 ) -> str:
     """KQL for DX-003's per-collection traffic in one shared-throughput database."""
-    safe_db = database.replace("'", "")
+    safe_db = database.replace("\\", "\\\\").replace("'", "\\'")
     return (
         source.query_table(window)
         + f"| where DatabaseName == '{safe_db}' and isnotempty(CollectionName) "
@@ -186,6 +188,7 @@ def detect_shared_throughput_starvation(
     *,
     config: SharedThroughputConfig | None = None,
     source: DataPlaneSource = DataPlaneSource.RAW,
+    pool_members: PoolMembers | None = None,
 ) -> SharedThroughputVerdict:
     """Run DX-003 after the pipeline has established the required LA capability.
 
@@ -194,12 +197,30 @@ def detect_shared_throughput_starvation(
     """
     span = (window.start, window.end)
     try:
+        members = set(verified_members(pool_members))
+    except IncompletePool as exc:
+        return _abstain(database, "insufficient_data", str(exc))
+    try:
         source.validate_window(window)
         rows = la.query_resource(account_resource_id, traffic_kql(database, source, window), span)
+        rows = [row for row in rows if row.get("CollectionName") in members]
         source.validate_rows(rows, counts=("requests", "throttled"), charges=("ru",))
     except Exception as exc:  # noqa: BLE001 - preserve a failed detector as an explicit abstention
         verdict = _abstain(database, "query_error", f"Log Analytics query failed: {exc}")
         verdict.methodology.update(source.evidence(window))
+        return verdict
+    names = {row["CollectionName"] for row in rows}
+    missing = sorted(members - names)
+    invalid = any(not isinstance(row.get(k), (int, float)) or isinstance(row[k], bool)
+                  or not isfinite(row[k]) or row[k] < 0 for row in rows
+                  for k in ("requests", "throttled", "ru"))
+    if not invalid:
+        invalid = any(int(r[k]) != r[k] for r in rows for k in ("requests", "throttled")) or any(
+            r["throttled"] > r["requests"] for r in rows)
+    if missing or invalid or len(rows) != len(names):
+        verdict = _abstain(database, "insufficient_data", "Incomplete shared-member traffic")
+        verdict.methodology.update(source.evidence(window), missing_members=missing,
+                                   expected_members=len(members), observed_members=len(names))
         return verdict
     collections = [
         CollectionTraffic(

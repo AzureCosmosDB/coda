@@ -88,6 +88,8 @@ class AccountScanResult:
                 "abstained": self.abstained, "la_missing": self.la_missing,
                 "recoverable_ru": round(self.recoverable_ru), "status": self.status,
                 "error": self.error,
+                **({"inventory_issues": self.report["inventory_issues"]}
+                   if self.report and self.report.get("inventory_issues") else {}),
                 **({"cost_estimate_issue": self.report["cost_estimate_issue"]}
                    if self.report and self.report.get("cost_estimate_issue") else {})}
 

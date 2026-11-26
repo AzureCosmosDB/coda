@@ -1,34 +1,91 @@
-"""Effective $/RU/s rate derivation — the FinOps dollar surface (ADR-0028).
+"""Throughput savings: regional billed quantity times a matching amortized meter price (ADR-0080).
 
-CODA never uses Azure **list** prices to estimate savings — that was cosmic-kusto's over-promise trap
-(list price × a `capture_rate`/`rebase` discount fudge). Instead it derives the customer's **own
-effective rate** from their **amortized** Cosmos provisioned-throughput bill (Cost Management), so
-every reservation, savings plan, EA/CSP discount, region multiplier, and mode premium is *already
-baked in* — because it is the customer's actual invoice, not an assertion (first principle #1).
-
-The derivation is **duration-independent**. The throughput meter's billed *usage* is in
-100-RU/s-hours, so ``cost / usage`` is a true unit price ($ per 100-RU/s-hour) regardless of how many
-hours the capacity was actually provisioned. (Dividing total cost by ``provisioned_ru × window_hours``
-would understate the rate for any resource provisioned for only part of the window — e.g. bursty
-fixtures.) Monthly savings for a finding is then just ``recovered_ru × rate`` — no assumptions.
-
-This module is intentionally provider-agnostic: it takes primitive cost/usage/currency, mirroring the
-``DataProvider`` seam, so the rate logic carries no Cost-Management coupling.
+Cost divided by usage gives a discount-inclusive price per billing unit. It cannot also tell us
+how many such units a physical capacity change removes. Keep those two facts separate; never use
+retail prices or interpret the estimate as a guaranteed reduction in the next invoice.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass
-from typing import Literal, TypedDict
+from typing import TYPE_CHECKING, Literal, TypedDict
 
-# Azure bills a "month" as 730 hours (8760 / 12). Used only to express the hourly effective unit price
-# as a monthly figure for human-facing savings ("$X / month"), never as a pricing assumption.
+if TYPE_CHECKING:
+    from coda_core.providers.arm import AccountConfig
+
+# Annual-average month used for projection, not the number of hours in a particular invoice.
 HOURS_PER_MONTH = 730.0
 
 # The Cosmos provisioned-throughput meter is priced per **100 RU/s** (the meter unit). cost / usage is
 # therefore $ per 100-RU/s-hour; divide by this to get $ per (1 RU/s)-hour.
 THROUGHPUT_METER_UNIT_RU = 100.0
+STANDARD_METER = "100 RU/s"
+MULTI_WRITE_METER = "100 Multi-master RU/s"
+THROUGHPUT_METERS = (STANDARD_METER, MULTI_WRITE_METER)
+
+
+def throughput_meter(config: AccountConfig | None) -> str | None:
+    """Select a meter only for an identified, consistent topology and a paid provisioned account."""
+    if config is None or config.is_serverless or config.free_tier is not False:
+        return None
+    names = {name.strip().casefold() for name in config.location_names if name.strip()}
+    if (config.region_count < 1 or len(names) != config.region_count
+            or len(config.location_names) != config.region_count):
+        return None
+    if config.multi_region_writes_enabled is False and config.write_region_count == 1:
+        return STANDARD_METER
+    if (config.multi_region_writes_enabled is True and config.region_count >= 2
+            and config.write_region_count == config.region_count):
+        return MULTI_WRITE_METER
+    return None
+
+
+@dataclass(frozen=True)
+class BillingQuantity:
+    """Explain how the input (already the idle floor delta for autoscale) becomes meter units."""
+
+    meter: str
+    input_ru: float
+    input_basis: str
+    affected_regions: int
+    zone_premium_regions: int
+    mode_factor: float
+    meter_units_per_hour: float
+
+    def monthly_estimate(self, rate: EffectiveRate) -> float | None:
+        """Price billed units directly; the hourly unit price already reflects the selected meter."""
+        if rate.basis.get("meters") != [self.meter]:
+            return None
+        amount = self.meter_units_per_hour * rate.unit_price_per_100rus_hour * HOURS_PER_MONTH
+        return amount if math.isfinite(amount) and amount > 0 else None
+
+
+def billing_quantity(config: AccountConfig, meter: str, mode: str, recovered_ru: float,
+                     *, already_regional: bool) -> BillingQuantity | None:
+    """Translate offer-local capacity or DX-008's already-regional amount exactly once."""
+    if (meter != throughput_meter(config) or meter not in THROUGHPUT_METERS
+            or mode not in {"manual", "autoscale"} or not math.isfinite(recovered_ru) or recovered_ru <= 0):
+        return None
+    if already_regional:
+        if mode != "manual" or meter != MULTI_WRITE_METER:
+            return None  # Only DX-008 supplies a regional input.
+        return BillingQuantity(meter, recovered_ru, "removed_regional_ru", config.region_count - 1,
+                               0, 1.0, recovered_ru / THROUGHPUT_METER_UNIT_RU)
+    zones = 0
+    factor = 1.0
+    if meter == STANDARD_METER:
+        if mode == "autoscale":
+            factor = 1.5
+        else:
+            count = config.zone_redundant_region_count
+            if type(count) is not int or not 0 <= count <= config.region_count:
+                return None
+            zones = count
+    units = recovered_ru / THROUGHPUT_METER_UNIT_RU * (config.region_count + 0.25 * zones) * factor
+    return BillingQuantity(meter, recovered_ru, "offer_ru_per_region", config.region_count, zones,
+                           factor, units) if math.isfinite(units) else None
+
 
 RATE_SOURCE_CUSTOMER_AMORTIZED_BILL = "customer_amortized_bill"
 RATE_SCOPE_ACCOUNT = "account"
@@ -57,8 +114,8 @@ class EffectiveRateBasis(TypedDict):
 class EffectiveRate:
     """A customer's discount-inclusive Cosmos throughput rate, derived from their amortized bill.
 
-    ``usd_per_ru_month`` is the headline conversion factor: dollars saved per RU/s recovered per
-    month. ``rate_scope`` distinguishes the preferred account-attributed rate from the bounded
+    ``usd_per_ru_month`` is the legacy field for the monthly price per billing-equivalent RU/s,
+    in the bill's currency (not necessarily USD). ``rate_scope`` distinguishes account rows from the bounded
     subscription fallback used during account billing latency. ``basis`` records the same scope plus
     the inputs (cost, usage, meters, currency) so every dollar figure is auditable back to the
     customer's invoice.
@@ -119,8 +176,12 @@ def cost_estimate_issue(
             "Use Run Pre-Checks to investigate. This failure does not establish a missing permission.",
         ),
         "no_usable_rate": (
-            "No usable billed throughput rate was available from the account or subscription.",
+            "No usable matching throughput meter rate was available from the account or subscription.",
             "Check billing-data availability and attribution; extra permissions do not create missing usage.",
+        ),
+        "unknown_billing_configuration": (
+            "The paid provisioned-throughput billing configuration could not be established.",
+            "Verify the write mode, free-tier setting and region inventory; capacity findings remain available.",
         ),
         "not_configured": (
             "Cost Management enrichment was not configured for this analysis.",
@@ -153,7 +214,7 @@ def derive_effective_rate(
         currency: Billing currency of ``cost``.
         rate_scope: Whether the bill rows are account-attributed or the explicitly approved
             subscription fallback used when a successful account query has no derivable rate.
-        meters: Which billing meters contributed (carried into ``basis`` for audit).
+        meters: Exactly one supported throughput meter. Unknown or blended meters are unpriceable.
 
     Returns:
         An :class:`EffectiveRate`, or ``None`` when no positive billed throughput usage exists —
@@ -169,6 +230,7 @@ def derive_effective_rate(
         or usage <= 0
         or not isinstance(currency, str)
         or not currency.strip()
+        or len(meters) != 1 or meters[0] not in THROUGHPUT_METERS
     ):
         return None
     unit_price_per_100rus_hour = cost / usage
@@ -188,10 +250,10 @@ def derive_effective_rate(
 
 
 def monthly_savings(recovered_ru: float, rate: EffectiveRate | None) -> float | None:
-    """Dollars/month saved by recovering ``recovered_ru`` RU/s at the customer's effective rate.
+    """Legacy one-copy conversion for a quantity already expressed in billing-equivalent RU/s.
 
-    Returns ``None`` when no rate is available (no Cost Management access or no billed usage) so the
-    caller renders a capacity-only finding rather than a fabricated dollar figure.
+    Do not pass unconverted physical offer capacity here. Report producers use
+    :meth:`BillingQuantity.monthly_estimate` after establishing regional billing scope.
     """
     if (
         rate is None

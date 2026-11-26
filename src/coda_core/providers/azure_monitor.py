@@ -20,6 +20,10 @@ from azure.monitor.query import MetricAggregationType, MetricsQueryClient
 from coda_core.detections.pitr_savings import DataUsageSample
 
 from .base import DataProvider, MetricPoint, MetricSeries, TimeWindow
+from .indexing_batch import IndexingReadPlan
+from .partition_metrics import (
+    SERIES_LIMIT, PartitionReader, RegionHistory, metadata as _metadata, quote, split_series,
+)
 
 # Map our aggregation names to the SDK enum. Kept explicit so callers use a small,
 # stable vocabulary rather than the SDK's types.
@@ -50,23 +54,6 @@ def _reduce(values: list[float], aggregation: str) -> float:
     return sum(values)  # Total, Count
 
 
-def _metadata(ts) -> dict[str, str]:
-    """Normalize both SDK metadata shapes into dimension-name/value strings."""
-    raw = getattr(ts, "metadata_values", None)
-    if isinstance(raw, dict):
-        return {
-            str(key).casefold(): str(getattr(value, "value", value))
-            for key, value in raw.items()
-        }
-    out: dict[str, str] = {}
-    for item in raw or []:
-        name = getattr(getattr(item, "name", None), "value", None)
-        value = getattr(item, "value", None)
-        if name is not None and value is not None:
-            out[str(name).casefold()] = str(value)
-    return out
-
-
 class AzureMonitorMetricsProvider(DataProvider):
     """DataProvider backed by the Azure Monitor Metrics API."""
 
@@ -74,11 +61,16 @@ class AzureMonitorMetricsProvider(DataProvider):
         self._credential = credential
         # MetricsQueryClient targets the public Azure Monitor endpoint by default.
         self._client = MetricsQueryClient(credential)
+        self._partitions = PartitionReader(self._client)
 
     @property
     def credential(self) -> TokenCredential:
         """Credential used to create per-worker clients without sharing SDK client state."""
         return self._credential
+
+    def indexing_plan(self, resource_id: str, window: TimeWindow) -> IndexingReadPlan:
+        """Create an independent indexing projection and recovery budget for this report."""
+        return IndexingReadPlan(self._client, resource_id, window)
 
     def get_metric(
         self,
@@ -109,7 +101,7 @@ class AzureMonitorMetricsProvider(DataProvider):
         # Azure Monitor metric filter syntax: "Dim1 eq 'v1' and Dim2 eq 'v2'".
         metric_filter = None
         if dimension_filter:
-            metric_filter = " and ".join(f"{k} eq '{v}'" for k, v in dimension_filter.items())
+            metric_filter = " and ".join(f"{k} eq {quote(v)}" for k, v in dimension_filter.items())
 
         response = self._client.query_resource(
             resource_id,
@@ -164,7 +156,7 @@ class AzureMonitorMetricsProvider(DataProvider):
         if aggregation not in _AGGREGATION:
             raise ValueError(f"Unsupported aggregation {aggregation!r}.")
 
-        clauses = [f"{k} eq '{v}'" for k, v in (dimension_filter or {}).items()]
+        clauses = [f"{k} eq {quote(v)}" for k, v in (dimension_filter or {}).items()]
         clauses.append(f"{split_dimension} eq '*'")
         response = self._client.query_resource(
             resource_id,
@@ -173,25 +165,24 @@ class AzureMonitorMetricsProvider(DataProvider):
             granularity=window.granularity,
             aggregations=[_AGGREGATION[aggregation]],
             filter=" and ".join(clauses),
+            max_results=SERIES_LIMIT,
         )
+        rows = [ts for metric in response.metrics for ts in metric.timeseries]
+        out, conflicts, unknown = split_series(rows, metric_name, aggregation, split_dimension)
+        if conflicts or unknown or len(rows) >= SERIES_LIMIT:
+            raise ValueError(f"Incomplete or ambiguous {metric_name} split by {split_dimension}")
+        unit = next((str(m.unit) for m in response.metrics if m.unit is not None), None)
+        return {k: MetricSeries(s.name, s.aggregation, unit, s.points) for k, s in out.items()}
 
-        out: dict[str, MetricSeries] = {}
-        for metric in response.metrics:
-            unit = str(metric.unit) if metric.unit is not None else None
-            for ts in metric.timeseries:
-                # metadata_values is a dict of lowercased dimension name -> value.
-                meta = ts.metadata_values if isinstance(ts.metadata_values, dict) else {}
-                key = meta.get(split_dimension.lower(), "unknown")
-                points = [
-                    MetricPoint(timestamp=d.timestamp, value=getattr(d, aggregation.lower(), None))
-                    for d in ts.data
-                ]
-                points = [p for p in points if p.value is not None]
-                points.sort(key=lambda p: p.timestamp)
-                out[key] = MetricSeries(
-                    name=metric_name, aggregation=aggregation, unit=unit, points=tuple(points)
-                )
-        return out
+    def partition_histories(self, rid: str, metric: str, window: TimeWindow, *,
+                            database: str, container: str | None, owner_rid: str | None,
+                            regions: tuple[str | None, ...]) -> tuple[RegionHistory, ...]:
+        """Read comparable physical-partition evidence independently in every configured region."""
+        return tuple(self._partitions.region(rid, database, container, owner_rid, region,
+                                             window, metric) if region else
+                     RegionHistory("Unidentified ARM region", None, 0, {}, ("region_name_missing",),
+                                   window.granularity)
+                     for region in regions)
 
     def get_data_usage_v2_samples(
         self,

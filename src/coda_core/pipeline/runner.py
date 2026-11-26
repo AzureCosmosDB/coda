@@ -1,8 +1,7 @@
 """End-to-end diagnostic orchestrator: Select -> Detect -> Rollup -> Report (ADR-0007).
 
 Ties the three scope layers together for one account:
-  1. **Select** every throughput offer (``ArmProvider.list_offers``); container-level offers are
-     the units detections run on (shared-DB pools and serverless are future: DX-003 / DX-014).
+  1. **Select** ARM-confirmed offers and their actual members, retaining inventory gaps.
   2. **Detect** — for each unit, run every applicable detection in the registry.
   3. **Rollup** — correlate within units, aggregate across the account.
   4. **Report** — return a structured :class:`DiagnosticReport`.
@@ -11,6 +10,7 @@ Ties the three scope layers together for one account:
 from __future__ import annotations
 
 import concurrent.futures
+from collections import Counter
 import logging
 import os
 import threading
@@ -19,6 +19,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from coda_core.detections import cross_partition_query as cpq
+from coda_core.detections import indexing_cost as indexing
 from coda_core.detections import shared_throughput as sht
 from coda_core.detections import uncontrolled_ingestion as ui
 from coda_core.framework.cost_rate import (
@@ -28,6 +29,7 @@ from coda_core.framework.cost_rate import (
     CostEstimateIssue,
     cost_estimate_issue,
     derive_effective_rate,
+    throughput_meter,
 )
 from coda_core.pipeline.capabilities import (
     CAP_COST_MANAGEMENT,
@@ -62,7 +64,9 @@ from coda_core.pipeline.registry import (
 )
 from coda_core.pipeline.report import DiagnosticReport, now_iso
 from coda_core.pipeline.rollup import aggregate, compute_scope_provisioned_ru, correlate
-from coda_core.providers.arm import ArmProvider, account_config_from_arm
+from coda_core.providers.arm import ArmProvider, ResourceAge, account_config_from_arm
+from coda_core.providers.indexing_batch import ProjectedReads, plan as plan_indexing
+from coda_core.providers.shared_offer import offer_request_counts
 from coda_core.providers.azure_monitor import AzureMonitorMetricsProvider
 from coda_core.providers.base import TimeWindow
 from coda_core.providers.cost_management import CostManagementProvider
@@ -373,7 +377,7 @@ def _cost_query_issue(exc: Exception, query_scope: str) -> CostEstimateIssue:
 
 def _derive_effective_rate(
     cost: CostManagementProvider | None, account_resource_id: str, run_now: datetime,
-    caps,
+    caps, meter: str | None,
 ) -> tuple[EffectiveRate | None, CostEstimateIssue | None]:
     """Derive a customer-bill $/RU/s rate without masking account-query failures.
 
@@ -385,12 +389,15 @@ def _derive_effective_rate(
     """
     if cost is None or not caps.has(CAP_COST_MANAGEMENT):
         return None, cost_estimate_issue("not_configured", "not_queried")
+    if meter is None:
+        return None, cost_estimate_issue("unknown_billing_configuration", "not_queried")
     start = (run_now - timedelta(days=RATE_DERIVATION_DAYS)).date()
     try:
         account_cost = cost.cosmos_throughput_cost(
             start,
             run_now.date(),
             resource_id=account_resource_id,
+            meter=meter,
         )
         account_rate = derive_effective_rate(
             account_cost.cost,
@@ -401,10 +408,10 @@ def _derive_effective_rate(
         )
     except Exception as exc:  # noqa: BLE001 - retain a safe reason; capacity diagnosis remains valid
         return None, _cost_query_issue(exc, RATE_SCOPE_ACCOUNT)
-    if account_rate is not None:
+    if account_rate is not None and account_rate.basis["meters"] == [meter]:
         return account_rate, None
     try:
-        subscription_cost = cost.cosmos_throughput_cost(start, run_now.date())
+        subscription_cost = cost.cosmos_throughput_cost(start, run_now.date(), meter=meter)
         subscription_rate = derive_effective_rate(
             subscription_cost.cost,
             subscription_cost.usage,
@@ -415,7 +422,7 @@ def _derive_effective_rate(
     except Exception as exc:  # noqa: BLE001 - fallback failure remains visible and capacity-only
         return None, _cost_query_issue(exc, RATE_SCOPE_SUBSCRIPTION_FALLBACK)
     return (
-        (subscription_rate, None) if subscription_rate is not None
+        (subscription_rate, None) if subscription_rate is not None and subscription_rate.basis["meters"] == [meter]
         else (None, cost_estimate_issue("no_usable_rate", RATE_SCOPE_SUBSCRIPTION_FALLBACK))
     )
 
@@ -454,14 +461,29 @@ def run_diagnostics(
     read-only DX-019 list-price enrichment; its absence or failure never suppresses the ARM finding.
     ``unit_concurrency`` bounds parallel work; ordering is restored before rollup.
     """
-    offers = arm.list_offers(resource_group, account)
+    # The executor starts threads only on submit. Its owner joins them even if another pass raises
+    # before the optional age lookups are collected.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as age_pool:
+        return _run_diagnostics(metrics, arm, resource_group, account, mode=mode, eval_window=eval_window,
+                                la=la, cost=cost, retail_prices=retail_prices,
+                                unit_concurrency=unit_concurrency, age_pool=age_pool)
+
+
+def _run_diagnostics(
+    metrics: AzureMonitorMetricsProvider, arm: ArmProvider, resource_group: str, account: str,
+    *, mode: str, eval_window: TimeWindow | None, la: LogAnalyticsProvider | None,
+    cost: CostManagementProvider | None, retail_prices: RetailPricesProvider | None,
+    unit_concurrency: int | None, age_pool: concurrent.futures.ThreadPoolExecutor,
+) -> DiagnosticReport:
+    """Evaluate the report, overlapping optional resource-age reads with independent checks."""
+    inventory = arm.inspect_offers(resource_group, account)
+    offers = inventory.offers
     container_offers = [o for o in offers if o.level == "container"]
     database_offers = [o for o in offers if o.level == "database"]
     acct = arm.get_account(resource_group, account)
     account_resource_id = acct.id
-    account_created_at = arm.get_account_created_at(resource_group, account)
     account_config = account_config_from_arm(acct)
-    scope_provisioned_ru = compute_scope_provisioned_ru(offers)
+    scope_provisioned_ru = None if inventory.issues else compute_scope_provisioned_ru(offers)
     run_now = datetime.now(timezone.utc)          # single per-run anchor (stable LA cache keys)
     window = eval_window or default_eval_window(now=run_now)
     unit_concurrency = _resolve_unit_concurrency(unit_concurrency)
@@ -472,26 +494,28 @@ def run_diagnostics(
         la_factory = (lambda: LogAnalyticsProvider(la_credential)) if la_credential is not None else None
         la = CachingLogAnalyticsProvider(la, inner_factory=la_factory)
     worker_providers = _ThreadLocalUnitProviders(metrics, arm, la)
-    # Prefetch per-container creation times (Activity Log; ~4s each) concurrently and overlap them with
-    # capability resolution + LA priming + the database/serverless passes below, so the container loop
-    # never blocks on them. Production only (eval disables the age guard); values and the account-age
-    # fallback are unchanged, so findings are identical to fetching them inline.
-    container_created_at: dict[tuple[str, str], datetime | None] = {}
-    _created_ex = None
-    _created_futs: dict[tuple[str, str], object] = {}
+    # Only look for creation events if the resource's own ARM record cannot prove the age floor.
+    ages = dict(inventory.ages)
+    age_errors = {}
+    _created_futs = {}
     if mode == MODE_PRODUCTION:
-        _age_targets = [o for o in container_offers if o.container]
+        _age_targets = []
+        for o in offers:
+            age = ages.get((o.database, o.container), ResourceAge())
+            floor = max((a.minimum_age for a in REGISTRY if a.minimum_age and a.applies(o)),
+                        default=None)
+            anchor = run_now.replace(minute=0, second=0, microsecond=0)
+            if floor and not age.created and (not age.existed_by or anchor - age.existed_by < floor):
+                _age_targets.append(o)
         if _age_targets:
-            _created_ex = concurrent.futures.ThreadPoolExecutor(max_workers=min(len(_age_targets), 8))
-
             def _fetch_created(off):
                 _, warm_arm, _ = worker_providers.current()
-                return warm_arm.get_container_created_at(
-                    resource_group, account, off.database, off.container
-                )
+                rid = f"{account_resource_id}/sqlDatabases/{off.database}"
+                return warm_arm.resource_created_at(
+                    f"{rid}/containers/{off.container}" if off.container else rid)
 
             for _off in _age_targets:
-                _created_futs[(_off.database, _off.container)] = _created_ex.submit(_fetch_created, _off)
+                _created_futs[(_off.database, _off.container)] = age_pool.submit(_fetch_created, _off)
     # Resolve capabilities ONCE per run (single source of truth for gating). Log Analytics is probed at
     # table granularity over a 30-day existence window so each LA detection gates on the exact category
     # it needs, with a category-precise "enable X" message instead of a silent clean result.
@@ -505,7 +529,8 @@ def run_diagnostics(
     # Derive the customer's effective $/RU/s rate once per run from their amortized bill. Account rows
     # are preferred; subscription rows are a provenance-labelled billing-latency fallback (ADR-0051).
     # None means bill-derived savings findings stay capacity-only.
-    effective_rate, cost_issue = _derive_effective_rate(cost, account_resource_id, run_now, caps)
+    effective_rate, cost_issue = _derive_effective_rate(cost, account_resource_id, run_now, caps,
+                                                       throughput_meter(account_config))
     _prime_log_analytics_cache(la, account_resource_id, container_offers, database_offers, run_now, caps)
 
     findings = []
@@ -518,6 +543,7 @@ def run_diagnostics(
         effective_rate=effective_rate,
         dataplane_source=caps.dataplane_source,
         dataplane_error=caps.probe_error_for(frozenset({CAP_LA_REQUEST_AGGREGATES})),
+        inventory_issues=inventory.issues,
     )
     for acct_adapter in ACCOUNT_REGISTRY:
         findings.append(run_account(acct_adapter, acct_ctx, caps))
@@ -532,6 +558,7 @@ def run_diagnostics(
             database=dbo.database, shared_ru=dbo.provisioned_ru, mode=mode, eval_window=window,
             now=run_now,
             dataplane_source=caps.dataplane_source,
+            pool_members=inventory.pools.get(dbo.database),
         )
         unit_findings = []
         for db_adapter in DATABASE_REGISTRY:
@@ -570,18 +597,17 @@ def run_diagnostics(
 
     def _run_container_unit(_idx: int, offer) -> list:
         worker_metrics, _, worker_la = worker_providers.current()
-        # Per-container age (Activity Log) when judging in production; falls back to account age.
-        # Prefetched concurrently above, so this is a dict lookup rather than a blocking call here.
-        if mode == MODE_PRODUCTION and offer.container:
-            resource_created_at = (
-                container_created_at.get((offer.database, offer.container)) or account_created_at
-            )
-        else:
-            resource_created_at = account_created_at
+        key = (offer.database, offer.container)
+        age = ages.get(key, ResourceAge())
+        members = inventory.pools.get(offer.database) if offer.level == "database" else None
         ctx = DetectionContext(
             metrics=worker_metrics, account=account, account_resource_id=account_resource_id,
             offer=offer, mode=mode, eval_window=window, now=run_now,
-            resource_created_at=resource_created_at, scope_provisioned_ru=scope_provisioned_ru,
+            resource_created_at=age.created, resource_existed_by=age.existed_by,
+            age_read_error=age_errors.get(key), scope_provisioned_ru=scope_provisioned_ru,
+            pool_members=members,
+            read_counts=offer_request_counts(worker_metrics, account_resource_id, offer.database,
+                                             offer.container, members),
             la=worker_la, effective_rate=effective_rate,
             dataplane_source=caps.dataplane_source,
             account_config=account_config,
@@ -592,14 +618,14 @@ def run_diagnostics(
                 unit_findings.append(run_container(adapter, ctx, caps))
         return unit_findings
 
-    # Join the concurrent creation-time prefetch (started up-front, overlapped with the passes above).
+    # Unknown age affects only age-gated checks; independent account/database results stand.
     for _key, _fut in _created_futs.items():
         try:
-            container_created_at[_key] = _fut.result()
-        except Exception:  # noqa: BLE001 - age lookup failure falls back to account age
-            container_created_at[_key] = None
-    if _created_ex is not None:
-        _created_ex.shutdown(wait=True)
+            created = _fut.result()
+        except Exception as exc:  # noqa: BLE001 - isolate optional SDK/decoding failures per resource
+            age_errors[_key] = type(exc).__name__
+        else:
+            ages[_key] = replace(ages.get(_key, ResourceAge()), created=created)
 
     # Shared-throughput DATABASE offers also run the metrics-based detectors at database scope
     # (DX-001/004/005/006/011 — idle/over/under-provisioning, hot partition; see _is_metrics_scoped).
@@ -615,25 +641,54 @@ def run_diagnostics(
     # account-level abstention per inventory detection rather than aborting the run.
     if INVENTORY_REGISTRY:
         try:
-            inventory = arm.list_container_indexing(resource_group, account)
+            indexing_inventory = arm.list_container_indexing(resource_group, account)
         except Exception as exc:  # noqa: BLE001 - degrade gracefully; never abort the run
-            inventory = []
+            indexing_inventory = []
             for inv_adapter in INVENTORY_REGISTRY:
                 findings.append(_error_finding(
                     inv_adapter.detection_id, inv_adapter.title, _account_unit(acct_ctx), exc,
                 ))
 
-        def _run_inventory_unit(_idx: int, cont) -> list:
+        def _run_inventory_unit(_idx: int, cont, projected: ProjectedReads | None = None) -> list:
             worker_metrics, _, _ = worker_providers.current()
             inv_ctx = InventoryDetectionContext(
                 metrics=worker_metrics, account=account, account_resource_id=account_resource_id,
                 container=cont, mode=mode, eval_window=window, now=run_now,
             )
-            return [run_inventory(a, inv_ctx, caps) for a in INVENTORY_REGISTRY]
+            return [run_inventory(a, replace(inv_ctx, metrics=projected)
+                                  if projected is not None and a.detection_id == "DX-024" else inv_ctx, caps)
+                    for a in INVENTORY_REGISTRY]
 
-        for unit_findings in _ordered_parallel_map(
-            inventory, _run_inventory_unit, concurrency=unit_concurrency
-        ):
+        index_window = window if mode == MODE_EVAL else indexing.production_window(run_now)
+        if (callable(make_plan := getattr(metrics, "indexing_plan", None)) and indexing_inventory
+                and index_window.end - index_window.start <= 72 * index_window.granularity
+                and any(a.detection_id == "DX-024" and not caps.missing(a.requires) for a in INVENTORY_REGISTRY)):
+            reader = make_plan(account_resource_id, index_window)
+            units = {(c.database, c.container): (i, c) for i, c in enumerate(indexing_inventory)}
+            counts = Counter((c.database, c.container) for c in indexing_inventory)
+            valid, ordered = [], {}
+            for i, c in enumerate(indexing_inventory):
+                if counts[c.database, c.container] == 1 and all(v and v != "*" for v in (c.database, c.container)):
+                    valid.append(c)
+                else:
+                    ordered[i] = _run_inventory_unit(i, c, ProjectedReads.unavailable(
+                        account_resource_id, index_window, c.database, (c.container,),
+                        "Incomplete indexing inventory: invalid or duplicate container identity"))
+            for batch in plan_indexing(valid):
+                try:
+                    projection = reader.project(batch)
+                except (ValueError, TypeError, AttributeError, KeyError) as exc:
+                    # Malformed wire/SDK data must not abort the rest of the diagnosis.
+                    projection = ProjectedReads.unavailable(account_resource_id, index_window, batch.database,
+                                                           batch.containers, f"Invalid Monitor response: {type(exc).__name__}")
+                for name in batch.containers:
+                    i, container = units[batch.database, name]
+                    ordered[i] = _run_inventory_unit(i, container, projection)
+            inventory_results = [ordered[i] for i in sorted(ordered)]
+        else:
+            inventory_results = _ordered_parallel_map(
+                indexing_inventory, _run_inventory_unit, concurrency=unit_concurrency)
+        for unit_findings in inventory_results:
             findings.extend(unit_findings)
 
     findings = correlate(findings)
@@ -655,6 +710,7 @@ def run_diagnostics(
         account_resource_id=account_resource_id,
         account_endpoint=getattr(acct, "document_endpoint", None),
         cost_estimate_issue=cost_issue,
+        inventory_issues=inventory.issues,
     )
 
 

@@ -53,14 +53,35 @@ production coverage. The browser uses production mode.
 Windows describe what is requested, not a guarantee of complete collected history. For example,
 DX-004 has a seven-day minimum resource-age guard while requesting 30 days of metrics; several
 seven-day performance/storage checks have one-day age guards. Data sufficiency checks also vary.
+In production, the database or container being measured must meet its own age floor; an unknown
+minimum age abstains only age-gated checks. A database and its shared members form one allocation;
+dedicated siblings are evaluated separately. Partial member data cannot establish a pool-wide total.
 DX-020 and DX-021 require at least 1,000 requests in their window. Missing/quiet data can produce
 an abstention; access or query failures can produce errors. Neither is a clean health result.
+
+**Example: which requests used the shared throughput?** Suppose containers A and B share the
+database's provisioned capacity (RU/s), while C has its own. Azure Monitor lets CODA ask how busy
+the shared pool was (percent utilization) by selecting the pool itself. For **RU consumed** and
+**request counts**, those metrics have no pool selector. CODA uses ARM to identify A and B,
+then reads their Azure Monitor metrics, not their documents. If A consumed 100 RU, B consumed
+200 RU and C consumed 900 RU in the same five minutes, the shared pool consumed **300 RU**, not
+the database-wide 1,200 RU. If B reports zero, the pool consumed 100 RU. If B's reading is
+missing, the pool total is unknown; that does not invalidate C's readings or the pool's
+independently measured utilization.
 
 The current registry labels DX-020, DX-021, and DX-023 thresholds **proposal**. Other registry labels
 are **validated**, which describes threshold policy, not fresh validation of your account or proof
 that every supported workload has been tested. Inspect report evidence before acting.
 
 ## Cost and capacity
+
+Recoverable RU/s describes the **offer**, not the number of units on the bill. For example,
+reducing manual throughput by 1,000 RU/s in two ordinary regions still recovers **1,000 RU/s**
+on the offer, but removes **20 units of 100 RU/s per hour** across those regions. CODA prices
+those units using the customer's matching amortized throughput meter and a 730-hour month.
+A zone premium applies only in confirmed zone-redundant regions for single-write manual
+offers. Single-write autoscale has a quantity premium instead. If the billed quantity or
+matching unit price is unknown, the capacity finding remains without a currency estimate.
 
 ### DX-001 - Manual over-provisioning
 
@@ -160,14 +181,16 @@ Evaluate dedicated throughput or workload isolation/rebalancing.
 [Detailed methodology](detector-methodology/dx-005.md)
 
 Correlates throttling with broad partition saturation to distinguish insufficient overall throughput
-from a localized hot spot. Review workload shaping and required RU/s; raising throughput may be
+from a localized hot spot. Global capacity advice requires verified partition coverage in every
+configured region; partial observations can still establish regional skew. Raising throughput may be
 appropriate for global pressure but is not automatically the right response to every 429.
 
 ### DX-006 - Hot partition
 
 [Detailed methodology](detector-methodology/dx-006.md)
 
-Finds utilization concentrated on a physical partition while others have headroom. Review partition-key
+Finds utilization concentrated on a physical partition while another in the same region has headroom.
+Incomplete coverage is not proof of balance or a single partition. Review partition-key
 distribution, high-volume keys, and workload patterns. More total throughput may temporarily help but
 does not remove uneven demand. Physical-partition metrics alone do not identify the exact logical key.
 
@@ -242,8 +265,9 @@ one particular detector's root cause is present.
 
 [Detailed methodology](detector-methodology/dx-008.md)
 
-Flags multi-write configuration on inferred non-production accounts or the engine's API-specific
-guards for MongoDB, Cassandra, Gremlin and Table.
+For MongoDB, Cassandra, Gremlin and Table, a **Low** advisory asks the application owner to verify
+client write failover. API family alone does not justify disabling multi-write. Separate checks
+cover single write regions and non-production NoSQL accounts.
 The public web discovery path targets NoSQL; production NoSQL multi-write can be legitimate and is
 not flagged solely for having multiple write regions. Confirm availability/conflict requirements.
 **Retaining regions**, not the multi-write toggle alone, repeats regional capacity; only defensible
@@ -253,7 +277,8 @@ all-manual removable-region capacity is quantified.
 
 [Detailed methodology](detector-methodology/dx-015.md)
 
-Finds disproportionate storage on physical partitions. Review key cardinality, large logical keys,
+Finds disproportionate storage on co-observed physical partitions in a region, distinguishing
+measured zero bytes from missing partition history. Review key cardinality, large logical keys,
 and data distribution before redesigning the key. A physical-partition measurement does not establish
 that an individual logical partition has reached its size limit.
 

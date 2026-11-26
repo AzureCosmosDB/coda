@@ -48,6 +48,10 @@ of universal least privilege. If access must remain account/RG-scoped, start the
 resource-age information, and effective capabilities with your administrator. Do not grant a whole
 subscription solely because a detector lacks logs.
 
+When the measured database/container's own metadata cannot prove its minimum age, CODA checks
+creation evidence for that resource in the Activity Log. Unavailable evidence does not cause
+CODA to substitute the account's age or skip unrelated checks.
+
 The web scan's resource-group filter limits what is diagnosed; it does not narrow an Azure role
 assignment or prevent subscription metadata discovery.
 
@@ -112,7 +116,10 @@ Billing-account policy can still restrict charge visibility; for example, enterp
 administrators may need to enable charge visibility. A role assignment alone does not guarantee
 usable cost rows, billing coverage, or an applicable throughput rate.
 
-Without a usable cost rate, eligible findings remain capacity/recommendation-only rather than
+Throughput estimates match the standard or multi-write bill meter to the current ARM configuration.
+A successful account read with no usable matching rate may use a labelled same-meter subscription
+average. Failed account reads do not trigger a broader query. Without a usable rate or verifiable
+regional billed quantity, eligible findings remain capacity/recommendation-only rather than
 inventing currency savings. Container-level estimates allocate account-level billing information;
 they are not independently billed container charges. Optional backup-storage estimates use public
 retail prices and have different provenance from bill-derived throughput estimates.

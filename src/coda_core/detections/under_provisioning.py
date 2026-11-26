@@ -16,13 +16,15 @@ Reuses ``utilization_stats`` from DX-001 (shared signal). Read-only / diagnose-o
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta
 
 from coda_core.detections.over_provisioning import utilization_stats
 from coda_core.providers.arm import ThroughputOffer
 from coda_core.providers.azure_monitor import AzureMonitorMetricsProvider
 from coda_core.providers.base import MetricSeries, TimeWindow
+from coda_core.providers.partition_metrics import coverage_evidence
+from coda_core.providers.shared_offer import PoolMembers, RequestCounts, request_series
 from coda_core.sufficiency import evaluate_age
 
 # DX-005 is present-tense: throttling sustained over the recent window, with a short age floor
@@ -160,6 +162,9 @@ def detect_under_provisioning(
     *,
     config: UnderProvisioningConfig | None = None,
     resource_created_at: datetime | None = None,
+    regions: tuple[str | None, ...] = (),
+    pool_members: PoolMembers | None = None,
+    read_counts: RequestCounts | None = None,
 ) -> UnderProvisioningVerdict:
     """End-to-end DX-005 for one container (manual or autoscale)."""
     cfg = config or UnderProvisioningConfig()
@@ -169,28 +174,53 @@ def detect_under_provisioning(
         if age_insuff is not None:
             return _abstain(offer, reason=age_insuff.reason, detail=age_insuff.detail)
 
-    scope = {"DatabaseName": database} if container is None else \
-        {"DatabaseName": database, "CollectionName": container}
     # TotalRequests is Count-native: aggregation="Count" gives the correct 429 rate; "Total"
     # mis-weights the sum per status code and returns a wrong throttle rate.
-    total = metrics.get_metric(account_resource_id, "TotalRequests", window,
-                               aggregation="Count", dimension_filter=scope)
-    throttled = metrics.get_metric(account_resource_id, "TotalRequests", window, aggregation="Count",
-                                   dimension_filter={**scope, "StatusCode": "429"})
-    per_partition = metrics.get_metric_split(
-        account_resource_id, "NormalizedRUConsumption", window,
-        split_dimension="PhysicalPartitionId", dimension_filter=scope, aggregation="Maximum",
-    )
-
+    total, throttled = (read_counts(window) if read_counts is not None else
+                        request_series(metrics, account_resource_id, window, database, container, pool_members))
     rate, t, r = throttle_rate(total, throttled)
     if t < cfg.min_total_requests:
         return _abstain(offer, reason="too_few_requests", detail=f"{t:.0f} requests in window")
-    count, max_p99, min_p99 = partition_saturation(per_partition)
-    signal = ThrottlingSignal(
-        total_requests=t, throttled_requests=r, throttle_rate_pct=rate,
-        partition_count=count, max_partition_p99=max_p99, min_partition_p99=min_p99,
-    )
-    return classify(signal, offer, cfg)
+    histories = metrics.partition_histories(
+        account_resource_id, "NormalizedRUConsumption", window, database=database,
+        container=container, owner_rid=offer.owner_rid, regions=regions)
+    evidence = coverage_evidence(histories)
+    evidence.update(total_requests=t, throttled_requests=r, throttle_rate_pct=rate)
+
+    def regional(series):
+        return classify(ThrottlingSignal(t, r, rate, *partition_saturation(series)), offer, cfg)
+
+    regional_results = []
+    for h, row in zip(histories, evidence["partition_coverage"]):
+        count, mx, mn = partition_saturation(h.series)
+        if count:
+            row.update(max_p99=mx, min_p99=mn)
+        for cohort in h.comparisons():
+            regional_results.append((h.region, regional(cohort)))
+    baseline = regional({})
+    witness = next(((region, v) for region, v in regional_results
+                    if v.root_cause == "skew_suspected"), None)
+    if witness:
+        region, result = witness
+        evidence["witness_region"] = region
+        result = replace(result, recommended_action=f"Observed in {region}: {result.recommended_action}")
+    elif rate < cfg.throttle_rate_pct:
+        # Request counts independently exclude the positive gate; retain measured saturation.
+        result = regional_results[0][1] if regional_results else baseline
+    elif not evidence["coverage_complete"]:
+        result = replace(baseline, root_cause="insufficient_data",
+                         at_capacity=any(row.get("max_p99", 0) >= cfg.saturation_pct
+                                         for row in evidence["partition_coverage"]))
+        evidence["abstained"] = "incomplete_partition_coverage"
+    elif all(v.is_under_provisioned for _, v in regional_results):
+        result = regional_results[0][1]
+    elif any(v.is_under_provisioned for _, v in regional_results):
+        result = replace(baseline, root_cause="regional_saturation")
+    else:
+        result = regional_results[0][1]
+    if not evidence["coverage_complete"] or len(histories) != 1:
+        evidence["partition_count"] = None  # Region-specific counts remain in partition_coverage.
+    return replace(result, methodology={**result.methodology, **evidence})
 
 
 def _abstain(offer: ThroughputOffer, *, reason: str, detail: str) -> UnderProvisioningVerdict:

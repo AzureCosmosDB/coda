@@ -33,6 +33,7 @@ from coda_core.detections.over_provisioning import (
 )
 from coda_core.providers.azure_monitor import AzureMonitorMetricsProvider
 from coda_core.providers.base import MetricPoint, MetricSeries, TimeWindow
+from coda_core.providers.shared_offer import IncompletePool, PoolMembers, verified_members
 from coda_core.sufficiency import evaluate_age, evaluate_series
 
 
@@ -80,6 +81,7 @@ def detect_autoscale_max_over_provisioned(
     config: OverProvisioningConfig | None = None,
     scope_provisioned_ru: float | None = None,
     resource_created_at: datetime | None = None,
+    pool_members: PoolMembers | None = None,
 ) -> OverProvisioningVerdict:
     """Compare an autoscale offer's maximum with its observed peak, including shared databases.
 
@@ -96,6 +98,13 @@ def detect_autoscale_max_over_provisioned(
         if age is not None:
             return _abstain_verdict(configured_max_ru, reason=age.reason, detail=age.detail)
 
+    if container is None:
+        try:
+            verified_members(pool_members)
+            if pool_members is not None and pool_members.dedicated:
+                raise IncompletePool("AutoscaledRU cannot isolate the shared offer in this mixed database")
+        except IncompletePool as exc:
+            return _abstain_verdict(configured_max_ru, reason=exc.reason, detail=str(exc))
     series = autoscaled_utilization_series(
         metrics, account_resource_id, database, container, configured_max_ru, window
     )

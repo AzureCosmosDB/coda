@@ -2,8 +2,7 @@
 
 Carries everything an adapter needs to run one detection against one unit, and centralises the
 **production vs eval** policy:
-  * production — each detection's real long window + the account age guard (honest; on a young
-    account most detections will abstain, which is the correct answer).
+  * production — each detection's own window and minimum age of the resource being judged.
   * eval — a single recent window with the age guard disabled, to exercise the wiring and see
     findings fire on freshly generated telemetry (the same mode our per-detection validations use).
 """
@@ -14,11 +13,12 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from coda_core.framework.cost_rate import EffectiveRate
-from coda_core.providers.arm import AccountConfig, ArmProvider, ContainerIndexing, ThroughputOffer
+from coda_core.providers.arm import AccountConfig, ArmProvider, ContainerIndexing, PoolMembers, ThroughputOffer
 from coda_core.providers.azure_monitor import AzureMonitorMetricsProvider
-from coda_core.providers.base import TimeWindow
+from coda_core.providers.base import DataProvider, TimeWindow
 from coda_core.providers.log_analytics import DataPlaneSource, LogAnalyticsProvider
 from coda_core.providers.retail_prices import RetailPricesProvider
+from coda_core.providers.shared_offer import RequestCounts
 
 MODE_PRODUCTION = "production"
 MODE_EVAL = "eval"
@@ -33,7 +33,7 @@ class DetectionContext:
     mode: str                          # MODE_PRODUCTION | MODE_EVAL
     eval_window: TimeWindow            # used only in eval mode
     now: datetime                      # single per-run anchor (stable window keys for LA caching)
-    resource_created_at: datetime | None  # effective per-unit age (container, else account)
+    resource_created_at: datetime | None  # exact creation of the unit, never its parent
     scope_provisioned_ru: float | None  # scope's total provisioned RU/s (materiality denominator)
     la: LogAnalyticsProvider | None = None  # Log Analytics (resource-centric) for LA-backed container
                                             # detections (e.g. DX-002); None => those detections skip.
@@ -41,6 +41,10 @@ class DetectionContext:
                                                  # None => Cost Management absent → capacity-only findings.
     dataplane_source: DataPlaneSource | None = DataPlaneSource.RAW
     account_config: AccountConfig | None = None  # shared ARM snapshot for DX-009 merge restrictions
+    resource_existed_by: datetime | None = None
+    age_read_error: str | None = None
+    pool_members: PoolMembers | None = None
+    read_counts: RequestCounts | None = None
 
     def window_for(self, production_window: TimeWindow) -> TimeWindow:
         """Pick the detection's production window, or the shared eval window in eval mode."""
@@ -49,6 +53,22 @@ class DetectionContext:
     def created_at(self) -> datetime | None:
         """Age guard input: real per-unit age in production, ``None`` (disabled) in eval."""
         return None if self.mode == MODE_EVAL else self.resource_created_at
+
+    @property
+    def partition_regions(self) -> tuple[str | None, ...]:
+        """Use configured ARM regions, not just the regions that happened to return metrics."""
+        if not self.account_config:
+            return ()
+        names = {n.casefold(): n for n in self.account_config.location_names if n.strip()}
+        regions = tuple(names.values())
+        if len(regions) != self.account_config.region_count:
+            return (*regions, None)
+        return regions
+
+    @property
+    def partition_anchor(self) -> datetime:
+        """Use the last closed UTC hour so regional reads share a stable production window."""
+        return self.now.replace(minute=0, second=0, microsecond=0)
 
 
 @dataclass(frozen=True)
@@ -79,6 +99,7 @@ class AccountDetectionContext:
     effective_rate: EffectiveRate | None = None
     dataplane_source: DataPlaneSource | None = DataPlaneSource.RAW
     dataplane_error: str | None = None
+    inventory_issues: tuple[str, ...] = ()
 
     def window_for(self, production_window: TimeWindow) -> TimeWindow:
         """Pick the detection's production window, or the shared eval window in eval mode."""
@@ -102,6 +123,7 @@ class DatabaseDetectionContext:
     eval_window: TimeWindow | None = None
     now: datetime | None = None
     dataplane_source: DataPlaneSource | None = DataPlaneSource.RAW
+    pool_members: PoolMembers | None = None
 
     def window_for(self, production_window: TimeWindow) -> TimeWindow:
         return self.eval_window if self.mode == MODE_EVAL else production_window
@@ -139,7 +161,7 @@ class InventoryDetectionContext:
     Metrics + ARM only (no Log Analytics, no provisioned RU).
     """
 
-    metrics: AzureMonitorMetricsProvider
+    metrics: DataProvider
     account: str
     account_resource_id: str
     container: ContainerIndexing

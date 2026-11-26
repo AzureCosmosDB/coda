@@ -24,14 +24,16 @@ follow-ups. Read-only / diagnose-only.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 
 from coda_core.detections.over_provisioning import utilization_stats
+from coda_core.detections.regional_skew import regional_verdict
 from coda_core.detections.under_provisioning import throttle_rate
 from coda_core.providers.arm import ThroughputOffer
 from coda_core.providers.azure_monitor import AzureMonitorMetricsProvider
 from coda_core.providers.base import MetricSeries, TimeWindow
+from coda_core.providers.shared_offer import IncompletePool, PoolMembers, RequestCounts, request_series
 from coda_core.sufficiency import evaluate_age
 
 # Hot partition is present-tense: a short window with a 1-day age floor (like DX-005).
@@ -94,7 +96,7 @@ class HotPartitionVerdict:
     max_p99: float
     min_p99: float
     skew_ratio: float
-    throttling: bool
+    throttling: bool | None
     # hot_partition | uniform_saturation | not_saturated | single_partition | insufficient_data
     root_cause: str
     severity: str  # high | medium | low | none
@@ -164,6 +166,9 @@ def detect_hot_partition(
     *,
     config: HotPartitionConfig | None = None,
     resource_created_at: datetime | None = None,
+    regions: tuple[str | None, ...] = (),
+    pool_members: PoolMembers | None = None,
+    read_counts: RequestCounts | None = None,
 ) -> HotPartitionVerdict:
     """End-to-end DX-006 for one container."""
     cfg = config or HotPartitionConfig()
@@ -178,24 +183,33 @@ def detect_hot_partition(
                 methodology={"abstained": age_insuff.reason, "detail": age_insuff.detail},
             )
 
-    scope = {"DatabaseName": database} if container is None else \
-        {"DatabaseName": database, "CollectionName": container}
-    per_partition = metrics.get_metric_split(
-        account_resource_id, "NormalizedRUConsumption", window,
-        split_dimension="PhysicalPartitionId", dimension_filter=scope, aggregation="Maximum",
+    histories = metrics.partition_histories(
+        account_resource_id, "NormalizedRUConsumption", window, database=database,
+        container=container, owner_rid=offer.owner_rid, regions=regions,
     )
     # TotalRequests is Count-native: aggregation="Count" gives the correct 429 rate; "Total"
     # mis-weights the sum per status code and returns a wrong throttle rate.
-    total = metrics.get_metric(account_resource_id, "TotalRequests", window,
-                               aggregation="Count", dimension_filter=scope)
-    throttled = metrics.get_metric(account_resource_id, "TotalRequests", window, aggregation="Count",
-                                   dimension_filter={**scope, "StatusCode": "429"})
-    rate, t, _ = throttle_rate(total, throttled)
-    count, mx, mn, mean, hot, cool, ratio = partition_skew(
-        per_partition, saturation_pct=cfg.saturation_pct, uniform_min_pct=cfg.uniform_min_pct
+    pressure_issue = None
+    try:
+        total, throttled = (read_counts(window) if read_counts is not None else
+                            request_series(metrics, account_resource_id, window, database, container, pool_members))
+        rate, t, _ = throttle_rate(total, throttled)
+    except IncompletePool as exc:
+        # Partition skew is observed independently of the missing rate used for escalation.
+        pressure_issue, rate, t = str(exc), 0, 0
+
+    def classify_series(series):
+        count, mx, mn, mean, hot, cool, ratio = partition_skew(
+            series, saturation_pct=cfg.saturation_pct, uniform_min_pct=cfg.uniform_min_pct)
+        return classify(PartitionSkewSignal(count, mx, mn, mean, hot, cool, ratio, rate, t), cfg)
+
+    verdict = regional_verdict(
+        histories, classify_series, skew_cause="hot_partition",
+        observations=lambda v: {"observed_hot": v.methodology["hot_partitions"],
+                                "observed_cool": v.methodology["cool_partitions"],
+                                "max_p99": v.max_p99, "min_p99": v.min_p99},
     )
-    signal = PartitionSkewSignal(
-        partition_count=count, max_p99=mx, min_p99=mn, mean_p99=mean, hot_partitions=hot,
-        cool_partitions=cool, skew_ratio=ratio, throttle_rate_pct=rate, total_requests=t,
-    )
-    return classify(signal, cfg)
+    if pressure_issue:
+        return replace(verdict, throttling=None, methodology={
+            **verdict.methodology, "throttle_rate_pct": None, "throttling_unavailable": pressure_issue})
+    return verdict

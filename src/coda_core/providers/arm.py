@@ -21,7 +21,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 
 from azure.core.credentials import TokenCredential
-from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
+from azure.core.exceptions import AzureError, HttpResponseError, ResourceNotFoundError
 from azure.mgmt.cosmosdb import CosmosDBManagementClient
 
 
@@ -39,9 +39,47 @@ class ThroughputOffer:
     mode: str  # "manual" | "autoscale"
     provisioned_ru: float  # manual RU/s, or autoscale MAX RU/s (the user-set value)
     minimum_ru: float | None  # ARM minimumThroughput; not inferred to be an autoscale maximum limit
+    owner_rid: str | None = None  # database/container resource RID, not the throughput settings RID
 
     def as_dict(self) -> dict:
-        return asdict(self)
+        fields = asdict(self)
+        fields.pop("owner_rid")  # Internal Monitor filter; retain the published offer shape.
+        return fields
+
+
+@dataclass(frozen=True)
+class PoolMembers:
+    """Only a confirmed no-dedicated-offer response under a known pool establishes membership."""
+
+    shared: tuple[str, ...]
+    dedicated: tuple[str, ...]
+    unresolved: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ResourceAge:
+    """Creation time or evidence that this exact resource instance already existed."""
+
+    created: datetime | None = None
+    existed_by: datetime | None = None
+
+    @classmethod
+    def from_arm(cls, item) -> ResourceAge:
+        """systemData is authoritative; Cosmos _ts is last modification, never creation."""
+        created = getattr(getattr(item, "system_data", None), "created_at", None)
+        ts = getattr(item.resource, "ts", None)
+        return cls(created, datetime.fromtimestamp(ts, timezone.utc)
+                   if isinstance(ts, (float, int)) and ts > 0 else None)
+
+
+@dataclass(frozen=True)
+class OfferInventory:
+    """Retain independent offers, pool membership, same-resource ages and ARM coverage failures."""
+
+    offers: list[ThroughputOffer]
+    pools: dict[str, PoolMembers]
+    ages: dict[tuple[str, str | None], ResourceAge]
+    issues: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -88,7 +126,8 @@ def _is_no_offer_error(exc: Exception) -> bool:
     if isinstance(exc, ResourceNotFoundError):
         return True
     msg = str(getattr(exc, "message", "") or exc)
-    return "serverless" in msg.lower() and "offer" in msg.lower()
+    return (isinstance(exc, HttpResponseError) and exc.status_code in (400, None)
+            and "serverless" in msg.lower() and "offer" in msg.lower())
 
 
 @dataclass(frozen=True)
@@ -101,7 +140,7 @@ class AccountConfig:
     name: str
     api_kind: str                 # ARM ``kind`` (e.g. "GlobalDocumentDB", "MongoDB")
     is_mongo: bool                # MongoDB API (drivers can't use Cosmos multi-region-write failover)
-    multi_region_writes_enabled: bool   # ``enableMultipleWriteLocations``
+    multi_region_writes_enabled: bool | None   # Missing configuration must not select a billing meter.
     write_region_count: int       # number of write locations
     region_count: int             # total locations (read + write)
     location_names: tuple[str, ...]
@@ -116,6 +155,8 @@ class AccountConfig:
     backup_migration_status: str | None = None  # nonempty migration metadata prevents merge advice
     backup_migration_target: str | None = None
     all_versions_and_deletes_enabled: bool | None = None  # enablement, not consumer activity
+    zone_redundant_region_count: int | None = None  # None if even one location lacks explicit evidence
+    free_tier: bool | None = None
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -124,9 +165,8 @@ class AccountConfig:
     def api(self) -> str:
         """Normalized Cosmos DB API family: sql | mongo | cassandra | gremlin | table.
 
-        Derived from the ARM ``kind`` plus capability names (e.g. ``EnableCassandra``). Only the
-        SQL (Core/NoSQL) API's SDK can use Cosmos DB's multi-region-write failover; the Mongo,
-        Cassandra, Gremlin, and Table APIs cannot (see :data:`NON_MULTI_WRITE_APIS`).
+        Derived from ARM ``kind`` and capabilities (e.g. ``EnableCassandra``).
+        This identifies the service API, not the application's SDK or its failover settings.
         """
         caps = {c.lower() for c in self.capabilities}
         kind = (self.api_kind or "").lower()
@@ -141,11 +181,6 @@ class AccountConfig:
         return "sql"
 
 
-# APIs whose SDKs cannot use Cosmos DB's multi-region-write failover — enabling multi-region writes
-# on these is a misconfiguration (the RTO=0 HA benefit never materialises). SQL (Core) is excluded.
-NON_MULTI_WRITE_APIS = ("mongo", "cassandra", "gremlin", "table")
-
-
 def account_config_from_arm(acct, *, subscription_name: str | None = None) -> AccountConfig:
     """Parse an ARM ``DatabaseAccountGetResults`` into a :class:`AccountConfig` (pure, no I/O)."""
     kind = getattr(acct, "kind", None) or ""
@@ -157,6 +192,7 @@ def account_config_from_arm(acct, *, subscription_name: str | None = None) -> Ac
     names = tuple(
         n for n in (getattr(loc, "location_name", None) for loc in all_locs) if n
     )
+    zone_flags = [getattr(loc, "is_zone_redundant", None) for loc in all_locs]
     cp = getattr(acct, "consistency_policy", None)
     consistency = getattr(cp, "default_consistency_level", None) if cp is not None else None
     # Backup policy: ContinuousModeBackupPolicy (PITR) has type "Continuous" + a retention tier;
@@ -175,10 +211,13 @@ def account_config_from_arm(acct, *, subscription_name: str | None = None) -> Ac
         name=getattr(acct, "name", "") or "",
         api_kind=kind,
         is_mongo=is_mongo,
-        multi_region_writes_enabled=bool(getattr(acct, "enable_multiple_write_locations", False)),
+        multi_region_writes_enabled=getattr(acct, "enable_multiple_write_locations", None),
         write_region_count=len(write_locs),
         region_count=len(all_locs),
         location_names=names,
+        zone_redundant_region_count=(sum(zone_flags) if zone_flags and
+                                     all(isinstance(v, bool) for v in zone_flags) else None),
+        free_tier=getattr(acct, "enable_free_tier", None),
         tags=dict(getattr(acct, "tags", None) or {}),
         subscription_name=subscription_name,
         default_consistency_level=str(consistency) if consistency is not None else None,
@@ -195,7 +234,8 @@ def account_config_from_arm(acct, *, subscription_name: str | None = None) -> Ac
     )
 
 
-def offer_from_throughput(resource, *, database: str, container: str | None, level: str) -> ThroughputOffer:
+def offer_from_throughput(resource, *, database: str, container: str | None, level: str,
+                          owner_rid: str | None = None) -> ThroughputOffer:
     """Parse a ``ThroughputSettingsResource`` into a :class:`ThroughputOffer`.
 
     Pure (no I/O) so it can be unit-tested. Autoscale is identified by the presence of
@@ -205,11 +245,11 @@ def offer_from_throughput(resource, *, database: str, container: str | None, lev
     max_throughput = getattr(auto, "max_throughput", None) if auto is not None else None
     if max_throughput:
         return ThroughputOffer(
-            database=database, container=container, level=level, mode="autoscale",
+            database=database, container=container, level=level, mode="autoscale", owner_rid=owner_rid,
             provisioned_ru=float(max_throughput), minimum_ru=_f(getattr(resource, "minimum_throughput", None)),
         )
     return ThroughputOffer(
-        database=database, container=container, level=level, mode="manual",
+        database=database, container=container, level=level, mode="manual", owner_rid=owner_rid,
         provisioned_ru=float(resource.throughput), minimum_ru=_f(getattr(resource, "minimum_throughput", None)),
     )
 
@@ -292,11 +332,7 @@ class ArmProvider:
         return account_config_from_arm(acct, subscription_name=self.get_subscription_name())
 
     def get_account_created_at(self, resource_group: str, account: str) -> datetime | None:
-        """Account creation time from ARM ``systemData.createdAt`` (None if unavailable).
-
-        A container can't be older than its account, so this is a correct (if coarse) age guard
-        and the fallback when per-container age is unavailable (see ``get_container_created_at``).
-        """
+        """Account creation time for account inventory only, never a child-age proxy."""
         acct = self._client.database_accounts.get(resource_group, account)
         system_data = getattr(acct, "system_data", None)
         return getattr(system_data, "created_at", None) if system_data else None
@@ -305,33 +341,38 @@ class ArmProvider:
         self, resource_group: str, account: str, database: str, container: str,
         *, lookback_days: int = 89,
     ) -> datetime | None:
-        """Per-container creation time from the **Activity Log** (None if not found in retention).
+        """Read creation evidence only for the named container, for standalone callers."""
+        acct = self._client.database_accounts.get(resource_group, account)
+        rid = f"{acct.id}/sqlDatabases/{database}/containers/{container}"
+        return self.resource_created_at(rid, lookback_days=lookback_days)
 
-        The Cosmos ARM container resource exposes no ``systemData``, so true per-container age
-        comes from the control-plane Activity Log: the earliest ``.../containers/write`` event is
-        the creation. Activity Log retention is ~90 days, so a container created earlier returns
-        ``None`` — and the caller falls back to account age, which is *safe*: such a container is
-        necessarily >90 days old, well past any age floor.
-
-        Read-only (Activity Log query). ``lookback_days`` stays inside the ~90-day retention.
-        """
+    def resource_created_at(self, rid: str, *, lookback_days: int = 89) -> datetime | None:
+        """Latest successful creation for this ARM ID; an ordinary PUT/update is not creation."""
         from azure.mgmt.monitor import MonitorManagementClient
 
         if self._monitor is None:
             self._monitor = MonitorManagementClient(self._credential, self._subscription_id)
-        acct = self._client.database_accounts.get(resource_group, account)
-        container_id = f"{acct.id}/sqlDatabases/{database}/containers/{container}"
         start = datetime.now(timezone.utc) - timedelta(days=lookback_days)
-        flt = f"eventTimestamp ge '{start.isoformat()}' and resourceId eq '{container_id}'"
-
-        earliest: datetime | None = None
+        safe_id = rid.replace("'", "''")
+        flt = f"eventTimestamp ge '{start.isoformat()}' and resourceId eq '{safe_id}'"
+        latest_create = latest_delete = None
+        prefix = "microsoft.documentdb/databaseaccounts/sqldatabases"
+        if "/containers/" in rid.casefold().split("/sqldatabases/", 1)[-1]:
+            prefix += "/containers"
         for ev in self._monitor.activity_logs.list(filter=flt):
-            op = (getattr(ev.operation_name, "value", "") or "").lower()
-            if op.endswith("/containers/write"):
-                ts = ev.event_timestamp
-                if ts is not None and (earliest is None or ts < earliest):
-                    earliest = ts
-        return earliest
+            if ((ev.resource_id or "").casefold() != rid.casefold()
+                    or (getattr(ev.status, "value", "") or "").casefold() != "succeeded"):
+                continue
+            op = (getattr(ev.operation_name, "value", "") or "").casefold()
+            sub = (getattr(ev.sub_status, "value", "") or "").casefold()
+            ts = ev.event_timestamp
+            if ts and op == f"{prefix}/write" and sub in {"created", "201", "created (201)"}:
+                latest_create = max(ts, latest_create or ts)
+            elif ts and op == f"{prefix}/delete":
+                latest_delete = max(ts, latest_delete or ts)
+        if latest_delete and (not latest_create or latest_create <= latest_delete):
+            return None
+        return latest_create
 
     def get_container_offer(
         self, resource_group: str, account: str, database: str, container: str
@@ -343,7 +384,9 @@ class ArmProvider:
             return offer_from_throughput(ct.resource, database=database, container=container, level="container")
         except ResourceNotFoundError:
             dbt = sql.get_sql_database_throughput(resource_group, account, database)
-            return offer_from_throughput(dbt.resource, database=database, container=None, level="database")
+            db = sql.get_sql_database(resource_group, account, database)
+            return offer_from_throughput(dbt.resource, database=database, container=None,
+                                         level="database", owner_rid=db.resource.rid)
 
     def list_offers(self, resource_group: str, account: str) -> list[ThroughputOffer]:
         """Enumerate every throughput offer in the account (shared DB pools + dedicated containers).
@@ -353,28 +396,58 @@ class ArmProvider:
         "no offer" → returns ``[]`` (serverless containers are diagnosed via :meth:`list_containers`
         + the DX-018 pass instead).
         """
+        inventory = self.inspect_offers(resource_group, account)
+        if inventory.issues:
+            raise ValueError("Incomplete ARM throughput inventory: " + "; ".join(inventory.issues))
+        return inventory.offers
+
+    def inspect_offers(self, resource_group: str, account: str) -> OfferInventory:
+        """Resolve each container once; isolate a failed lookup from independent offers."""
         sql = self._client.sql_resources
         offers: list[ThroughputOffer] = []
-        for db in sql.list_sql_databases(resource_group, account):
+        pools, ages, issues = {}, {}, []
+
+        def listed(label, fetch, failures):
+            """Keep earlier pages when a later ARM enumeration fails; flag incomplete membership."""
+            try:
+                yield from fetch()
+            except AzureError as exc:
+                failures.append(f"{label}: {type(exc).__name__}")
+
+        for db in listed("database enumeration", lambda: sql.list_sql_databases(
+                resource_group, account), issues):
             db_name = db.name
+            pool = False
+            shared, dedicated, unresolved = [], [], []
             try:
                 dbt = sql.get_sql_database_throughput(resource_group, account, db_name)
-                offers.append(offer_from_throughput(dbt.resource, database=db_name, container=None, level="database"))
-            except (ResourceNotFoundError, HttpResponseError) as exc:
+                offers.append(offer_from_throughput(
+                    dbt.resource, database=db_name, container=None, level="database",
+                    owner_rid=getattr(db.resource, "rid", None)))
+                ages[db_name, None] = ResourceAge.from_arm(db)
+                pool = True
+            except AzureError as exc:
                 if not _is_no_offer_error(exc):
-                    raise
-                # no shared offer at the database level (dedicated containers) or serverless account
-            for cont in sql.list_sql_containers(resource_group, account, db_name):
+                    issues.append(f"{db_name} database offer: {type(exc).__name__}")
+            for cont in listed(f"{db_name} container enumeration", lambda: sql.list_sql_containers(
+                    resource_group, account, db_name), unresolved):
                 try:
                     ct = sql.get_sql_container_throughput(resource_group, account, db_name, cont.name)
                     offers.append(
-                        offer_from_throughput(ct.resource, database=db_name, container=cont.name, level="container")
+                        offer_from_throughput(ct.resource, database=db_name, container=cont.name,
+                                              level="container", owner_rid=getattr(cont.resource, "rid", None))
                     )
-                except (ResourceNotFoundError, HttpResponseError) as exc:
-                    if not _is_no_offer_error(exc):
-                        raise
-                    continue  # draws from the shared DB pool, or a serverless container (no offer)
-        return offers
+                    dedicated.append(cont.name)
+                    ages[db_name, cont.name] = ResourceAge.from_arm(cont)
+                except AzureError as exc:
+                    if pool and isinstance(exc, ResourceNotFoundError):
+                        shared.append(cont.name)
+                    elif pool or not _is_no_offer_error(exc):
+                        unresolved.append(f"{db_name}/{cont.name}: {type(exc).__name__}")
+            issues.extend(unresolved)
+            if pool:
+                pools[db_name] = PoolMembers(tuple(shared), tuple(dedicated), tuple(unresolved))
+        return OfferInventory(offers, pools, ages, tuple(issues))
 
     def list_containers(self, resource_group: str, account: str) -> list[tuple[str, str]]:
         """Enumerate every ``(database, container)`` in the account, regardless of throughput offer.

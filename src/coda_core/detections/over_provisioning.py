@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from coda_core.framework.materiality import MaterialityConfig
 from coda_core.framework.materiality import severity as materiality_severity
 from coda_core.providers.base import DataProvider, MetricSeries, TimeWindow
+from coda_core.providers.shared_offer import owner_scope
 from coda_core.sufficiency import DataRequirement, evaluate_age, evaluate_series
 
 # Autoscale's configurable maximum baseline, not its scaled/billed idle floor (ADR-0016).
@@ -303,6 +304,7 @@ def detect_over_provisioning(
     config: OverProvisioningConfig | None = None,
     scope_provisioned_ru: float | None = None,
     resource_created_at: datetime | None = None,
+    owner_rid: str | None = None,
 ) -> OverProvisioningVerdict:
     """End-to-end DX-001 detection for one container offer.
 
@@ -325,8 +327,7 @@ def detect_over_provisioning(
         "NormalizedRUConsumption",
         window,
         aggregation="Maximum",
-        dimension_filter=({"DatabaseName": database} if container is None else
-                          {"DatabaseName": database, "CollectionName": container}),
+        dimension_filter=owner_scope(database, container, owner_rid),
     )
     insufficiency = evaluate_series(series, DATA_REQUIREMENT)
     if insufficiency is not None:
