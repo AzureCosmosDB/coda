@@ -139,7 +139,7 @@ class AccountConfig:
 
     name: str
     api_kind: str                 # ARM ``kind`` (e.g. "GlobalDocumentDB", "MongoDB")
-    is_mongo: bool                # MongoDB API (drivers can't use Cosmos multi-region-write failover)
+    is_mongo: bool                # API identity, not evidence of a client's write-failover behavior.
     multi_region_writes_enabled: bool | None   # Missing configuration must not select a billing meter.
     write_region_count: int       # number of write locations
     region_count: int             # total locations (read + write)

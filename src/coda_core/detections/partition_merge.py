@@ -167,16 +167,18 @@ def detect_partition_merge(
     window: TimeWindow,
     *,
     account_config: AccountConfig | None = None,
+    storage_peak: float | None = None,
 ) -> PartitionMergeVerdict:
     """Read structural metrics and apply backup-aware guidance from the existing ARM snapshot."""
     scope = {"DatabaseName": database, "CollectionName": container}
     pcount = metrics.get_metric(account_resource_id, "PhysicalPartitionCount", window,
                                 aggregation="Maximum", dimension_filter=scope)
-    storage = metrics.get_metric(account_resource_id, "DataUsage", window,
-                                 aggregation="Maximum", dimension_filter=scope)
+    if storage_peak is None:
+        storage = metrics.get_metric(account_resource_id, "DataUsage", window,
+                                     aggregation="Maximum", dimension_filter=scope)
+        storage_peak = max(storage.values(), default=0.0)
     pvals = pcount.values()
     if not pvals:
         return classify(0, provisioned_ru, 0.0, account_config=account_config)
     actual = int(max(pvals))
-    storage_bytes = max(storage.values()) if storage.values() else 0.0
-    return classify(actual, provisioned_ru, storage_bytes, account_config=account_config)
+    return classify(actual, provisioned_ru, storage_peak, account_config=account_config)

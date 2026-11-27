@@ -77,7 +77,7 @@ Independent owner-scoped, dedicated-container and account-configuration findings
 6. **Render a report.** The browser shows recommendations and incomplete evaluations. JSON/MCP
    retains evidence, identifiers, thresholds, and remediation-rule metadata.
 
-The shipped diagnostic path does not call an LLM. An AI client can call the MCP tools and interpret
+The diagnostic path does not call an LLM. An AI client can call the MCP tools and interpret
 their output, but that client's model service is separate from CODA.
 
 DX-005, DX-006 and DX-015 compare physical partitions within each configured region. The
@@ -94,11 +94,24 @@ require raw request logs for activity-level query-charge joins. See
 
 ## Services and outbound connections
 
-For indexing checks, the runner groups ARM-inventoried containers in the same database and
-requests `IndexUsage` and `DataUsage` together. It maps each result to its exact metric, account,
-database, container and window. Recovery reads are bounded; missing evidence is not zero. The
-under-provisioning and hot-partition checks reuse identical request counts within one offer's
-evaluation. No extra Azure permissions or background service are needed.
+The runner groups compatible Metrics reads within one database, keeping mode, eligibility,
+ownership, region, dimensions, aggregation and absolute window distinct. Each result must
+map back to its resource with verifiable bucket coverage. After a successful but incomplete
+group read, the affected resource can use the original exact read. Authorization errors and
+throttled requests do not fan out into one retry per container. The existing indexing pass
+keeps its eight-read recovery limit; every unresolved unit remains in the report. It shares
+the full-series storage peak with the partition-merge check only when the windows match.
+Partition histories are not substituted for one another without independent count evidence.
+
+Azure Monitor collection allows at most three attempts per read, with SDK retries disabled
+underneath. A service 429 pauses new Metrics requests in that scan's subscription; one worker
+probes recovery before the others resume. CODA honors `Retry-After` (including HTTP dates and
+Azure millisecond headers), or uses exponential backoff with jitter when no usable hint exists.
+408, 500, 502, 503, 504 and transport errors are retryable; permission and invalid-query
+errors are not. An account has at most 60 seconds of cumulative retry waiting or the caller's
+remaining deadline, whichever is shorter. CODA never shortens Azure's requested delay to fit;
+it reports missing evidence and retains independent results. These are collection limits,
+not a hard ceiling on normal reads and not a change to detector severity.
 
 Throughput currency estimates combine two separate inputs: ARM offer/region configuration
 determines the change in billed meter units, and Cost Management supplies the historical

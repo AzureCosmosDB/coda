@@ -22,6 +22,9 @@ remediation (``index-exclude-unused``) is a policy change the customer applies.
 
 from __future__ import annotations
 
+from azure.core.exceptions import AzureError
+from coda_core.providers.indexing_batch import IncompleteBatch, InvalidIndexingInventory
+
 import math
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -142,9 +145,16 @@ def detect_indexing_cost(
 ) -> IndexingCostVerdict:
     """End-to-end DX-024 for one container (latest index/data bytes, extension parity)."""
     scope = {"DatabaseName": database, "CollectionName": container}
-    index = metrics.get_metric(account_resource_id, "IndexUsage", window,
-                               aggregation="Maximum", dimension_filter=scope)
-    data = metrics.get_metric(account_resource_id, "DataUsage", window,
-                              aggregation="Maximum", dimension_filter=scope)
+    try:
+        index = metrics.get_metric(account_resource_id, "IndexUsage", window,
+                                   aggregation="Maximum", dimension_filter=scope)
+        data = metrics.get_metric(account_resource_id, "DataUsage", window,
+                                  aggregation="Maximum", dimension_filter=scope)
+    except (IncompleteBatch, AzureError) as exc:
+        if isinstance(exc, InvalidIndexingInventory) or (indexing_mode or "").lower() != "none":
+            raise
+        result = classify(None, None, indexing_mode=indexing_mode, excluded_paths=excluded_paths, config=config)
+        result.methodology["storage_read_issue"] = type(exc).__name__
+        return result
     return classify(_latest(index), _latest(data), indexing_mode=indexing_mode,
                     excluded_paths=excluded_paths, config=config)

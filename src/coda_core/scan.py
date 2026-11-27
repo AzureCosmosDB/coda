@@ -29,6 +29,7 @@ from azure.mgmt.cosmosdb import CosmosDBManagementClient
 from coda_core.pipeline import default_eval_window, run_diagnostics
 from coda_core.providers.arm import ArmProvider
 from coda_core.providers.azure_monitor import AzureMonitorMetricsProvider
+from coda_core.providers.monitor_retry import MonitorCooldown, RetryBudget
 from coda_core.providers.base import TimeWindow
 from coda_core.providers.cost_management import CostManagementProvider
 from coda_core.providers.log_analytics import LogAnalyticsProvider
@@ -192,11 +193,13 @@ def scan(
     if limit:
         targets = targets[:limit]
     eval_window = default_eval_window(hours=eval_hours) if eval_hours else None
+    cooldown = MonitorCooldown()
 
     def _diagnose(rg: str, name: str):
         # Per-worker providers (SDK clients aren't guaranteed thread-safe); credential is shared.
         arm = ArmProvider(credential, subscription)
-        metrics = AzureMonitorMetricsProvider(credential)
+        metrics = AzureMonitorMetricsProvider(credential, cooldown=cooldown,
+                                             budget=RetryBudget(time.monotonic() + per_account_timeout))
         la = LogAnalyticsProvider(credential)
         cost = CostManagementProvider(credential, subscription)
         retail_prices = RetailPricesProvider()
@@ -327,8 +330,7 @@ def _shallow_probe_account(
 
     Uses NormalizedRUConsumption (peak partition saturation) and the 429 rate — both safe for serverless
     (which emits no provisioned-throughput metric, avoiding the serverless false-positive class). The
-    ``metrics`` provider is shared across workers: azure-identity credentials are thread-safe and cache
-    tokens, so one shared client avoids a per-account Azure-CLI token storm under high concurrency.
+    Workers share the credential and throttle cooldown, not an account's retry budget.
     """
     rid = (f"/subscriptions/{subscription}/resourceGroups/{rg}"
            f"/providers/Microsoft.DocumentDB/databaseAccounts/{name}")
@@ -365,16 +367,14 @@ def shallow_scan(
         targets = targets[:limit]
     end = datetime.now(timezone.utc)
     window = TimeWindow(end - timedelta(hours=window_hours), end, timedelta(hours=1))
-    # One shared metrics client for the whole scan: azure-identity credentials are thread-safe and
-    # cache tokens, so a single client acquires the token once instead of every worker shelling out to
-    # the Azure CLI at once (which fails under high concurrency).
-    metrics = AzureMonitorMetricsProvider(credential)
+    cooldown = MonitorCooldown()
     # Warm the shared credential's token once (best effort) so the worker burst below reuses the cached
     # token instead of every thread shelling out to the Azure CLI at once (which fails under load).
     if targets:
         try:
             _wrg, _wn = targets[0]
-            metrics.get_metric(
+            AzureMonitorMetricsProvider(credential, cooldown=cooldown,
+                budget=RetryBudget(time.monotonic() + per_account_timeout)).get_metric(
                 f"/subscriptions/{subscription}/resourceGroups/{_wrg}"
                 f"/providers/Microsoft.DocumentDB/databaseAccounts/{_wn}",
                 "TotalRequests", window, aggregation="Count")
@@ -382,11 +382,18 @@ def shallow_scan(
             pass
     result = ShallowScanResult(subscription, end.isoformat())
     t0 = time.time()
+
+    def probe(rg, name):
+        """A timed-out scan worker may not keep issuing Monitor attempts in the background."""
+        metrics = AzureMonitorMetricsProvider(credential, cooldown=cooldown,
+                                              budget=RetryBudget(time.monotonic() + per_account_timeout))
+        return _shallow_probe_account(metrics, subscription, rg, name, window)
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
         fut_map = {
             ex.submit(
                 _run_with_timeout,
-                (lambda rg=rg, n=n: _shallow_probe_account(metrics, subscription, rg, n, window)),
+                (lambda rg=rg, n=n: probe(rg, n)),
                 per_account_timeout,
             ): (rg, n)
             for rg, n in targets

@@ -38,6 +38,7 @@ from coda_core.framework.materiality import severity as materiality_severity
 from coda_core.providers.arm import ThroughputOffer
 from coda_core.providers.azure_monitor import AzureMonitorMetricsProvider
 from coda_core.providers.base import TimeWindow
+from coda_core.providers.monitor_retry import MonitorUnavailable
 from coda_core.providers.shared_offer import IncompletePool, PoolMembers, owner_scope, traffic_metric
 from coda_core.sufficiency import DataRequirement, evaluate_age, evaluate_series
 
@@ -205,7 +206,8 @@ def detect_idle(
             aggregation="Maximum", dimension_filter=owner_scope(database, container, offer.owner_rid))
     except (AzureError, IncompletePool) as exc:
         utilization = None
-        utilization_issue = f"Optional utilization unavailable: {type(exc).__name__}"
+        detail = str(exc) if isinstance(exc, MonitorUnavailable) else type(exc).__name__
+        utilization_issue = f"Optional utilization unavailable: {detail}"
     ru_values = ru.values()
     util_values = utilization.values() if utilization is not None else []
     signal = IdleSignal(

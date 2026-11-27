@@ -14,13 +14,17 @@ must be regenerated.
 
 from __future__ import annotations
 
+from collections import OrderedDict
+from copy import copy
 from azure.core.credentials import TokenCredential
 from azure.monitor.query import MetricAggregationType, MetricsQueryClient
 
 from coda_core.detections.pitr_savings import DataUsageSample
 
 from .base import DataProvider, MetricPoint, MetricSeries, TimeWindow
-from .indexing_batch import IndexingReadPlan
+from .indexing_batch import IndexingReadPlan, plan_names
+from .monitor_retry import MonitorCooldown, MonitorReadClient, RetryBudget
+from .monitor_cohort import CohortClient
 from .partition_metrics import (
     SERIES_LIMIT, PartitionReader, RegionHistory, metadata as _metadata, quote, split_series,
 )
@@ -57,11 +61,16 @@ def _reduce(values: list[float], aggregation: str) -> float:
 class AzureMonitorMetricsProvider(DataProvider):
     """DataProvider backed by the Azure Monitor Metrics API."""
 
-    def __init__(self, credential: TokenCredential) -> None:
+    def __init__(self, credential: TokenCredential, *, cooldown: MonitorCooldown | None = None,
+                 budget: RetryBudget | None = None) -> None:
         self._credential = credential
-        # MetricsQueryClient targets the public Azure Monitor endpoint by default.
-        self._client = MetricsQueryClient(credential)
+        self._external_cooldown = cooldown is not None
+        self._external_budget = budget is not None
+        self.cooldown = cooldown or MonitorCooldown()
+        self.budget = budget or RetryBudget()
+        self._client = MonitorReadClient(MetricsQueryClient(credential), self.cooldown, self.budget)
         self._partitions = PartitionReader(self._client)
+        self._exact = None
 
     @property
     def credential(self) -> TokenCredential:
@@ -71,6 +80,35 @@ class AzureMonitorMetricsProvider(DataProvider):
     def indexing_plan(self, resource_id: str, window: TimeWindow) -> IndexingReadPlan:
         """Create an independent indexing projection and recovery budget for this report."""
         return IndexingReadPlan(self._client, resource_id, window)
+
+    def for_cohort(self, database, containers=(), owners=()):
+        """Use a bounded projection on this worker's SDK client, never sharing it across threads."""
+        scoped = copy(self)
+        scoped._client = CohortClient(self._client, database, containers, owners)
+        scoped._partitions = PartitionReader(scoped._client)
+        scoped._exact = OrderedDict()
+        return scoped
+
+    def for_report(self):
+        """Keep caller-owned retry state; reset each provider-owned component for this report."""
+        if self._external_cooldown and self._external_budget:
+            return self
+        scoped = copy(self)
+        if not self._external_cooldown:
+            scoped.cooldown = MonitorCooldown()
+        if not self._external_budget:
+            scoped.budget = RetryBudget()
+        scoped._client = MonitorReadClient(self._client.client, scoped.cooldown, scoped.budget)
+        scoped._partitions = PartitionReader(scoped._client)
+        return scoped
+
+    def _remember(self, key, result):
+        """Only share nonempty successfully decoded histories, never failures or indices across reports."""
+        cache = getattr(self, "_exact", None)
+        if cache is not None:
+            if len(cache) >= 64:
+                cache.popitem(last=False)
+            cache[key] = result
 
     def get_metric(
         self,
@@ -97,6 +135,10 @@ class AzureMonitorMetricsProvider(DataProvider):
                 f"Unsupported aggregation {aggregation!r}; "
                 f"expected one of {sorted(_AGGREGATION)}."
             )
+        key = (resource_id, metric_name, window, aggregation, tuple(sorted((dimension_filter or {}).items())), None)
+        cache = getattr(self, "_exact", None)
+        if cache is not None and key in cache:
+            return cache[key]
 
         # Azure Monitor metric filter syntax: "Dim1 eq 'v1' and Dim2 eq 'v2'".
         metric_filter = None
@@ -129,12 +171,15 @@ class AzureMonitorMetricsProvider(DataProvider):
             MetricPoint(timestamp=ts, value=_reduce(vals, aggregation))
             for ts, vals in sorted(by_ts.items())
         ]
-        return MetricSeries(
+        series = MetricSeries(
             name=metric_name,
             aggregation=aggregation,
             unit=unit,
             points=tuple(points),
         )
+        if points and metric_name in {"NormalizedRUConsumption", "TotalRequests"}:
+            self._remember(key, series)
+        return series
 
     def get_metric_split(
         self,
@@ -157,6 +202,10 @@ class AzureMonitorMetricsProvider(DataProvider):
             raise ValueError(f"Unsupported aggregation {aggregation!r}.")
 
         clauses = [f"{k} eq {quote(v)}" for k, v in (dimension_filter or {}).items()]
+        key = (resource_id, metric_name, window, aggregation, tuple(sorted((dimension_filter or {}).items())), split_dimension)
+        cache = getattr(self, "_exact", None)
+        if cache is not None and key in cache:
+            return cache[key].copy()
         clauses.append(f"{split_dimension} eq '*'")
         response = self._client.query_resource(
             resource_id,
@@ -172,7 +221,10 @@ class AzureMonitorMetricsProvider(DataProvider):
         if conflicts or unknown or len(rows) >= SERIES_LIMIT:
             raise ValueError(f"Incomplete or ambiguous {metric_name} split by {split_dimension}")
         unit = next((str(m.unit) for m in response.metrics if m.unit is not None), None)
-        return {k: MetricSeries(s.name, s.aggregation, unit, s.points) for k, s in out.items()}
+        result = {k: MetricSeries(s.name, s.aggregation, unit, s.points) for k, s in out.items()}
+        if result and all(s.points for s in result.values()) and metric_name in {"AutoscaledRU", "TotalRequests"}:
+            self._remember(key, result.copy())
+        return result
 
     def partition_histories(self, rid: str, metric: str, window: TimeWindow, *,
                             database: str, container: str | None, owner_rid: str | None,
@@ -190,6 +242,7 @@ class AzureMonitorMetricsProvider(DataProvider):
         window: TimeWindow,
         *,
         reference_region: str,
+        expected_containers: tuple[tuple[str, str], ...] = (),
     ) -> tuple[DataUsageSample, ...]:
         """Read raw ``DataUsageV2`` logical-container series from exactly one account region.
 
@@ -197,17 +250,29 @@ class AzureMonitorMetricsProvider(DataProvider):
         selector can therefore prove that one timestamp contains every ARM-inventoried logical
         container exactly once before summing the byte values.
         """
-        escaped_region = reference_region.replace("'", "''")
+        prefix = f"Region eq {quote(reference_region)} and "
+        if len(expected_containers) >= SERIES_LIMIT:
+            samples = []
+            for batch in plan_names(expected_containers):
+                if not batch.fits():
+                    raise ValueError("DataUsageV2 inventory exceeds encoded filter size")
+                rows = self._storage_rows(resource_id, window, prefix + batch.filter, len(batch.containers) + 1)
+                if any(row.database != batch.database or row.container not in batch.containers for row in rows):
+                    raise ValueError("DataUsageV2 returned a series outside its group")
+                samples.extend(rows)
+            return tuple(samples)
+        return self._storage_rows(resource_id, window, prefix + "DatabaseName eq '*' and CollectionName eq '*'", SERIES_LIMIT)
+
+    def _storage_rows(self, resource_id, window, scope, top):
+        """Keep raw dimensions and timestamps; the snapshot selector checks the complete union."""
         response = self._client.query_resource(
             resource_id,
             metric_names=["DataUsageV2"],
             timespan=(window.start, window.end),
             granularity=window.granularity,
             aggregations=[MetricAggregationType.TOTAL],
-            filter=(
-                f"Region eq '{escaped_region}' and "
-                "DatabaseName eq '*' and CollectionName eq '*'"
-            ),
+            max_results=top,
+            filter=scope,
         )
         samples: list[DataUsageSample] = []
         for metric in response.metrics:

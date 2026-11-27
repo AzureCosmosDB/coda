@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from math import ceil, isfinite
@@ -15,6 +15,7 @@ from azure.monitor.query import MetricAggregationType, MetricsQueryClient
 
 from coda_core.providers.arm import ContainerIndexing
 from coda_core.providers.base import DataProvider, MetricPoint, MetricSeries, TimeWindow
+from coda_core.providers.monitor_retry import MonitorUnavailable
 from coda_core.providers.partition_metrics import metadata, quote
 
 METRICS = ("IndexUsage", "DataUsage")
@@ -26,6 +27,10 @@ MAX_RECOVERY_READS = 8
 
 class IncompleteBatch(ValueError):
     """A requested unit could not be attributed safely. Never represent this as a measured zero."""
+
+
+class InvalidIndexingInventory(IncompleteBatch):
+    """An ambiguous ARM identity cannot establish even a configuration-only result."""
 
 
 @dataclass(frozen=True)
@@ -48,13 +53,18 @@ class Batch:
 
 def plan(inventory: Sequence[ContainerIndexing]) -> Iterator[Batch]:
     """Group in stable inventory order, bounding both cardinality and encoded filter size."""
+    return plan_names((u.database, u.container) for u in inventory)
+
+
+def plan_names(inventory: Iterable[tuple[str, str]]) -> Iterator[Batch]:
+    """Plan named logical containers without requiring an indexing policy for storage-only reads."""
     databases: dict[str, dict[str, None]] = defaultdict(dict)
-    for unit in inventory:
-        if any(not name or name == "*" for name in (unit.database, unit.container)):
-            raise ValueError("DX-024 requires explicit database and container names")
-        if unit.container in databases[unit.database]:
-            raise ValueError("Duplicate ARM container identity in DX-024 inventory")
-        databases[unit.database][unit.container] = None
+    for database, container in inventory:
+        if any(not name or name == "*" for name in (database, container)):
+            raise ValueError("Monitor requires explicit database and container names")
+        if container in databases[database]:
+            raise ValueError("Duplicate ARM container identity in Monitor inventory")
+        databases[database][container] = None
     for db, names in databases.items():
         group: tuple[str, ...] = ()
         for name in names:
@@ -80,9 +90,9 @@ class ProjectedReads(DataProvider):
         self.rid, self.window, self.db, self.cells = rid, window, db, cells
 
     @classmethod
-    def unavailable(cls, rid, window, database, containers, reason):
+    def unavailable(cls, rid, window, database, containers, reason, *, error_type=IncompleteBatch):
         """Carry missing evidence into the normal per-unit detector abstention path."""
-        return cls(rid, window, database, {(c, m): IncompleteBatch(reason) for c in containers for m in METRICS})
+        return cls(rid, window, database, {(c, m): error_type(reason) for c in containers for m in METRICS})
 
     def get_metric(self, resource_id, metric_name, window, *, aggregation="Average", dimension_filter=None):
         """Serve a scoped Maximum series or expose the specific missing/failed read."""
@@ -92,7 +102,7 @@ class ProjectedReads(DataProvider):
             raise ValueError("Query does not match the DX-024 projection")
         value = self.cells[(dims["CollectionName"], metric_name)]
         if isinstance(value, IncompleteBatch):
-            raise IncompleteBatch(str(value))
+            raise type(value)(str(value))
         return value
 
 
@@ -110,6 +120,7 @@ class IndexingReadPlan:
 
         def metric_status(response):
             # The installed 1.4.x public Metric model drops REST's per-metric errorCode on HTTP 200.
+            errors.clear()  # Only the final attempt describes the returned response.
             if response.http_response.status_code == 200:
                 for obj in json.loads(response.http_response.text()).get("value", []):
                     code = obj.get("errorCode")
@@ -130,7 +141,7 @@ class IndexingReadPlan:
             )
         except (HttpResponseError, ServiceRequestError, ServiceResponseError) as exc:
             code = getattr(exc, "status_code", None)
-            reason = f"Monitor read failed: {code or type(exc).__name__}"
+            reason = str(exc) if isinstance(exc, MonitorUnavailable) else f"Monitor read failed: {code or type(exc).__name__}"
             if code in {401, 403, 429}:
                 self.stop_reason = reason  # Do not amplify rejection or throttling into N requests.
             return unavailable(reason)

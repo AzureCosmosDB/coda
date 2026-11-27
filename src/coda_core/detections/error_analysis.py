@@ -28,7 +28,7 @@ aggregation=Count)`. Closes the `error_analysis` gap from the cosmic-kusto cover
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from coda_core.providers.base import TimeWindow
 
@@ -57,9 +57,10 @@ _ERROR_MEANINGS: dict[int, str] = {
 }
 
 
-def production_window() -> TimeWindow:
+def production_window(now: datetime | None = None) -> TimeWindow:
     """Errors are a current-state reliability signal — a 7-day, hourly window (mirrors DX-005)."""
-    return TimeWindow.trailing(timedelta(days=7), granularity=timedelta(hours=1))
+    end = now or datetime.now(timezone.utc)
+    return TimeWindow(end - timedelta(days=7), end, timedelta(hours=1))
 
 
 def _is_hard_error(code: int) -> bool:

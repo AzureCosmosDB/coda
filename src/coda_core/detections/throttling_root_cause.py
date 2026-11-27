@@ -23,7 +23,7 @@ Closes the `throttling_root_cause` gap from the cosmic-kusto coverage analysis
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from coda_core.providers.base import TimeWindow
 
@@ -53,9 +53,10 @@ _CATEGORY_GUIDANCE = {
 }
 
 
-def production_window() -> TimeWindow:
+def production_window(now: datetime | None = None) -> TimeWindow:
     """Throttling is a current-state signal — a 7-day, hourly window (mirrors DX-005)."""
-    return TimeWindow.trailing(timedelta(days=7), granularity=timedelta(hours=1))
+    end = now or datetime.now(timezone.utc)
+    return TimeWindow(end - timedelta(days=7), end, timedelta(hours=1))
 
 
 def _category_of(operation_type: str) -> str:
@@ -99,12 +100,16 @@ def detect_throttling_root_cause(
     total_throttled = int(total_throttled or 0)
     # Normalise the {operation_type: 429_count} map.
     ops: dict[str, int] = {}
+    invalid = False
     for k, v in (op_throttled_counts or {}).items():
         try:
             n = int(v or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            invalid = True
             continue
-        if n > 0 and k:
+        if n < 0 or isinstance(v, bool) or (isinstance(v, float) and n != v) or (n and not str(k or "").strip()):
+            invalid = True
+        elif n > 0:
             ops[str(k)] = n
     rate = (100.0 * total_throttled / total_requests) if total_requests else 0.0
 
@@ -137,6 +142,13 @@ def detect_throttling_root_cause(
         return verdict()
     if rate < THROTTLE_RATE_PCT:
         return verdict(root_cause="below_throttle_threshold")
+    attributed = sum(ops.values())
+    if invalid or (ops and attributed != total_throttled):
+        return verdict(root_cause="insufficient_data", category_share_pct={}, methodology={
+            **method, "attributed_throttled": attributed,
+            "abstained": "partial_operation_breakdown" if not invalid and attributed < total_throttled
+            else "inconsistent_operation_breakdown",
+        })
     if not ops:
         return verdict(root_cause="insufficient_data",
                        methodology={**method, "abstained": "missing_operation_breakdown"})

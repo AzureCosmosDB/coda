@@ -10,7 +10,7 @@ Ties the three scope layers together for one account:
 from __future__ import annotations
 
 import concurrent.futures
-from collections import Counter
+from collections import Counter, defaultdict
 import logging
 import os
 import threading
@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 
 from coda_core.detections import cross_partition_query as cpq
 from coda_core.detections import indexing_cost as indexing
+from coda_core.detections import partition_merge as pm
 from coda_core.detections import shared_throughput as sht
 from coda_core.detections import uncontrolled_ingestion as ui
 from coda_core.framework.cost_rate import (
@@ -65,10 +66,11 @@ from coda_core.pipeline.registry import (
 from coda_core.pipeline.report import DiagnosticReport, now_iso
 from coda_core.pipeline.rollup import aggregate, compute_scope_provisioned_ru, correlate
 from coda_core.providers.arm import ArmProvider, ResourceAge, account_config_from_arm
-from coda_core.providers.indexing_batch import ProjectedReads, plan as plan_indexing
+from coda_core.providers.indexing_batch import InvalidIndexingInventory, ProjectedReads, plan as plan_indexing
+from coda_core.providers.monitor_cohort import COHORT_SIZE
 from coda_core.providers.shared_offer import offer_request_counts
 from coda_core.providers.azure_monitor import AzureMonitorMetricsProvider
-from coda_core.providers.base import TimeWindow
+from coda_core.providers.base import MetricSeries, TimeWindow
 from coda_core.providers.cost_management import CostManagementProvider
 from coda_core.providers.log_analytics import (
     CachingLogAnalyticsProvider,
@@ -125,7 +127,9 @@ class _ThreadLocalUnitProviders:
         providers = getattr(self._local, "providers", None)
         if providers is None:
             providers = (
-                AzureMonitorMetricsProvider(self._metrics_credential),
+                AzureMonitorMetricsProvider(self._metrics_credential,
+                                            cooldown=getattr(self._base_metrics, "cooldown", None),
+                                            budget=getattr(self._base_metrics, "budget", None)),
                 ArmProvider(self._arm_credential, self._subscription_id),
                 self._la,
             )
@@ -170,6 +174,29 @@ def _ordered_parallel_map(items, worker, *, concurrency: int) -> list:
 def _kql_literal(value: str) -> str:
     """Quote a Cosmos name for KQL using the detectors' existing quote-stripping convention."""
     return "'" + value.replace("'", "") + "'"
+
+
+def _run_metric_groups(items, cohort_key, axes, worker, providers, concurrency):
+    """Process bounded, compatible ARM inventory groups; restore the original report ordering."""
+    grouped = defaultdict(list)
+    for i, item in enumerate(items):
+        grouped[cohort_key(item)].append((i, item))
+    stride = min(COHORT_SIZE, max(2, (len(items) + concurrency - 1) // concurrency))
+    tasks = [(key[0], entries[start:start + stride]) for key, entries in grouped.items()
+             for start in range(0, len(entries), stride)]
+
+    def run_group(_, task):
+        db, entries = task
+        names, owners = axes([unit for _, unit in entries])
+        provider, _, _ = providers.current()
+        view = provider.for_cohort(db, names, owners)
+        return [(i, worker(i, item, view)) for i, item in entries]
+
+    ordered = [None] * len(items)
+    for group in _ordered_parallel_map(tasks, run_group, concurrency=concurrency):
+        for i, result in group:
+            ordered[i] = result
+    return ordered
 
 
 def _container_predicate(units: list[tuple[str, str]]) -> str:
@@ -476,6 +503,8 @@ def _run_diagnostics(
     unit_concurrency: int | None, age_pool: concurrent.futures.ThreadPoolExecutor,
 ) -> DiagnosticReport:
     """Evaluate the report, overlapping optional resource-age reads with independent checks."""
+    if callable(getattr(type(metrics), "for_report", None)):
+        metrics = metrics.for_report()
     inventory = arm.inspect_offers(resource_group, account)
     offers = inventory.offers
     container_offers = [o for o in offers if o.level == "container"]
@@ -534,9 +563,11 @@ def _run_diagnostics(
     _prime_log_analytics_cache(la, account_resource_id, container_offers, database_offers, run_now, caps)
 
     findings = []
+    use_cohorts = callable(getattr(type(metrics), "for_cohort", None))
+    account_metrics = metrics.for_cohort("") if use_cohorts else metrics
     # Account-scoped detections (config/state) run once for the account.
     acct_ctx = AccountDetectionContext(
-        metrics=metrics, account=account, account_resource_id=account_resource_id,
+        metrics=account_metrics, account=account, account_resource_id=account_resource_id,
         config=account_config, mode=mode, eval_window=window, now=run_now,
         scope_provisioned_ru=scope_provisioned_ru, resource_group=resource_group, arm=arm,
         retail_prices=retail_prices, throughput_offers=tuple(offers), la=la,
@@ -577,11 +608,11 @@ def _run_diagnostics(
         serverless_containers = arm.list_containers(resource_group, account)
         serverless_units = len(serverless_containers)
 
-        def _run_serverless_unit(_idx: int, unit: tuple[str, str]) -> list:
+        def _run_serverless_unit(_idx: int, unit: tuple[str, str], projected=None) -> list:
             db_name, container_name = unit
             worker_metrics, _, worker_la = worker_providers.current()
             sls_ctx = ServerlessDetectionContext(
-                metrics=worker_metrics, account=account, account_resource_id=account_resource_id,
+                metrics=projected or worker_metrics, account=account, account_resource_id=account_resource_id,
                 database=db_name, container=container_name, mode=mode, eval_window=window,
                 now=run_now, la=worker_la,
             )
@@ -590,13 +621,22 @@ def _run_diagnostics(
                 unit_findings.append(run_serverless(sls_adapter, sls_ctx, caps))
             return unit_findings
 
-        for unit_findings in _ordered_parallel_map(
-            serverless_containers, _run_serverless_unit, concurrency=unit_concurrency
-        ):
+        if use_cohorts:
+            sls_results = _run_metric_groups(
+                serverless_containers, lambda u: (u[0],), lambda rows: ([u[1] for u in rows], []),
+                _run_serverless_unit, worker_providers, unit_concurrency)
+        else:
+            sls_results = _ordered_parallel_map(serverless_containers, _run_serverless_unit,
+                                                concurrency=unit_concurrency)
+        for unit_findings in sls_results:
             findings.extend(unit_findings)
 
-    def _run_container_unit(_idx: int, offer) -> list:
+    storage_peaks = {}
+
+    def _run_container_unit(_idx: int, offer, projected=None) -> list:
         worker_metrics, _, worker_la = worker_providers.current()
+        if projected is not None:
+            worker_metrics = projected
         key = (offer.database, offer.container)
         age = ages.get(key, ResourceAge())
         members = inventory.pools.get(offer.database) if offer.level == "database" else None
@@ -611,6 +651,7 @@ def _run_diagnostics(
             la=worker_la, effective_rate=effective_rate,
             dataplane_source=caps.dataplane_source,
             account_config=account_config,
+            storage_peak=storage_peaks.get(key),
         )
         unit_findings = []
         for adapter in REGISTRY:
@@ -630,22 +671,17 @@ def _run_diagnostics(
     # Shared-throughput DATABASE offers also run the metrics-based detectors at database scope
     # (DX-001/004/005/006/011 — idle/over/under-provisioning, hot partition; see _is_metrics_scoped).
     # They additionally run the LA-backed DX-003 in the database pass above.
-    metrics_offers = container_offers + database_offers
-    for unit_findings in _ordered_parallel_map(
-        metrics_offers, _run_container_unit, concurrency=unit_concurrency
-    ):
-        findings.extend(unit_findings)
-
     # All-container inventory pass (DX-024 indexing cost): every container regardless of throughput
     # model, enumerated once from ARM with its indexing policy. An enumeration failure degrades to one
     # account-level abstention per inventory detection rather than aborting the run.
+    inventory_tail = []
     if INVENTORY_REGISTRY:
         try:
             indexing_inventory = arm.list_container_indexing(resource_group, account)
         except Exception as exc:  # noqa: BLE001 - degrade gracefully; never abort the run
             indexing_inventory = []
             for inv_adapter in INVENTORY_REGISTRY:
-                findings.append(_error_finding(
+                inventory_tail.append(_error_finding(
                     inv_adapter.detection_id, inv_adapter.title, _account_unit(acct_ctx), exc,
                 ))
 
@@ -673,7 +709,8 @@ def _run_diagnostics(
                 else:
                     ordered[i] = _run_inventory_unit(i, c, ProjectedReads.unavailable(
                         account_resource_id, index_window, c.database, (c.container,),
-                        "Incomplete indexing inventory: invalid or duplicate container identity"))
+                        "Incomplete indexing inventory: invalid or duplicate container identity",
+                        error_type=InvalidIndexingInventory))
             for batch in plan_indexing(valid):
                 try:
                     projection = reader.project(batch)
@@ -684,12 +721,45 @@ def _run_diagnostics(
                 for name in batch.containers:
                     i, container = units[batch.database, name]
                     ordered[i] = _run_inventory_unit(i, container, projection)
+                    if use_cohorts and index_window == pm.recent_window(run_now):
+                        cell = projection.cells.get((name, "DataUsage"))
+                        if isinstance(cell, MetricSeries) and (values := cell.values()):
+                            storage_peaks[batch.database, name] = max(values)
             inventory_results = [ordered[i] for i in sorted(ordered)]
         else:
             inventory_results = _ordered_parallel_map(
                 indexing_inventory, _run_inventory_unit, concurrency=unit_concurrency)
         for unit_findings in inventory_results:
-            findings.extend(unit_findings)
+            inventory_tail.extend(unit_findings)
+
+    metrics_offers = container_offers + database_offers
+    if use_cohorts:
+        floors = sorted({a.minimum_age for a in REGISTRY if a.minimum_age})
+
+        def cohort_key(o):
+            """Never speculate across an age, mode, ownership or missing-evidence boundary."""
+            age = ages.get((o.database, o.container), ResourceAge())
+            since = age.created or age.existed_by
+            anchor = run_now.replace(minute=0, second=0, microsecond=0)
+            # Both anchors matter at a floor boundary (closed-hour and present-tense checks).
+            bands = () if mode == MODE_EVAL else tuple(
+                bool(since and t - since >= floor) for t in (anchor, run_now) for floor in floors)
+            return o.database, o.mode, o.level, bands
+
+        def axes(rows):
+            first = rows[0]
+            if first.container is None:
+                pool = inventory.pools.get(first.database)
+                return (pool.shared if pool and not pool.unresolved else ()), ()
+            return [o.container for o in rows], [o.owner_rid for o in rows if o.owner_rid]
+
+        offer_results = _run_metric_groups(metrics_offers, cohort_key, axes, _run_container_unit,
+                                           worker_providers, unit_concurrency)
+    else:
+        offer_results = _ordered_parallel_map(metrics_offers, _run_container_unit, concurrency=unit_concurrency)
+    for unit_findings in offer_results:
+        findings.extend(unit_findings)
+    findings.extend(inventory_tail)
 
     findings = correlate(findings)
     # Honesty policy (single source of truth): stamp each finding's threshold_status by whether the

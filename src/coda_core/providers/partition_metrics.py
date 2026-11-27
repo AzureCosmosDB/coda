@@ -13,6 +13,7 @@ from azure.core.exceptions import HttpResponseError, ServiceRequestError, Servic
 from azure.monitor.query import MetricAggregationType
 
 from .base import MetricPoint, MetricSeries, TimeWindow
+from .monitor_retry import MonitorUnavailable
 
 SERIES_LIMIT = 1000
 TARGETED_LIMIT = 4
@@ -232,6 +233,8 @@ class PartitionReader:
 
 def _read_error(stage, exc):
     """Keep an unavailable read distinct from an empty successful response in report evidence."""
+    if isinstance(exc, MonitorUnavailable):
+        return f"{stage}_read_error:{exc}"
     return f"{stage}_read_error:{getattr(exc, 'status_code', None) or type(exc).__name__}"
 
 
