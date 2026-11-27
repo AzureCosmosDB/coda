@@ -10,6 +10,7 @@ from azure.core.exceptions import AzureError
 
 from .arm import PoolMembers
 from .base import DataProvider, MetricPoint, MetricSeries, TimeWindow
+from .monitor_retry import MonitorUnavailable
 
 
 class IncompletePool(ValueError):
@@ -62,8 +63,9 @@ def traffic_metric(metrics, rid: str, metric: str, window: TimeWindow, *, databa
             series = metrics.get_metric(rid, metric, window, aggregation=aggregation,
                                         dimension_filter={**scope, "CollectionName": name})
         except AzureError as exc:
+            detail = str(exc) if isinstance(exc, MonitorUnavailable) else type(exc).__name__
             raise IncompletePool(f"{metric} read failed for shared member {name}: "
-                                 f"{type(exc).__name__}") from exc
+                                 f"{detail}") from exc
         values = {p.timestamp: p.value for p in series.points if p.value is not None}
         if not values:
             raise MissingMemberSamples(f"No usable {metric} samples for shared member {name}")

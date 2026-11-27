@@ -45,6 +45,7 @@ class DetectionContext:
     age_read_error: str | None = None
     pool_members: PoolMembers | None = None
     read_counts: RequestCounts | None = None
+    storage_peak: float | None = None  # DX-024's full-series peak only when DX-009's window matches.
 
     def window_for(self, production_window: TimeWindow) -> TimeWindow:
         """Pick the detection's production window, or the shared eval window in eval mode."""

@@ -7,6 +7,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.17.18] - Unreleased
+
+### Changed
+
+- Reduce duplicate Azure Monitor reads across compatible containers and detectors. When
+  Azure Monitor throttles collection, workers honor its retry delay together and retry the
+  same request within a bounded wait. Missing evidence stays visible.
+- Report partial or inconsistent throttling-by-operation counts without guessing a dominant
+  operation. Preserve a verified disabled indexing policy when storage reads fail, and avoid
+  the default ten-series cutoff for backup storage estimates.
+
+### Preview status
+
+- No new permissions or installation changes. These changes do not guarantee latency
+  or quota behavior on a large customer account.
+
 ## [0.17.17] - Unreleased
 
 ### Fixed

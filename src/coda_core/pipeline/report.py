@@ -77,7 +77,7 @@ def _humanize_abstain(summary: str) -> str:
     """Turn an internal abstention reason into one plain phrase (no detector tokens leak out)."""
     text = summary.replace("Insufficient data:", "").strip()
     normalized = text.lower()
-    if normalized.startswith(("incomplete partition coverage:", "indexing metrics incomplete:")) or (
+    if normalized.startswith(("incomplete partition coverage:", "indexing metrics incomplete:", "azure monitor ")) or (
         "requests returned http 429" in normalized
     ):
         return text

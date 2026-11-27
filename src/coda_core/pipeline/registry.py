@@ -75,6 +75,7 @@ from coda_core.pipeline.finding import (
 )
 from coda_core.providers.arm import ThroughputOffer
 from coda_core.providers.indexing_batch import IncompleteBatch
+from coda_core.providers.monitor_retry import MonitorUnavailable
 from coda_core.providers.base import TimeWindow
 from coda_core.providers.shared_offer import IncompletePool
 from coda_core.providers.retail_prices import (
@@ -333,6 +334,10 @@ def _error_finding(detection_id: str, title: str, unit: UnitRef, exc: Exception)
     The error is captured in evidence for diagnosis; it is *not* flagged ``la_unavailable`` (so it
     doesn't wrongly trip the report's "enable Log Analytics" guardrail).
     """
+    if isinstance(exc, MonitorUnavailable):
+        return Finding(detection_id, title, unit, STATUS_ABSTAINED, "none", str(exc), "", None,
+                       THRESHOLD_VALIDATED, evidence={"abstained": "monitor_unavailable",
+                       "http_status": exc.status_code, "retry_after_seconds": exc.retry_after_seconds})
     return Finding(
         detection_id=detection_id, title=title, unit=unit, status=STATUS_ABSTAINED, severity="none",
         summary=f"Insufficient data: detection error ({type(exc).__name__})",
@@ -602,7 +607,7 @@ def _run_dx001(ctx: DetectionContext) -> Finding:
     o = ctx.offer
     v = op.detect_over_provisioning(
         ctx.metrics, ctx.account_resource_id, o.database, o.container, o.provisioned_ru,
-        ctx.window_for(op.production_window()),
+        ctx.window_for(op.production_window(ctx.now)),
         scope_provisioned_ru=ctx.scope_provisioned_ru, resource_created_at=ctx.created_at(),
         owner_rid=o.owner_rid,
     )
@@ -639,7 +644,7 @@ def _run_dx004(ctx: DetectionContext) -> Finding:
     o = ctx.offer
     v = idle.detect_idle(
         ctx.metrics, ctx.account_resource_id, o.database, o.container, o,
-        ctx.window_for(idle.production_window()),
+        ctx.window_for(idle.production_window(ctx.now)),
         scope_provisioned_ru=ctx.scope_provisioned_ru, resource_created_at=ctx.created_at(),
         pool_members=ctx.pool_members,
     )
@@ -677,7 +682,10 @@ def _partition_abstention(methodology: dict) -> str:
         f"{r['region']}: {r['usable']} usable, expected "
         f"{r['expected'] if r['expected'] is not None else 'unknown'}"
         for r in methodology["partition_coverage"])
-    return "Incomplete partition coverage: " + (regions or "no configured regions available")
+    summary = "Incomplete partition coverage: " + (regions or "no configured regions available")
+    read_limits = sorted({issue.split(":", 1)[1] for row in methodology["partition_coverage"]
+                          for issue in row["issues"] if "_read_error:Azure Monitor " in issue})
+    return "; ".join([summary, *read_limits])
 
 
 def _run_dx005(ctx: DetectionContext) -> Finding:
@@ -804,7 +812,7 @@ def _run_dx011(ctx: DetectionContext) -> Finding:
     o = ctx.offer
     v = asig.detect_autoscale_max_over_provisioned(
         ctx.metrics, ctx.account_resource_id, o.database, o.container, o.provisioned_ru,
-        ctx.window_for(op.production_window()),
+        ctx.window_for(op.production_window(ctx.now)),
         scope_provisioned_ru=ctx.scope_provisioned_ru, resource_created_at=ctx.created_at(),
         pool_members=ctx.pool_members,
     )
@@ -856,7 +864,7 @@ def _run_dx013(ctx: DetectionContext) -> Finding:
     o = ctx.offer
     v = ms.detect_autoscale_to_manual(
         ctx.metrics, ctx.account_resource_id, o.database, o.container, o.provisioned_ru,
-        ctx.window_for(op.production_window()), resource_created_at=ctx.created_at(),
+        ctx.window_for(op.production_window(ctx.now)), resource_created_at=ctx.created_at(),
     )
     if v.root_cause == "insufficient_data":
         status, summary = STATUS_ABSTAINED, f"Insufficient data: {v.methodology.get('abstained', '')}"
@@ -880,7 +888,7 @@ def _run_dx012(ctx: DetectionContext) -> Finding:
     o = ctx.offer
     v = ms.detect_manual_to_autoscale(
         ctx.metrics, ctx.account_resource_id, o.database, o.container, o.provisioned_ru,
-        ctx.window_for(op.production_window()), resource_created_at=ctx.created_at(),
+        ctx.window_for(op.production_window(ctx.now)), resource_created_at=ctx.created_at(),
     )
     if v.root_cause == "insufficient_data":
         status, summary = STATUS_ABSTAINED, f"Insufficient data: {v.methodology.get('abstained', '')}"
@@ -906,7 +914,7 @@ def _run_dx009(ctx: DetectionContext) -> Finding:
     # (partition count is slow-moving state) regardless of the run mode.
     v = pm.detect_partition_merge(
         ctx.metrics, ctx.account_resource_id, o.database, o.container, o.provisioned_ru,
-        pm.recent_window(),
+        pm.recent_window(ctx.now), storage_peak=ctx.storage_peak,
         account_config=ctx.account_config,
     )
     if v.root_cause == "insufficient_data":
@@ -940,7 +948,7 @@ def _run_dx017(ctx: DetectionContext) -> Finding:
     o = ctx.offer
     v = sg.detect_storage_growth(
         ctx.metrics, ctx.account_resource_id, o.database, o.container,
-        ctx.window_for(sg.production_window()),
+        ctx.window_for(sg.production_window(ctx.now)),
     )
     if v.root_cause == "insufficient_data":
         status, summary = STATUS_ABSTAINED, "Insufficient data: no per-partition storage telemetry"
@@ -1168,6 +1176,7 @@ def _dx019_savings_fields(ctx: AccountDetectionContext) -> dict:
         ctx.account_resource_id,
         metric_window,
         reference_region=reference_region,
+        expected_containers=expected,
     )
     snapshot = select_complete_storage_snapshot(
         samples,
@@ -1268,7 +1277,7 @@ def _run_dx019(ctx: AccountDetectionContext) -> Finding:
 
 def _run_dx020(ctx: AccountDetectionContext) -> Finding:
     """Translate unchanged status-only detection into conditional investigation guidance."""
-    window = ctx.window_for(ea.production_window())
+    window = ctx.window_for(ea.production_window(ctx.now))
     series = ctx.metrics.get_metric_split(
         ctx.account_resource_id, "TotalRequests", window,
         split_dimension="StatusCode", aggregation="Count",
@@ -1306,7 +1315,7 @@ def _observed_429s(throttled: float, total: float) -> str:
 
 
 def _run_dx021(ctx: AccountDetectionContext) -> Finding:
-    window = ctx.window_for(trc.production_window())
+    window = ctx.window_for(trc.production_window(ctx.now))
     by_code = ctx.metrics.get_metric_split(
         ctx.account_resource_id, "TotalRequests", window,
         split_dimension="StatusCode", aggregation="Count",
@@ -1318,6 +1327,7 @@ def _run_dx021(ctx: AccountDetectionContext) -> Finding:
     # not discard successful status counts or turn a measured negative into an abstention.
     v = trc.detect_throttling_root_cause(total_requests, total_throttled, {})
     operation_error = None
+    operation_limit = None
     if v.root_cause == "insufficient_data":
         try:
             by_op = ctx.metrics.get_metric_split(
@@ -1326,9 +1336,11 @@ def _run_dx021(ctx: AccountDetectionContext) -> Finding:
             )
         except (AzureError, ValueError) as exc:
             operation_error = type(exc).__name__
+            if isinstance(exc, MonitorUnavailable):
+                operation_limit = exc
         else:
             v = trc.detect_throttling_root_cause(total_requests, total_throttled,
-                                                 {op: int(sum(s.values())) for op, s in by_op.items()})
+                                                 {op: sum(s.values()) for op, s in by_op.items()})
     evidence = {**v.methodology, "root_cause": v.root_cause, "observed_throttling": bool(total_throttled)}
     observed = _observed_429s(total_throttled, total_requests)
     if v.root_cause == "too_few_requests":
@@ -1338,9 +1350,16 @@ def _run_dx021(ctx: AccountDetectionContext) -> Finding:
     elif v.root_cause == "insufficient_data":
         status = STATUS_ABSTAINED
         detail = "the operation breakdown contained no usable counts"
+        if "attributed_throttled" in evidence:
+            detail = (f"the operation breakdown did not reconcile "
+                      f"({evidence['attributed_throttled']:,} attributed vs {total_throttled:,} status-code 429s)")
         if operation_error:
             detail = "the operation breakdown could not be read"
             evidence.update(abstained="operation_breakdown_read_error", operation_error=operation_error)
+            if operation_limit is not None:
+                detail += f": {operation_limit}"
+                evidence.update(http_status=operation_limit.status_code,
+                                retry_after_seconds=operation_limit.retry_after_seconds)
         summary = f"{observed}; cannot determine which operations were throttled because {detail}"
     elif v.is_finding:
         status = STATUS_FINDING
@@ -1504,7 +1523,7 @@ def _run_dx007_serverless(ctx: ServerlessDetectionContext) -> Finding:
 def _run_dx018(ctx: ServerlessDetectionContext) -> Finding:
     v = svt.detect_serverless_throttling(
         ctx.metrics, ctx.account_resource_id, ctx.database, ctx.container,
-        ctx.window_for(svt.production_window()),
+        ctx.window_for(svt.production_window(ctx.now)),
     )
     if v.root_cause == "insufficient_data":
         status = STATUS_ABSTAINED
