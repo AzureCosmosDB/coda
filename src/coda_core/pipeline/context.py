@@ -13,9 +13,12 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from coda_core.framework.cost_rate import EffectiveRate
+from coda_core.detections.logical_partition_storage import LogicalStorage
 from coda_core.providers.arm import AccountConfig, ArmProvider, ContainerIndexing, PoolMembers, ThroughputOffer
 from coda_core.providers.azure_monitor import AzureMonitorMetricsProvider
 from coda_core.providers.base import DataProvider, TimeWindow
+from coda_core.providers.cost_management import CostManagementProvider
+from coda_core.providers.diagnostic_settings import FanoutLogHistory
 from coda_core.providers.log_analytics import DataPlaneSource, LogAnalyticsProvider
 from coda_core.providers.retail_prices import RetailPricesProvider
 from coda_core.providers.shared_offer import RequestCounts
@@ -46,6 +49,8 @@ class DetectionContext:
     pool_members: PoolMembers | None = None
     read_counts: RequestCounts | None = None
     storage_peak: float | None = None  # DX-024's full-series peak only when DX-009's window matches.
+    fanout_log_history: FanoutLogHistory | None = None
+    logical_storage: LogicalStorage | None = None
 
     def window_for(self, production_window: TimeWindow) -> TimeWindow:
         """Pick the detection's production window, or the shared eval window in eval mode."""
@@ -101,6 +106,7 @@ class AccountDetectionContext:
     dataplane_source: DataPlaneSource | None = DataPlaneSource.RAW
     dataplane_error: str | None = None
     inventory_issues: tuple[str, ...] = ()
+    cost: CostManagementProvider | None = None  # DX-014 reads equal-period daily charges only after preflight.
 
     def window_for(self, production_window: TimeWindow) -> TimeWindow:
         """Pick the detection's production window, or the shared eval window in eval mode."""
@@ -148,6 +154,9 @@ class ServerlessDetectionContext:
     eval_window: TimeWindow
     now: datetime
     la: LogAnalyticsProvider | None = None  # Log Analytics for LA-backed serverless detections (DX-002)
+    resource_created_at: datetime | None = None
+    resource_existed_by: datetime | None = None
+    fanout_log_history: FanoutLogHistory | None = None
 
     def window_for(self, production_window: TimeWindow) -> TimeWindow:
         return self.eval_window if self.mode == MODE_EVAL else production_window

@@ -15,14 +15,14 @@ severity. Methodology and thresholds: ADR-0011. Quantities are **capacity (RU/s)
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 
+from coda_core.detections.throughput_history import HOUR, MONTH, WEEK, throughput_history
 from coda_core.framework.materiality import MaterialityConfig
 from coda_core.framework.materiality import severity as materiality_severity
 from coda_core.providers.base import DataProvider, MetricSeries, TimeWindow
 from coda_core.providers.shared_offer import owner_scope
-from coda_core.sufficiency import DataRequirement, evaluate_age, evaluate_series
 
 # Autoscale's configurable maximum baseline, not its scaled/billed idle floor (ADR-0016).
 AUTOSCALE_MIN_MAX_RU = 1000
@@ -137,8 +137,8 @@ class OverProvisioningVerdict:
     trigger_statistic: str
     trigger_pct: float
     provisioned_ru: float
-    recommended_ru: float
-    wasted_ru: float
+    recommended_ru: float | None
+    wasted_ru: float | None
     severity: str  # high | medium | low | none
     materiality_pct: float | None  # wasted RU/s as % of scope provisioned RU/s
     methodology: dict = field(default_factory=dict)
@@ -155,8 +155,8 @@ def _abstain_verdict(provisioned_ru: float, *, reason: str, detail: str = "") ->
         trigger_statistic="",
         trigger_pct=0.0,
         provisioned_ru=provisioned_ru,
-        recommended_ru=provisioned_ru,
-        wasted_ru=0.0,
+        recommended_ru=None,
+        wasted_ru=None,
         severity="none",
         materiality_pct=None,
         methodology={"abstained": reason, "detail": detail},
@@ -192,9 +192,7 @@ def classify(
     """
     cfg = config or OverProvisioningConfig()
 
-    # Defensive: can't compute a verdict from zero samples. Primary data-sufficiency (span +
-    # min-points over the window) is checked in detect_over_provisioning via the shared
-    # evaluator (ADR-0008).
+    # Pure band/target arithmetic. assess_sizing separately verifies history before releasing it.
     if stats.sample_count == 0:
         return _abstain_verdict(provisioned_ru, reason="no_samples")
 
@@ -280,17 +278,40 @@ def classify(
     )
 
 
-# DX-001 §B4: over-provisioning needs ~30 days of history to capture monthly cycles; below a
-# 7-day confidence floor we abstain (ADR-0008). PT1H granularity suits a 30-day window.
-DATA_REQUIREMENT = DataRequirement(window_floor=timedelta(days=7), min_points=24)
 PRODUCTION_WINDOW_DAYS = 30
-PRODUCTION_GRANULARITY = timedelta(hours=1)
+PRODUCTION_GRANULARITY = HOUR
 
 
 def production_window(now: datetime | None = None) -> TimeWindow:
-    """The production DX-001 window: 30 days ending now, hourly buckets (DX-001 §B4)."""
-    anchor = now or datetime.now(timezone.utc)
+    """Anchor a month of UTC hours at the end of the last completed hour."""
+    anchor = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
     return TimeWindow(anchor - timedelta(days=PRODUCTION_WINDOW_DAYS), anchor, PRODUCTION_GRANULARITY)
+
+
+def assess_sizing(series: MetricSeries, window: TimeWindow, provisioned_ru: float, *,
+                  config: OverProvisioningConfig | None, scope_provisioned_ru: float | None,
+                  resource_created_at: datetime | None, resource_existed_by: datetime | None = None,
+                  autoscale_billing: bool = False) -> OverProvisioningVerdict:
+    """Report low usage immediately but release numerical sizing only on a complete recent month."""
+    history = throughput_history(series, window, resource_created_at, existed_by=resource_existed_by,
+                                 exclude_unverified_zero_padding=not autoscale_billing)
+    if not history.evaluated.points:
+        detail = ("No complete scaled-throughput totals with matching partition counts." if autoscale_billing
+                  else "No usable manual utilization measurements.")
+        return _abstain_verdict(provisioned_ru, reason="no_data", detail=detail)
+    stats = utilization_stats(history.evaluated)
+    v = classify(stats, provisioned_ru, config=config, scope_provisioned_ru=scope_provisioned_ru,
+                 autoscale_billing=autoscale_billing)
+    evidence = {**history.evidence(), "peak_pct": stats.max}
+    if autoscale_billing:
+        evidence["peak_scaled_ru"] = stats.max / 100 * provisioned_ru
+    if history.consecutive == MONTH:
+        return replace(v, methodology={**v.methodology, **evidence,
+                                       "advice_stage": "recommendation" if v.is_over_provisioned else "no_change"})
+    review = history.consecutive >= WEEK and v.is_over_provisioned and v.wasted_ru > 0
+    return replace(v, is_over_provisioned=False, severity="none", materiality_pct=None,
+                   recommended_ru=None, wasted_ru=None,
+                   methodology={**evidence, "advice_stage": "review" if review else "observation"})
 
 
 def detect_over_provisioning(
@@ -304,6 +325,7 @@ def detect_over_provisioning(
     config: OverProvisioningConfig | None = None,
     scope_provisioned_ru: float | None = None,
     resource_created_at: datetime | None = None,
+    resource_existed_by: datetime | None = None,
     owner_rid: str | None = None,
 ) -> OverProvisioningVerdict:
     """End-to-end DX-001 detection for one container offer.
@@ -317,11 +339,6 @@ def detect_over_provisioning(
     value is an internal burst ceiling, not what the customer set (DX-001 §B2). No telemetry
     in-window yields an ``insufficient_data`` abstention (confirming idle is DX-004's job).
     """
-    if resource_created_at is not None:
-        age_insuff = evaluate_age(resource_created_at, window.end, DATA_REQUIREMENT.window_floor)
-        if age_insuff is not None:
-            return _abstain_verdict(provisioned_ru, reason=age_insuff.reason, detail=age_insuff.detail)
-
     series = provider.get_metric(
         account_resource_id,
         "NormalizedRUConsumption",
@@ -329,11 +346,5 @@ def detect_over_provisioning(
         aggregation="Maximum",
         dimension_filter=owner_scope(database, container, owner_rid),
     )
-    insufficiency = evaluate_series(series, DATA_REQUIREMENT)
-    if insufficiency is not None:
-        return _abstain_verdict(provisioned_ru, reason=insufficiency.reason, detail=insufficiency.detail)
-
-    stats = utilization_stats(series)
-    return classify(
-        stats, provisioned_ru, config=config, scope_provisioned_ru=scope_provisioned_ru,
-    )
+    return assess_sizing(series, window, provisioned_ru, config=config, scope_provisioned_ru=scope_provisioned_ru,
+                         resource_created_at=resource_created_at, resource_existed_by=resource_existed_by)

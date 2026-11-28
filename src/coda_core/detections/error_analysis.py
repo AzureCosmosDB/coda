@@ -1,179 +1,45 @@
-"""DX-020: Error-code analysis (non-throttling hard errors).
-
-Throttling (HTTP 429) is its own story — DX-005 (provisioned) and DX-018 (serverless) own it. But a
-Cosmos account can also return a material share of **non-429** errors. These warrant investigation
-of application / SDK / configuration or service-side issues; status counts alone do not prove the
-cause, and adding RU/s is not a general remedy:
-
-* **400 Bad Request** — malformed requests or invalid queries (an app/SDK bug).
-* **404 Not Found** — missing resources/items or incorrect id/partition-key context; missing-item
-  lookups can be expected, and counts cannot establish a read-before-create sequence.
-* **409 Conflict** — creating items with an id that already exists.
-* **412 Precondition Failed** — an ETag/precondition may have rejected a write as intended; this
-  is not proof of a hot item or missing concurrency control.
-* **408 / 449** — request timeout / "retry with" concurrency retry.
-* **5xx** — service-side errors.
-
-This detection reads **Azure Monitor Metrics only** (`TotalRequests` split by `StatusCode`, Count) —
-no Log Analytics required — so it runs immediately. It is **advisory** (ADR-0012): it surfaces the
-error mix and offers conditional, status-specific investigation, not request-sequence detection.
-It asserts no dollar or RU/s figure. Read-only /
-diagnose-only. Thresholds are **proposals** (registry `threshold_status`) pending fleet grounding.
-
-Data source: `AzureMonitorMetricsProvider.get_metric_split(TotalRequests, split_dimension=StatusCode,
-aggregation=Count)`. Closes the `error_analysis` gap from the cosmic-kusto coverage analysis
-(`docs/planning/active/cosmic-kusto-gap-buildability.md`).
-"""
+"""DX-020: show server response counts by status; grade only same-hour 5xx service responses."""
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta, timezone
-
+from coda_core.detections import request_intervals as hours
+from coda_core.detections.request_intervals import production_window as production_window
 from coda_core.providers.base import TimeWindow
 
-# --- Proposed thresholds (honest by default: registry marks DX-020 `proposal`) ---------
-# Minimum request volume below which an error *rate* is too noisy to judge (mirrors DX-005).
 MIN_TOTAL_REQUESTS = 1000
-# Fire when the non-429 hard-error share of all requests reaches this floor.
 HARD_ERROR_RATE_PCT = 1.0
-# Severity cutoffs on the hard-error rate (proposed; parallels the DX-005 reliability model).
-SEVERITY_HIGH_PCT = 10.0
 SEVERITY_MEDIUM_PCT = 5.0
-
-# HTTP status → short, human-readable meaning + tailored guidance. Only non-429 client/server errors.
-_ERROR_MEANINGS: dict[int, str] = {
-    400: "Bad Request — malformed requests or invalid queries (application/SDK issue)",
-    401: "Unauthorized — authentication failures",
-    403: "Forbidden — authorization/RBAC or firewall failures",
-    404: "Not Found — missing resources/items or incorrect id/partition-key context (may be expected)",
-    408: "Request Timeout",
-    409: "Conflict — creating an item with an id that already exists",
-    412: "Precondition Failed — ETag/precondition rejected (may be expected protection)",
-    413: "Request Entity Too Large — payload exceeds limits",
-    449: "Retry With — transient concurrency retry",
-    500: "Internal Server Error — service-side",
-    503: "Service Unavailable — service-side or connectivity",
-}
+SEVERITY_HIGH_PCT = 10.0
 
 
-def production_window(now: datetime | None = None) -> TimeWindow:
-    """Errors are a current-state reliability signal — a 7-day, hourly window (mirrors DX-005)."""
-    end = now or datetime.now(timezone.utc)
-    return TimeWindow(end - timedelta(days=7), end, timedelta(hours=1))
-
-
-def _is_hard_error(code: int) -> bool:
-    """A non-429 client/server error (429 throttling is DX-005/DX-018's domain; 2xx/3xx are fine)."""
-    return code != 429 and code >= 400
-
-
-@dataclass(frozen=True)
-class ErrorAnalysisVerdict:
-    is_finding: bool
-    # has_errors | too_few_requests | clean
-    root_cause: str
-    severity: str  # high | medium | low | none
-    total_requests: int
-    hard_error_requests: int
-    hard_error_rate_pct: float
-    dominant_code: int | None
-    dominant_rate_pct: float
-    category_rates_pct: dict[str, float]  # e.g. {"400": 4.6, "404": 0.2}
-    recommended_action: str
-    methodology: dict = field(default_factory=dict)
-
-    def as_dict(self) -> dict:
-        return asdict(self)
-
-
-def _parse_counts(counts: dict) -> dict[int, int]:
-    """Normalise a {status_code_str: count} map to {int_code: int_count}, dropping junk keys."""
-    out: dict[int, int] = {}
-    for k, v in (counts or {}).items():
-        try:
-            code = int(str(k).strip())
-            n = int(v or 0)
-        except (TypeError, ValueError):
-            continue
-        if n > 0:
-            out[code] = out.get(code, 0) + n
-    return out
-
-
-def detect_error_patterns(status_code_counts: dict) -> ErrorAnalysisVerdict:
-    """Classify an account's non-429 error mix (pure; status-code counts in, verdict out)."""
-    counts = _parse_counts(status_code_counts)
+def detect_error_patterns(counts: dict[str, int], *, completed: bool) -> dict:
+    """Keep 4xx descriptive and 429 denominator-only; do not infer client failures or a cause."""
+    if any(not str(code).isascii() or not str(code).isdigit() or
+           not 100 <= int(code) <= 599 for code in counts):
+        raise ValueError("Unrecognized HTTP status in TotalRequests")
     total = sum(counts.values())
+    errors = {str(c): n for c, n in sorted(counts.items()) if int(c) >= 400 and int(c) != 429 and n}
+    service = sum(n for c, n in errors.items() if int(c) >= 500)
+    rate = 100 * service / total if total else 0
+    severity = "none"
+    if completed and total >= MIN_TOTAL_REQUESTS and rate >= HARD_ERROR_RATE_PCT:
+        severity = "high" if rate >= SEVERITY_HIGH_PCT else "medium" if rate >= SEVERITY_MEDIUM_PCT else "low"
+    return {"total_requests": total, "status_code_counts": errors,
+            "status_rates_pct": {c: 100 * n / total for c, n in errors.items()},
+            "service_error_requests": service, "service_error_rate_pct": rate, "severity": severity}
 
-    hard = {c: n for c, n in counts.items() if _is_hard_error(c)}
-    hard_total = sum(hard.values())
-    rate = (100.0 * hard_total / total) if total else 0.0
-    category_rates = {str(c): round(100.0 * n / total, 2) for c, n in sorted(hard.items()) if total}
-    method = {
-        "total_requests": total,
-        "hard_error_requests": hard_total,
-        "min_total_requests": MIN_TOTAL_REQUESTS,
-        "hard_error_rate_pct_threshold": HARD_ERROR_RATE_PCT,
-        "status_code_counts": {str(c): n for c, n in sorted(counts.items())},
-    }
 
-    def verdict(**kw) -> ErrorAnalysisVerdict:
-        base = dict(
-            is_finding=False, root_cause="clean", severity="none", total_requests=total,
-            hard_error_requests=hard_total, hard_error_rate_pct=round(rate, 2),
-            dominant_code=None, dominant_rate_pct=0.0, category_rates_pct=category_rates,
-            recommended_action="", methodology=method,
-        )
-        base.update(kw)
-        return ErrorAnalysisVerdict(**base)
-
-    if total < MIN_TOTAL_REQUESTS:
-        return verdict(root_cause="too_few_requests")
-    if hard_total == 0 or rate < HARD_ERROR_RATE_PCT:
-        return verdict(root_cause="clean")
-
-    dominant_code = max(hard, key=hard.get)
-    dominant_rate = 100.0 * hard[dominant_code] / total
-    severity = ("high" if rate >= SEVERITY_HIGH_PCT
-                else "medium" if rate >= SEVERITY_MEDIUM_PCT else "low")
-    dom_meaning = _ERROR_MEANINGS.get(dominant_code, f"HTTP {dominant_code}")
-    guidance_limits = (
-        "Conditional investigation only: status counts alone cannot identify the operation or item, "
-        "or establish a read-404-then-insert sequence."
-    )
-    method.update(dominant_code=dominant_code, guidance=guidance_limits)
-    if dominant_code in (404, 409):
-        guidance = (
-            "Check expected missing-item lookups and the correct id and partition-key context. "
-            "Only if application code or traces confirm existence-check-before-create, evaluate "
-            "SDK-appropriate atomic create and handle 409 according to the intended conflict "
-            "semantics. Unconditional upsert is not equivalent to create-if-absent: it can "
-            "overwrite existing data. A 404 does not supply the missing item's ETag. "
-            "The Agent Kit conditional-create example is Java-specific; .NET ignores "
-            "IfNoneMatchEtag for writes, so it is not universal create protection."
-        )
-    elif dominant_code == 412:
-        guidance = (
-            "Inspect the actual operation and ETag/precondition handling. A 412 can be expected "
-            "protection working, not proof of missing concurrency control or a hot item. "
-            "For a confirmed read-modify-write path, re-read current state and its ETag, reapply "
-            "the intended update, and retry with bounded attempts; surface unresolved conflicts "
-            "rather than dropping the precondition or blindly retrying stale state."
-        )
-    else:
-        guidance = (
-            "Review request formation, access patterns, authentication/configuration, diagnostics "
-            "and service health for the actual status and context. 5xx can be service-side; "
-            "increasing RU/s is not a general remedy for non-429 failures."
-        )
-    action = (
-        f"{rate:.1f}% of requests returned non-throttling errors over the window "
-        f"(dominated by HTTP {dominant_code} at {dominant_rate:.1f}% — {dom_meaning}). "
-        f"{guidance_limits} {guidance}"
-    )
-    return verdict(
-        is_finding=True, root_cause="has_errors", severity=severity,
-        dominant_code=dominant_code, dominant_rate_pct=round(dominant_rate, 2),
-        recommended_action=action,
-    )
+def observe(metrics, resource_id: str, window: TimeWindow) -> dict:
+    """Read account-only StatusCode counts once, retaining observations from every affected interval."""
+    window = hours.hourly_window(window)
+    by_code = metrics.get_metric_split(resource_id, "TotalRequests", window,
+                                       split_dimension="StatusCode", aggregation="Count")
+    by_hour = hours.split_hours(by_code, window)
+    affected = []
+    for stamp, counts in by_hour.items():
+        bounds = hours.interval(stamp, window)
+        row = detect_error_patterns(counts, completed=bounds["completed_hour"])
+        if row["status_code_counts"]:
+            affected.append({**bounds, **row})
+    return {"affected_intervals": affected, "measured_intervals": len(by_hour),
+            "min_total_requests": MIN_TOTAL_REQUESTS, "service_error_rate_pct_threshold": HARD_ERROR_RATE_PCT}

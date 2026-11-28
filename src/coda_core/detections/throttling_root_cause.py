@@ -1,170 +1,64 @@
-"""DX-021: Throttling root-cause decomposition (which operations are being throttled).
-
-DX-005 (provisioned) and DX-018 (serverless) answer *"is this account/container throttling?"*. DX-021
-adds the **root cause**: of the 429s an account is taking, **which operation category** dominates —
-because the fix differs completely by category:
-
-* **writes** (Create/Upsert/Replace/Delete/Patch/Batch) — bulk/batch ingestion outrunning capacity;
-  fix with the bulk executor / client-side throughput control / spreading the load (see DX-010).
-* **reads** (Read) — point reads throttling usually means a hot partition (DX-006) or genuine
-  under-provisioning (DX-005), not the read path itself.
-* **queries** (Query/QueryPlan) — expensive or cross-partition fan-out (DX-002 / DX-007); add a
-  partition-key filter or an index rather than only adding RU/s.
-
-This reads **Azure Monitor Metrics only** (`TotalRequests` split by `StatusCode` and by `OperationType`
-filtered to `StatusCode=429`) — no Log Analytics. It is **advisory** (ADR-0012): it points at the
-throttled operation category; app-level attribution (per client `UserAgent`) is a Log-Analytics
-enrichment tracked separately. Read-only. Thresholds are **proposals** (registry `threshold_status`).
-
-Closes the `throttling_root_cause` gap from the cosmic-kusto coverage analysis
-(`docs/planning/active/cosmic-kusto-gap-buildability.md`).
-"""
+"""DX-021: reconcile account-level 429s with operation counts in the exact same time bucket."""
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
 
+from azure.core.exceptions import AzureError
+
+from coda_core.detections import request_intervals as hours
+from coda_core.detections.request_intervals import production_window as production_window
 from coda_core.providers.base import TimeWindow
-
-# Proposed thresholds (honest by default: registry marks DX-021 `proposal`).
-MIN_TOTAL_REQUESTS = 1000       # below this the throttle rate is too noisy to decompose
-THROTTLE_RATE_PCT = 1.0         # only decompose when throttling is material (DX-005 owns the verdict)
-SEVERITY_HIGH_PCT = 20.0        # mirrors DX-005's reliability severity model
-SEVERITY_MEDIUM_PCT = 5.0
-
-# OperationType → (category, tailored guidance). Categories collapse the raw op names.
-_WRITE_OPS = {"create", "upsert", "replace", "delete", "patch", "batch", "executebatch"}
-_READ_OPS = {"read", "head"}
-_QUERY_OPS = {"query", "queryplan", "readfeed"}
-_EXEC_OPS = {"execute", "executejavascript", "executestoredprocedure"}
-
-_CATEGORY_GUIDANCE = {
-    "write": ("write", "check whether bulk or batch ingestion is concentrating writes (DX-010) "
-                       "before changing throughput"),
-    "read": ("read", "check for a hot physical partition (DX-006) or broad saturation (DX-005) "
-                     "before changing throughput"),
-    "query": ("query", "query load is throttling — check for cross-partition fan-out / expensive "
-                       "queries (DX-002 / DX-007) and add a partition-key filter or index before "
-                       "adding RU/s"),
-    "execute": ("execute", "stored-procedure / server-side execution is throttling — review the "
-                          "procedure's RU cost and call rate"),
-    "other": ("other", "review the dominant operation's call rate and cost"),
-}
-
-
-def production_window(now: datetime | None = None) -> TimeWindow:
-    """Throttling is a current-state signal — a 7-day, hourly window (mirrors DX-005)."""
-    end = now or datetime.now(timezone.utc)
-    return TimeWindow(end - timedelta(days=7), end, timedelta(hours=1))
-
-
-def _category_of(operation_type: str) -> str:
-    op = (operation_type or "").strip().lower()
-    if op in _WRITE_OPS:
-        return "write"
-    if op in _READ_OPS:
-        return "read"
-    if op in _QUERY_OPS:
-        return "query"
-    if op in _EXEC_OPS:
-        return "execute"
-    return "other"
+from coda_core.providers.monitor_retry import MonitorUnavailable
 
 
 @dataclass(frozen=True)
-class ThrottlingRootCauseVerdict:
-    is_finding: bool
-    # Operation attribution is distinct from observing throttling.
-    root_cause: str
-    severity: str  # high | medium | low | none
-    total_requests: int
-    total_throttled: int
-    throttle_rate_pct: float
-    dominant_operation: str | None
-    dominant_category: str | None
-    dominant_share_pct: float       # dominant op's share of the 429s
-    category_share_pct: dict[str, float]  # 429 share by category
-    recommended_action: str
-    methodology: dict = field(default_factory=dict)
+class OperationBreakdown:
+    """Expose operation counts and shares only after all attributed 429s reconcile."""
 
-    def as_dict(self) -> dict:
-        return asdict(self)
+    attribution: str
+    counts: dict
+    shares_pct: dict
 
 
-def detect_throttling_root_cause(
-    total_requests: int, total_throttled: int, op_throttled_counts: dict
-) -> ThrottlingRootCauseVerdict:
-    """Decompose an account's 429s by operation category (pure; counts in, verdict out)."""
-    total_requests = int(total_requests or 0)
-    total_throttled = int(total_throttled or 0)
-    # Normalise the {operation_type: 429_count} map.
-    ops: dict[str, int] = {}
-    invalid = False
-    for k, v in (op_throttled_counts or {}).items():
-        try:
-            n = int(v or 0)
-        except (TypeError, ValueError, OverflowError):
-            invalid = True
-            continue
-        if n < 0 or isinstance(v, bool) or (isinstance(v, float) and n != v) or (n and not str(k or "").strip()):
-            invalid = True
-        elif n > 0:
-            ops[str(k)] = n
-    rate = (100.0 * total_throttled / total_requests) if total_requests else 0.0
+def detect_throttling_root_cause(total_requests: int, total_throttled: int,
+                                 op_throttled_counts: dict) -> OperationBreakdown:
+    """A share of all 429s describes recipients, not the throttle rate within an operation."""
+    ops = op_throttled_counts or {}
+    if (not total_throttled or not 0 < total_throttled <= total_requests
+            or any(not isinstance(k, str) or not k.strip() or isinstance(n, bool)
+                   or not isinstance(n, (int, float)) or not float(n).is_integer() or n < 0
+                   for k, n in ops.items())
+            or sum(ops.values()) != total_throttled):
+        return OperationBreakdown("unavailable", {}, {})
+    counts = {op: int(n) for op, n in sorted(ops.items()) if n}
+    return OperationBreakdown("reconciled", counts, {k: 100*n/total_throttled for k, n in counts.items()})
 
-    # Aggregate 429s by category.
-    cat_counts: dict[str, int] = {}
-    for op, n in ops.items():
-        cat_counts[_category_of(op)] = cat_counts.get(_category_of(op), 0) + n
-    cat_share = {c: round(100.0 * n / total_throttled, 2) for c, n in cat_counts.items()} if total_throttled else {}
 
-    method = {
-        "total_requests": total_requests, "total_throttled": total_throttled,
-        "min_total_requests": MIN_TOTAL_REQUESTS, "throttle_rate_pct_threshold": THROTTLE_RATE_PCT,
-        "op_throttled_counts": dict(sorted(ops.items())),
-    }
-
-    def verdict(**kw) -> ThrottlingRootCauseVerdict:
-        base = dict(
-            is_finding=False, root_cause="not_throttling", severity="none",
-            total_requests=total_requests, total_throttled=total_throttled,
-            throttle_rate_pct=round(rate, 2), dominant_operation=None, dominant_category=None,
-            dominant_share_pct=0.0, category_share_pct=cat_share, recommended_action="",
-            methodology=method,
-        )
-        base.update(kw)
-        return ThrottlingRootCauseVerdict(**base)
-
-    if total_requests < MIN_TOTAL_REQUESTS:
-        return verdict(root_cause="too_few_requests")
-    if total_throttled == 0:
-        return verdict()
-    if rate < THROTTLE_RATE_PCT:
-        return verdict(root_cause="below_throttle_threshold")
-    attributed = sum(ops.values())
-    if invalid or (ops and attributed != total_throttled):
-        return verdict(root_cause="insufficient_data", category_share_pct={}, methodology={
-            **method, "attributed_throttled": attributed,
-            "abstained": "partial_operation_breakdown" if not invalid and attributed < total_throttled
-            else "inconsistent_operation_breakdown",
-        })
-    if not ops:
-        return verdict(root_cause="insufficient_data",
-                       methodology={**method, "abstained": "missing_operation_breakdown"})
-
-    dominant_op = max(ops, key=ops.get)
-    dominant_share = 100.0 * ops[dominant_op] / total_throttled
-    category = _category_of(dominant_op)
-    _, guidance = _CATEGORY_GUIDANCE[category]
-    severity = ("high" if rate >= SEVERITY_HIGH_PCT
-                else "medium" if rate >= SEVERITY_MEDIUM_PCT else "low")
-    action = (
-        f"{rate:.1f}% of requests were throttled (429). {dominant_share:.0f}% of the throttling is on "
-        f"'{dominant_op}' ({category}) operations: {guidance}."
-    )
-    return verdict(
-        is_finding=True, root_cause="decomposed", severity=severity,
-        dominant_operation=dominant_op, dominant_category=category,
-        dominant_share_pct=round(dominant_share, 2), recommended_action=action,
-    )
+def observe(metrics, resource_id: str, window: TimeWindow) -> dict:
+    """Join independently scoped status and filtered operation reads by exact timestamp, never range total."""
+    window = hours.hourly_window(window)
+    status = hours.split_hours(metrics.get_metric_split(
+        resource_id, "TotalRequests", window, split_dimension="StatusCode", aggregation="Count"), window)
+    affected = [(stamp, sum(cs.values()), cs["429"]) for stamp, cs in status.items() if cs.get("429")]
+    # A quiet control needs observed traffic: zero throttles on zero requests is not an exercised workload.
+    ops, evidence = {}, {"measured_intervals": len(status), "affected_intervals": [],
+                         "measured_requests": sum(sum(cs.values()) for cs in status.values())}
+    if not affected:
+        return evidence
+    try:
+        ops = hours.split_hours(metrics.get_metric_split(
+            resource_id, "TotalRequests", window, split_dimension="OperationType",
+            dimension_filter={"StatusCode": "429"}, aggregation="Count"), window)
+    except (AzureError, ValueError) as exc:
+        evidence["operation_error"] = type(exc).__name__
+        if isinstance(exc, MonitorUnavailable):
+            evidence.update(http_status=exc.status_code, retry_after_seconds=exc.retry_after_seconds)
+    for stamp, total, throttled in affected:
+        v = detect_throttling_root_cause(total, throttled, ops.get(stamp, {}))
+        row = {**hours.interval(stamp, window), "total_requests": total, "total_throttled": throttled,
+               "throttle_rate_pct": 100 * throttled / total, "attribution": v.attribution}
+        if v.attribution == "reconciled":
+            row.update(op_throttled_counts=v.counts, op_share_of_429s_pct=v.shares_pct)
+        evidence["affected_intervals"].append(row)
+    return evidence

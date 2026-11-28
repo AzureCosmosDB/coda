@@ -1,9 +1,8 @@
 """DX-003: Shared-throughput starvation.
 
 Only containers without dedicated throughput draw from the database-level RU/s pool. A single
-container can monopolise that pool, **starving its siblings** — they throttle (429) despite consuming
-little, while the database as a whole is at its cap. This is distinct from global under-provisioning
-(DX-005): the database *has* capacity, it's just unfairly distributed.
+container can compete with its siblings for capacity. Their observed RU and 429s do not prove
+the database is at its cap, or that a specific container caused another container's throttling.
 
 Signal & data source: **Log Analytics** ``CDBDataPlaneRequests5M`` when available, otherwise
 ``CDBDataPlaneRequests``. Aggregate rows use ``RequestCount`` and ``TotalRequestCharge``;
@@ -22,7 +21,7 @@ enable diagnostics. Read-only.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from math import isfinite
 
@@ -30,6 +29,7 @@ from coda_core.providers.base import TimeWindow
 from coda_core.providers.log_analytics import DataPlaneSource, LogAnalyticsProvider
 from coda_core.providers.shared_offer import IncompletePool, PoolMembers, verified_members
 
+INTERVAL = timedelta(minutes=5)
 
 # Shared-pool throttling is a present-tense signal; a 1-day window over the data-plane logs is enough.
 def production_window(
@@ -41,17 +41,24 @@ def production_window(
 
 
 def traffic_kql(
-    database: str, source: DataPlaneSource = DataPlaneSource.RAW,
+    database: str | list[str], source: DataPlaneSource = DataPlaneSource.RAW,
     window: TimeWindow | None = None,
 ) -> str:
-    """KQL for DX-003's per-collection traffic in one shared-throughput database."""
-    safe_db = database.replace("\\", "\\\\").replace("'", "\\'")
+    """Keep member and UTC interval identity in both direct and account-prefetched reads."""
+    def literal(name):
+        return "'" + name.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+    predicate = (f"DatabaseName == {literal(database)}" if isinstance(database, str) else
+                 f"DatabaseName in ({', '.join(map(literal, database))})")
+    bounds = (f"| where TimeGenerated >= datetime({window.start.isoformat()}) "
+              f"and TimeGenerated < datetime({window.end.isoformat()}) "
+              if window and source is DataPlaneSource.RAW else "")
     return (
-        source.query_table(window)
-        + f"| where DatabaseName == '{safe_db}' and isnotempty(CollectionName) "
+        source.query_table(window) + bounds
+        + f"| where {predicate} and isnotempty(CollectionName) "
         f"| summarize requests = {source.count}, "
         f"throttled = {source.count_if('StatusCode == 429')}, "
-        f"ru = sum({source.charge}){source.invalid_rows} by CollectionName"
+        f"ru = sum({source.charge}){source.invalid_rows} by DatabaseName, CollectionName, bucket = bin(TimeGenerated, 5m)"
     )
 
 
@@ -71,7 +78,7 @@ class CollectionTraffic:
 
 @dataclass(frozen=True)
 class SharedThroughputConfig:
-    min_requests: int = 100         # a collection below this is "inactive" for the window
+    min_requests: int = 100         # a collection below this is inactive in that five-minute interval
     pool_throttle_pct: float = 5.0  # database-wide 429 rate at/above this = pool under pressure
     dominance_pct: float = 60.0     # one collection consuming >= this share of pool RU = monopoliser
     victim_throttle_pct: float = 5.0  # a starved sibling throttles at/above this
@@ -81,8 +88,6 @@ class SharedThroughputConfig:
 @dataclass(frozen=True)
 class SharedThroughputVerdict:
     is_starvation: bool
-    # starvation | no_disparity | not_throttling | single_collection | insufficient_data |
-    # query_error
     root_cause: str
     database: str
     collection_count: int
@@ -91,7 +96,7 @@ class SharedThroughputVerdict:
     monopolizer_ru_share_pct: float
     victim: str | None
     victim_throttle_rate_pct: float
-    severity: str  # high | medium | none
+    severity: str  # high only for confirmed contention; otherwise none
     recommended_action: str
     methodology: dict = field(default_factory=dict)
 
@@ -111,17 +116,19 @@ def _abstain(database: str, root_cause: str, detail: str) -> SharedThroughputVer
     )
 
 
-def classify(
+def _interval_verdicts(
     database: str, collections: list[CollectionTraffic], shared_ru: float,
-    config: SharedThroughputConfig | None = None,
-) -> SharedThroughputVerdict:
-    """Map per-collection shared-pool traffic to a starvation verdict (pure)."""
-    cfg = config or SharedThroughputConfig()
+    cfg: SharedThroughputConfig,
+) -> list[SharedThroughputVerdict]:
+    """Evaluate one complete bin; keep all qualifying victims so rank changes cannot hide a pair."""
     active = [c for c in collections if c.requests >= cfg.min_requests]
     ru_total = sum(c.ru_consumed for c in active)
     req_total = sum(c.requests for c in active)
     thr_total = sum(c.throttled_429 for c in active)
     pool_rate = (100.0 * thr_total / req_total) if req_total else 0.0
+
+    method = {"thresholds": asdict(cfg), "shared_ru": shared_ru, "active_collections": len(active),
+              "note": "The internal RU allocation is not exposed; contention is inferred, not proven."}
 
     def verdict(**kw) -> SharedThroughputVerdict:
         base = dict(
@@ -129,23 +136,17 @@ def classify(
             collection_count=len(active), pool_throttle_rate_pct=round(pool_rate, 2),
             monopolizer=None, monopolizer_ru_share_pct=0.0, victim=None,
             victim_throttle_rate_pct=0.0, severity="none", recommended_action="",
-            methodology={"thresholds": {"pool_throttle_pct": cfg.pool_throttle_pct,
-                                        "dominance_pct": cfg.dominance_pct,
-                                        "victim_throttle_pct": cfg.victim_throttle_pct,
-                                        "victim_share_pct": cfg.victim_share_pct},
-                         "shared_ru": shared_ru, "active_collections": len(active),
-                         "note": "Internal per-collection RU allocation is not exposed (gap D5); "
-                                 "starvation is inferred from the 429 + consumption disparity."},
+            methodology=method,
         )
         base.update(kw)
         return SharedThroughputVerdict(**base)
 
     if len(active) < 2:
-        return verdict(root_cause="single_collection")
+        return [verdict(root_cause="single_collection")]
     if pool_rate < cfg.pool_throttle_pct:
-        return verdict(root_cause="not_throttling")
+        return [verdict(root_cause="below_pool_throttle_threshold" if thr_total else "not_throttling")]
     if ru_total <= 0:
-        return verdict(root_cause="insufficient_data")
+        return [verdict(root_cause="insufficient_data")]
 
     shares = {c.name: 100.0 * c.ru_consumed / ru_total for c in active}
     monopolizer = max(active, key=lambda c: shares[c.name])
@@ -158,25 +159,79 @@ def classify(
         and shares[c.name] <= cfg.victim_share_pct
     ]
     if mono_share < cfg.dominance_pct or not victims:
-        return verdict(root_cause="no_disparity",
-                       monopolizer=monopolizer.name, monopolizer_ru_share_pct=round(mono_share, 1))
+        return [verdict(root_cause="no_disparity",
+                        monopolizer=monopolizer.name, monopolizer_ru_share_pct=round(mono_share, 1))]
 
-    victim = max(victims, key=lambda c: c.throttle_rate_pct)
-    action = (
-        f"In shared-throughput database '{database}' ({shared_ru:.0f} RU/s shared across "
-        f"{len(active)} collections), collection '{monopolizer.name}' consumes "
-        f"{mono_share:.0f}% of the pool while '{victim.name}' throttles at "
-        f"{victim.throttle_rate_pct:.0f}% despite using only {shares[victim.name]:.0f}% — it is being "
-        f"starved. Move '{monopolizer.name}' (or the starved '{victim.name}') to dedicated throughput, "
-        f"or migrate collections off the shared pool. (The exact internal RU split per collection is "
-        f"not exposed; this is inferred from the 429 + consumption disparity.)"
-    )
-    return verdict(
-        is_starvation=True, root_cause="starvation", severity="high",
+    return [verdict(
+        root_cause="possible_contention",
         monopolizer=monopolizer.name, monopolizer_ru_share_pct=round(mono_share, 1),
         victim=victim.name, victim_throttle_rate_pct=round(victim.throttle_rate_pct, 1),
-        recommended_action=action,
-    )
+        methodology={**method, "affected_ru_share_pct": round(shares[victim.name], 1),
+                     "interval_requests": req_total, "interval_429s": thr_total,
+                     "affected_requests": victim.requests, "affected_429s": victim.throttled_429},
+    ) for victim in sorted(victims, key=lambda c: (-c.throttle_rate_pct, c.name))]
+
+
+def classify(database: str, buckets: dict[datetime, dict[str, CollectionTraffic]], shared_ru: float,
+             window: TimeWindow, members: set[str], config: SharedThroughputConfig | None = None) -> SharedThroughputVerdict:
+    """Confirm only an identical ordered pair in adjacent completed, independently qualifying bins."""
+    cfg = config or SharedThroughputConfig()
+    previous = {}
+    previous_stamp = None
+    possible = confirmed = last = None
+    incomplete = 0
+    totals: dict[str, list[int]] = {}
+    for stamp, rows in sorted(buckets.items()):
+        for name, row in rows.items():
+            counts = totals.setdefault(name, [0, 0])
+            counts[0] += row.requests
+            counts[1] += row.throttled_429
+        if stamp < window.start or stamp + INTERVAL > window.end or rows.keys() != members:
+            incomplete += 1
+            previous = {}
+            continue
+        verdicts = _interval_verdicts(database, list(rows.values()), shared_ru, cfg)
+        last = verdicts[0]
+        if last.root_cause == "insufficient_data":
+            incomplete += 1
+        pairs = {(v.monopolizer, v.victim): v for v in verdicts if v.root_cause == "possible_contention"}
+        if pairs:
+            possible = (stamp, last)
+            if previous_stamp == stamp - INTERVAL:
+                match = next((p for p in pairs if p in previous), None)
+                if match is not None:
+                    confirmed = [(previous_stamp, previous[match]), (stamp, pairs[match])]
+        previous_stamp, previous = stamp, pairs
+
+    observed = {"observed_requests": sum(c[0] for c in totals.values()),
+                "observed_429s": sum(c[1] for c in totals.values()),
+                "member_observations": [{"container": name, "requests": counts[0], "throttled": counts[1]}
+                                        for name, counts in sorted(totals.items())],
+                "incomplete_or_partial_intervals": incomplete}
+    if possible:
+        witnesses = confirmed or [possible]
+        v = witnesses[-1][1]
+        observed.update(dominant_container=v.monopolizer, affected_container=v.victim, intervals=[
+            {"start": stamp.isoformat(), "end": (stamp+INTERVAL).isoformat(),
+             "pool_throttle_pct": w.pool_throttle_rate_pct, "dominant_ru_share_pct": w.monopolizer_ru_share_pct,
+             "affected_throttle_pct": w.victim_throttle_rate_pct,
+             **{k: w.methodology[k] for k in ("affected_ru_share_pct", "interval_requests", "interval_429s",
+                                             "affected_requests", "affected_429s")}} for stamp, w in witnesses])
+        if confirmed:
+            v = replace(v, is_starvation=True, root_cause="starvation", severity="high", recommended_action=(
+                f"Investigate '{v.monopolizer}' and '{v.victim}' during the reported intervals. "
+                "Check whether pacing or rescheduling the competing work relieves throttling. "
+                "If the workloads must run together and require isolation, evaluate dedicated throughput. "
+                "These logs do not establish the internal allocation or prove which workload caused a 429."))
+    elif incomplete or last is None:
+        v = _abstain(database, "insufficient_data", "Shared-member traffic is incomplete for interval comparison")
+    else:
+        v = last
+        if v.root_cause == "not_throttling" and observed["observed_429s"]:
+            v = replace(v, root_cause="throttling_without_confirmed_contention")
+    missing = sorted(members - totals.keys())
+    return replace(v, methodology={**v.methodology, **observed, "missing_members": missing,
+                                   "expected_members": len(members), "observed_members": len(totals)})
 
 
 def detect_shared_throughput_starvation(
@@ -189,6 +244,7 @@ def detect_shared_throughput_starvation(
     config: SharedThroughputConfig | None = None,
     source: DataPlaneSource = DataPlaneSource.RAW,
     pool_members: PoolMembers | None = None,
+    as_of: datetime | None = None,
 ) -> SharedThroughputVerdict:
     """Run DX-003 after the pipeline has established the required LA capability.
 
@@ -209,34 +265,23 @@ def detect_shared_throughput_starvation(
         verdict = _abstain(database, "query_error", f"Log Analytics query failed: {exc}")
         verdict.methodology.update(source.evidence(window))
         return verdict
-    names = {row["CollectionName"] for row in rows}
-    missing = sorted(members - names)
-    invalid = any(not isinstance(row.get(k), (int, float)) or isinstance(row[k], bool)
-                  or not isfinite(row[k]) or row[k] < 0 for row in rows
-                  for k in ("requests", "throttled", "ru"))
-    if not invalid:
-        invalid = any(int(r[k]) != r[k] for r in rows for k in ("requests", "throttled")) or any(
-            r["throttled"] > r["requests"] for r in rows)
-    if missing or invalid or len(rows) != len(names):
-        verdict = _abstain(database, "insufficient_data", "Incomplete shared-member traffic")
-        verdict.methodology.update(source.evidence(window), missing_members=missing,
-                                   expected_members=len(members), observed_members=len(names))
-        return verdict
-    collections = [
-        CollectionTraffic(
-            name=r.get("CollectionName") or "",
-            requests=int(r.get("requests") or 0),
-            throttled_429=int(r.get("throttled") or 0),
-            ru_consumed=float(r.get("ru") or 0.0),
-        )
-        for r in rows if r.get("CollectionName")
-    ]
-    if not collections:
-        verdict = _abstain(
-            database, "insufficient_data", "No data-plane telemetry in this analysis window."
-        )
-        verdict.methodology.update(source.evidence(window))
-        return verdict
-    verdict = classify(database, collections, shared_ru, config)
+    buckets: dict[datetime, dict[str, CollectionTraffic]] = {}
+    end = min(window.end, as_of or datetime.now(timezone.utc))
+    for r in rows:
+        stamp, name = r.get("bucket"), r["CollectionName"]
+        if (not isinstance(stamp, datetime) or stamp.utcoffset() is None or stamp.timestamp() % 300
+                or not window.start-INTERVAL < stamp < end or name in buckets.get(stamp, {})
+                or any(not isinstance(r.get(k), (int, float)) or isinstance(r[k], bool)
+                       or not isfinite(r[k]) or r[k] < 0 for k in ("requests", "throttled", "ru"))
+                or any(int(r[k]) != r[k] for k in ("requests", "throttled"))
+                or r["throttled"] > r["requests"]):
+            verdict = _abstain(database, "insufficient_data", "Invalid or ambiguous shared-member interval")
+            verdict.methodology.update(source.evidence(window))
+            return verdict
+        buckets.setdefault(stamp.astimezone(timezone.utc), {})[name] = CollectionTraffic(
+            name, int(r["requests"]), int(r["throttled"]), r["ru"])
+    if end <= window.start:
+        return _abstain(database, "insufficient_data", "No elapsed observation window")
+    verdict = classify(database, buckets, shared_ru, TimeWindow(window.start, end, INTERVAL), members, config)
     verdict.methodology.update(source.evidence(window))
     return verdict

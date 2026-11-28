@@ -23,7 +23,8 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
+from decimal import Decimal
 
 from azure.core.credentials import TokenCredential
 from coda_core.framework.cost_rate import THROUGHPUT_METERS
@@ -100,6 +101,15 @@ class ThroughputCost:
         return self.usage > 0
 
 
+@dataclass(frozen=True)
+class ServerlessComparisonDay:
+    """Actual account throughput charge and a regional subscription benchmark on the same UTC date."""
+
+    currency: str
+    provisioned_cost: Decimal
+    price_per_million_ru: Decimal
+
+
 class CostManagementProvider:
     """Read-only actual-cost queries over a subscription or a sub-scope resource."""
 
@@ -166,6 +176,66 @@ class CostManagementProvider:
             return {}
         return {"filter": {"dimensions": {"name": "ResourceId", "operator": "In",
                                           "values": [resource_id]}}}
+
+    def serverless_comparison_days(self, start: date, end: date, *, resource_id: str,
+                                   region: str) -> dict[date, ServerlessComparisonDay]:
+        """Return 30 comparable daily prices, not an extrapolation from sparse account billing.
+
+        ``end`` is exclusive. Never broaden a failed or incomplete account query. The serverless
+        estimate uses the customer's regional, subscription-level consumed-RU meter, not a quoted
+        new-account price. Distinguish that benchmark from the actual current account charges.
+        """
+        canonical_region = region.strip().casefold().replace(" ", "")
+        if not resource_id or not canonical_region or end - start != timedelta(days=30):
+            raise ValueError("Invalid serverless comparison scope or dates")
+        expected = {start + timedelta(days=i) for i in range(30)}
+
+        def daily(meter, scope_dimension, scope_values):
+            filters = [{"dimensions": {"name": k, "operator": "In", "values": v}}
+                       for k, v in (("MeterCategory", [_COSMOS_METER_CATEGORY]), (scope_dimension, scope_values))]
+            if meter == "1M RUs":
+                filters.append({"dimensions": {"name": "Meter", "operator": "In", "values": [meter]}})
+            body = {**self._window(start, end - timedelta(days=1), AMORTIZED_COST),
+                    "dataset": {"granularity": "Daily", "filter": {"and": filters},
+                                "aggregation": {"totalCost": {"name": "Cost", "function": "Sum"},
+                                                "usage": {"name": "UsageQuantity", "function": "Sum"}},
+                                "grouping": [{"type": "Dimension", "name": "Meter"},
+                                             {"type": "Dimension", "name": "ResourceLocation"}]}}
+            props = self._post_query(self._scope(None), body)
+            if props.get("nextLink") or not isinstance(props.get("rows"), list):
+                raise ValueError("Incomplete daily billing response")
+            indexes = [self._col_index(props["columns"], name) for name in
+                       ("UsageDate", "Cost", "UsageQuantity", "Currency", "Meter", "ResourceLocation")]
+            days = {}
+            for row in props["rows"]:
+                raw_date, raw_cost, raw_usage, currency, name, location = (row[i] for i in indexes)
+                if meter == "100 RU/s" and name == "1M RUs":
+                    raise ValueError("Account billing period includes serverless consumption")
+                if meter == "100 RU/s" and not is_cosmos_throughput_meter(_COSMOS_METER_CATEGORY, str(name)):
+                    continue
+                if name != meter or str(location).casefold().replace(" ", "") != canonical_region:
+                    raise ValueError("Unmatched daily billing meter or region")
+                stamp = str(raw_date)
+                if not stamp.isdigit() or len(stamp) != 8:
+                    raise ValueError("Invalid usage date")
+                day = date(int(stamp[:4]), int(stamp[4:6]), int(stamp[6:]))
+                cost, usage = Decimal(str(raw_cost)), Decimal(str(raw_usage))
+                if (day in days or day not in expected or not isinstance(currency, str)
+                        or len(currency) != 3 or not currency.isascii() or not currency.isalpha() or not currency.isupper()
+                        or not cost.is_finite() or not usage.is_finite() or cost < 0 or usage <= 0
+                        or (meter == "1M RUs" and cost == 0)):
+                    raise ValueError("Ambiguous or invalid daily pricing")
+                days[day] = (cost, usage, currency)
+            if days.keys() != expected:
+                raise ValueError("Missing daily billing coverage")
+            return days
+
+        actual = daily("100 RU/s", "ResourceId", [resource_id])
+        prices = daily("1M RUs", "ResourceLocation", list(dict.fromkeys((region, canonical_region))))
+        if len({v[2] for v in (*actual.values(), *prices.values())}) != 1:
+            raise ValueError("Incomparable billing currencies")
+        return {day: ServerlessComparisonDay(actual[day][2], actual[day][0], prices[day][0] / prices[day][1])
+                for day in sorted(expected)}
 
     def cosmos_throughput_cost(
         self, start: date, end: date, *, resource_id: str | None = None, scope: str | None = None,

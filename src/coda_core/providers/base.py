@@ -20,8 +20,10 @@ Every provider method therefore takes a :class:`TimeWindow` explicitly.
 from __future__ import annotations
 
 import abc
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from math import ceil
 
 
 @dataclass(frozen=True)
@@ -57,6 +59,18 @@ class TimeWindow:
         """
         now = datetime.now(timezone.utc)
         return cls(start=now - duration, end=now, granularity=granularity)
+
+
+def covers_bucket_grid(stamps: Sequence[datetime], window: TimeWindow) -> bool:
+    """Check ordered Monitor bucket labels, including Azure's minute-rounded start convention."""
+    grain = window.granularity
+    expected = ceil((window.end - window.start) / grain)
+    if not stamps or len(stamps) < expected or not window.start - grain < stamps[0] <= window.start:
+        return False
+    minute_grid = (grain >= timedelta(minutes=1) and len(stamps) == expected
+                   and stamps[0] == window.start.replace(second=0, microsecond=0))
+    return (stamps[-1] < window.end and (stamps[-1] + grain >= window.end or minute_grid)
+            and all(b - a == grain for a, b in zip(stamps, stamps[1:])))
 
 
 @dataclass(frozen=True)

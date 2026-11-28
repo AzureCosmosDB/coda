@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 import json
-from collections import defaultdict
-from collections.abc import Iterable, Iterator, Sequence
+from collections import defaultdict, deque
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
-from math import ceil, isfinite
+from itertools import chain, islice
+from math import isfinite
+from threading import Lock
 from urllib.parse import quote as urlquote
 
 from azure.core.exceptions import HttpResponseError, ServiceRequestError, ServiceResponseError
 from azure.monitor.query import MetricAggregationType, MetricsQueryClient
 
 from coda_core.providers.arm import ContainerIndexing
-from coda_core.providers.base import DataProvider, MetricPoint, MetricSeries, TimeWindow
+from coda_core.providers.base import DataProvider, MetricPoint, MetricSeries, TimeWindow, covers_bucket_grid
 from coda_core.providers.monitor_retry import MonitorUnavailable
 from coda_core.providers.partition_metrics import metadata, quote
 
@@ -109,8 +112,11 @@ class ProjectedReads(DataProvider):
 class IndexingReadPlan:
     """One account and absolute window. Budget and projection state never cross a report boundary."""
 
-    def __init__(self, client: MetricsQueryClient, resource_id: str, window: TimeWindow):
+    def __init__(self, client: MetricsQueryClient, resource_id: str, window: TimeWindow,
+                 *, worker_client: Callable[[], MetricsQueryClient] | None = None):
         self.client, self.rid, self.window = client, resource_id, window
+        self.worker_client = worker_client
+        self._admission = Lock()
         self.batches = self.recoveries = 0
         self.stop_reason: str | None = None
 
@@ -130,10 +136,14 @@ class IndexingReadPlan:
         def unavailable(reason):
             return {(c, m): IncompleteBatch(reason) for c in batch.containers for m in metrics}
 
-        if self.stop_reason:
-            return unavailable(f"Not queried after earlier rejection: {self.stop_reason}")
+        with self._admission:
+            if self.stop_reason:
+                return unavailable(f"Not queried after earlier rejection: {self.stop_reason}")
+            if not exact:
+                self.batches += 1
+        client = self.worker_client() if self.worker_client and not exact else self.client
         try:
-            response = self.client.query_resource(
+            response = client.query_resource(
                 self.rid, metric_names=list(metrics), timespan=(self.window.start, self.window.end),
                 granularity=self.window.granularity, aggregations=[MetricAggregationType.MAXIMUM],
                 filter=batch.filter, max_results=len(batch.containers) * len(metrics) + 1,
@@ -143,7 +153,8 @@ class IndexingReadPlan:
             code = getattr(exc, "status_code", None)
             reason = str(exc) if isinstance(exc, MonitorUnavailable) else f"Monitor read failed: {code or type(exc).__name__}"
             if code in {401, 403, 429}:
-                self.stop_reason = reason  # Do not amplify rejection or throttling into N requests.
+                with self._admission:
+                    self.stop_reason = self.stop_reason or reason
             return unavailable(reason)
         if response.granularity != self.window.granularity:
             return unavailable("Monitor returned a different time grain")
@@ -194,30 +205,21 @@ class IndexingReadPlan:
                     # A partial time series can omit the newest usable value. Recover the original
                     # exact read rather than passing its prefix to DX-024 as the latest sample.
                     stamps = sorted(points)
-                    grain = self.window.granularity
-                    if not exact:
-                        if not stamps or stamps[0] > self.window.start:
-                            continue
-                        # Azure also returns N buckets starting at the requested minute (:00),
-                        # not N+1 intersecting buckets for a window starting at :17.456789.
-                        minute_grid = (stamps[0] == self.window.start.replace(second=0, microsecond=0)
-                                       and len(stamps) == ceil((self.window.end - self.window.start) / grain))
-                        if ((stamps[-1] + grain < self.window.end and not minute_grid)
-                                or any(b - a != grain for a, b in zip(stamps, stamps[1:]))):
-                            continue
+                    if not covers_bucket_grid(stamps, self.window):
+                        continue
                     cells[c, name] = MetricSeries(name, "Maximum", metric.unit, tuple(
                         MetricPoint(t, points[t]) for t in stamps if points[t] is not None))
         return cells
 
-    def project(self, batch: Batch) -> ProjectedReads:
-        """Seed exact keys, repairing only the missing metric/container pairs within a run-wide cap."""
+    def _seed(self, batch):
+        """Return the grouped measurements without consuming the shared recovery budget."""
         if not batch.fits():
-            cells = {(c, m): IncompleteBatch("Unit exceeds encoded filter budget; not queried")
-                     for c in batch.containers for m in METRICS}
-            return ProjectedReads(self.rid, self.window, batch.database, cells)
-        if not self.stop_reason:
-            self.batches += 1
-        cells = self._read(batch, METRICS, exact=False)
+            return {(c, m): IncompleteBatch("Unit exceeds encoded filter budget; not queried")
+                    for c in batch.containers for m in METRICS}
+        return self._read(batch, METRICS, exact=False)
+
+    def _finish(self, batch, cells):
+        """Recover in inventory order on one thread so the same units receive the eight reads."""
         for c in batch.containers:
             for m in METRICS:
                 if (c, m) not in cells:
@@ -227,3 +229,31 @@ class IndexingReadPlan:
                     cells.setdefault((c, m), IncompleteBatch(self.stop_reason or
                                      "Incomplete or ambiguous Monitor series; exact recovery unavailable"))
         return ProjectedReads(self.rid, self.window, batch.database, cells)
+
+    def project(self, batch: Batch) -> ProjectedReads:
+        """Read a single group with the same checks and recovery budget as the parallel pass."""
+        return self._finish(batch, self._seed(batch))
+
+    def projections(self, batches: Iterable[Batch], workers: int):
+        """Overlap at most `workers` grouped reads, retaining only that many groups' histories."""
+        batches = iter(batches)
+        first = list(islice(batches, workers if self.worker_client else 1))
+
+        def finish(batch, read):
+            try:
+                return self._finish(batch, read())
+            except (ValueError, TypeError, AttributeError, KeyError) as exc:
+                return ProjectedReads.unavailable(self.rid, self.window, batch.database,
+                    batch.containers, f"Invalid Monitor response: {type(exc).__name__}")
+
+        if len(first) <= 1:
+            for batch in chain(first, batches):
+                yield batch, finish(batch, lambda: self._seed(batch))
+            return
+        with ThreadPoolExecutor(max_workers=len(first)) as pool:
+            pending = deque((b, pool.submit(self._seed, b)) for b in first)
+            while pending:
+                batch, future = pending.popleft()
+                yield batch, finish(batch, future.result)
+                if (b := next(batches, None)) is not None:
+                    pending.append((b, pool.submit(self._seed, b)))

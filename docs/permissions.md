@@ -78,6 +78,9 @@ for current access-mode, table-plan, and granular-RBAC behavior.
 **Run Pre-Checks** tests ARM/ARG reads, metrics, logs and optional subscription Cost Management.
 It also reads the account's diagnostic settings and supported categories. Reader-level
 ARM access can provide these metadata reads; it does not require permission to write settings.
+DX-002 and DX-007 use the same read-only settings/category metadata during diagnosis to check logging
+history once per applicable account report. If denied, query observations can still be shown
+but are not graded. CODA does not request additional per-hour metrics permissions.
 A group check needs permission to enumerate the group's accounts; a named-account check uses
 that account directly. Log queries use the same resource-context permissions described above.
 If configuration cannot be read but logs are readable, CODA reports that distinction rather than
@@ -111,6 +114,11 @@ rate. These HTTP POST requests are read-only aggregations, not resource writes. 
 queries subscription scope and filters the relevant account; a role scoped only to a resource group
 does not necessarily authorize that subscription-scoped request.
 
+For eligible provisioned accounts, DX-014 can use that same read permission to compare the
+account's daily throughput charges with a matching regional serverless consumed-RU meter on
+the subscription for the same dates. Without comparable prices it reports consumption only.
+DX-023 directs the customer to Cost Management; it does not read or purchase reservations.
+
 Access can come from an existing read role or a dedicated **Cost Management Reader** assignment.
 Billing-account policy can still restrict charge visibility; for example, enterprise billing
 administrators may need to enable charge visibility. A role assignment alone does not guarantee
@@ -138,7 +146,8 @@ settings. Those permissions are not prerequisites for this release.
 
 An administrator must create or select a Log Analytics workspace and add the Cosmos diagnostic
 setting using **Resource specific** destination tables. **DataPlaneRequests5M** supports DX-003,
-DX-010, and optional DX-016 enrichment. **DataPlaneRequests** plus **QueryRuntimeStatistics**
+DX-010, and optional DX-016 enrichment. **PartitionKeyStatistics** is optional for DX-015;
+physical storage does not require logs. **DataPlaneRequests** plus **QueryRuntimeStatistics**
 are additionally required for DX-002/DX-007 query analysis. Existing raw-only request collection
 remains supported for aggregate-compatible checks. Follow the
 [setup guide](detections/log-analytics-readiness.md).

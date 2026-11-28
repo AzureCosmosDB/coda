@@ -40,6 +40,7 @@ CAP_COST_MANAGEMENT = "cost_management"  # Cost Management / Consumption (Cost M
 # Physical-table capabilities remain distinct from the aggregate-compatible request capability.
 CAP_LA_DATAPLANE = "la:CDBDataPlaneRequests"
 CAP_LA_QUERYSTATS = "la:CDBQueryRuntimeStatistics"
+CAP_LA_KEYSTATS = "la:CDBPartitionKeyStatistics"
 # Aggregate-only detectors can use either source; raw remains mandatory for activity-ID joins.
 CAP_LA_REQUEST_AGGREGATES = "la:request_aggregates"
 
@@ -89,6 +90,11 @@ CAPABILITIES: dict[str, Capability] = {
         "Enable 'DataPlaneRequests5M' in **resource-specific** mode "
         "(CDBDataPlaneRequests5M). Existing raw DataPlaneRequests logs are also supported.",
         la_table="CDBDataPlaneRequests5M", category="DataPlaneRequests5M",
+    ),
+    CAP_LA_KEYSTATS: Capability(
+        CAP_LA_KEYSTATS, "Logical partition storage statistics",
+        "Enable PartitionKeyStatistics in a resource-specific diagnostic setting sent to Log Analytics.",
+        la_table="CDBPartitionKeyStatistics", category="PartitionKeyStatistics",
     ),
 }
 
@@ -257,7 +263,7 @@ def resolve_capabilities(
     la,  # LogAnalyticsProvider | None
     account_resource_id: str,
     span: tuple[datetime, datetime],
-    required_la_caps: frozenset[str] = LA_CAPABILITIES,
+    required_la_caps: frozenset[str] = LA_CAPABILITIES - {CAP_LA_KEYSTATS},
     metrics_available: bool = True,
     arm_available: bool = True,
     cost_available: bool = False,

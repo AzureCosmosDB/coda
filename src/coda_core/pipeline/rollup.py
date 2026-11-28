@@ -3,10 +3,8 @@
 Two jobs:
   * **Correlate** — resolve overlaps and explicit related-signal declarations on the *same* unit.
     Rules today: an idle
-    container (DX-004) **subsumes** over-provisioning (DX-001) *and* autoscale-max right-sizing
-    (DX-011) on that unit — if it's unused, "decommission" is the right call, not "right-size". A
-    bursty container (DX-012) subsumes DX-001, and shard-key misalignment (DX-007) subsumes the
-    per-query cross-partition finding (DX-002). Subsumed findings are kept but marked
+    container (DX-004) **subsumes** sizing and mode-change recommendations for that offer.
+    Otherwise sizing and switching mode are alternatives, not additive. Subsumed findings are kept but marked
     ``superseded_by`` so they don't double-count or contradict.
   * **Aggregate** — account-level totals (recoverable RU/s, severity counts, abstentions) computed
     only over **actionable** (real, non-superseded) findings.
@@ -14,7 +12,7 @@ Two jobs:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from coda_core.pipeline.finding import STATUS_ABSTAINED, STATUS_NOT_DETECTED, Finding
 from coda_core.providers.arm import ThroughputOffer
@@ -38,22 +36,17 @@ def _has_same_resource(finding: Finding, candidates: list[Finding]) -> bool:
 def _apply_supersession(findings: list[Finding]) -> list[Finding]:
     """Apply the existing explicit supersession rules using canonical resource identity."""
     idle = [f for f in findings if f.detection_id == "DX-004" and f.is_actionable()]
-    # A bursty container (DX-012 -> autoscale) must not also be told to right-size down (DX-001):
-    # cutting the fixed RU/s below the spike would throttle it. Autoscale is the right answer.
-    bursty = [f for f in findings if f.detection_id == "DX-012" and f.is_actionable()]
-    # Shard-key misalignment (DX-007) is the structural verdict: re-keying subsumes the per-query
-    # cross-partition finding (DX-002) on the same container — keep DX-002 but mark it superseded.
-    misaligned = [f for f in findings if f.detection_id == "DX-007" and f.is_actionable()]
+    alternatives = {"DX-001": "DX-012", "DX-012": "DX-001", "DX-011": "DX-013", "DX-013": "DX-011"}
+    by_id = {did: [f for f in findings if f.detection_id == did and f.is_actionable()] for did in alternatives}
     out: list[Finding] = []
     for f in findings:
-        if f.detection_id == "DX-001" and f.is_actionable() and _has_same_resource(f, idle):
-            out.append(f.with_superseded_by("DX-004"))  # idle subsumes over-provisioning
-        elif f.detection_id == "DX-011" and f.is_actionable() and _has_same_resource(f, idle):
-            out.append(f.with_superseded_by("DX-004"))  # idle subsumes autoscale-max right-sizing
-        elif f.detection_id == "DX-001" and f.is_actionable() and _has_same_resource(f, bursty):
-            out.append(f.with_superseded_by("DX-012"))  # bursty -> autoscale, not right-size
-        elif f.detection_id == "DX-002" and f.is_actionable() and _has_same_resource(f, misaligned):
-            out.append(f.with_superseded_by("DX-007"))  # re-key subsumes per-query cross-partition fix
+        peer = alternatives.get(f.detection_id)
+        if peer and f.is_actionable() and _has_same_resource(f, idle):
+            out.append(f.with_superseded_by("DX-004"))
+        elif peer and f.is_actionable() and _has_same_resource(f, by_id[peer]) and not f.evidence.get("alternative_to"):
+            out.append(replace(f, evidence={**f.evidence, "alternative_to": peer},
+                               recommended_action=f"Alternative to {peer} for this offer, not an additional saving. "
+                                                  + f.recommended_action))
         else:
             out.append(f)
     return out
@@ -135,6 +128,7 @@ def aggregate(findings: list[Finding], scope_provisioned_ru: float | None, units
         if (
             f.estimated_monthly_savings is not None
             and f.savings_basis == "customer_amortized_bill"
+            and not f.evidence.get("alternative_to")
         ):
             total_savings += f.estimated_monthly_savings
             savings_currency = f.savings_currency

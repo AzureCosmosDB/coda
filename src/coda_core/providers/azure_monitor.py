@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from copy import copy
+from datetime import timedelta
+from math import isfinite
 from azure.core.credentials import TokenCredential
 from azure.monitor.query import MetricAggregationType, MetricsQueryClient
 
@@ -58,6 +60,33 @@ def _reduce(values: list[float], aggregation: str) -> float:
     return sum(values)  # Total, Count
 
 
+def _check_throughput_response(response, name, window, scope, *, scalar_count=False):
+    """Reject an explicitly changed grain or offer identity before certifying completed hours."""
+    if getattr(response, "granularity", window.granularity) != window.granularity:
+        raise ValueError(f"{name} returned a different granularity")
+    if len(response.metrics) > 1:
+        raise ValueError(f"{name} returned multiple metric payloads")
+    expected = {k.casefold(): v for k, v in (scope or {}).items()}
+    for metric in response.metrics:
+        if getattr(metric, "name", name) != name or (scalar_count and len(metric.timeseries) > 1):
+            raise ValueError(f"{name} response is ambiguous")
+        region_slices = set()
+        for ts in metric.timeseries:
+            dims = _metadata(ts)
+            scoped_region = "region" in expected and name in {
+                "NormalizedRUConsumption", "AutoscaledRU", "PhysicalPartitionCount", "ProvisionedThroughput"}
+            if ((scoped_region and "region" not in dims)
+                    or (scalar_count and name in {"NormalizedRUConsumption", "ProvisionedThroughput"}
+                        and set(dims) - set(expected))
+                    or any(k in dims and (dims[k].casefold() != v.casefold() if k == "region" else dims[k] != v)
+                           for k, v in expected.items())):
+                raise ValueError(f"{name} response did not match the requested scope")
+            if name == "AutoscaledRU":
+                region_slices.add(dims.get("region", "").casefold())
+        if len(region_slices) > 1:
+            raise ValueError("AutoscaledRU returned distinct regional slices; not one comparable offer total")
+
+
 class AzureMonitorMetricsProvider(DataProvider):
     """DataProvider backed by the Azure Monitor Metrics API."""
 
@@ -77,9 +106,10 @@ class AzureMonitorMetricsProvider(DataProvider):
         """Credential used to create per-worker clients without sharing SDK client state."""
         return self._credential
 
-    def indexing_plan(self, resource_id: str, window: TimeWindow) -> IndexingReadPlan:
+    def indexing_plan(self, resource_id: str, window: TimeWindow, *, worker_provider=None) -> IndexingReadPlan:
         """Create an independent indexing projection and recovery budget for this report."""
-        return IndexingReadPlan(self._client, resource_id, window)
+        return IndexingReadPlan(self._client, resource_id, window,
+                                worker_client=(lambda: worker_provider()._client) if worker_provider else None)
 
     def for_cohort(self, database, containers=(), owners=()):
         """Use a bounded projection on this worker's SDK client, never sharing it across threads."""
@@ -118,6 +148,7 @@ class AzureMonitorMetricsProvider(DataProvider):
         *,
         aggregation: str = "Average",
         dimension_filter: dict[str, str] | None = None,
+        require_single_series: bool = False,
     ) -> MetricSeries:
         """Query one Cosmos metric as a time series over an absolute window.
 
@@ -135,7 +166,8 @@ class AzureMonitorMetricsProvider(DataProvider):
                 f"Unsupported aggregation {aggregation!r}; "
                 f"expected one of {sorted(_AGGREGATION)}."
             )
-        key = (resource_id, metric_name, window, aggregation, tuple(sorted((dimension_filter or {}).items())), None)
+        key = (resource_id, metric_name, window, aggregation, tuple(sorted((dimension_filter or {}).items())),
+               None, require_single_series)
         cache = getattr(self, "_exact", None)
         if cache is not None and key in cache:
             return cache[key]
@@ -159,17 +191,49 @@ class AzureMonitorMetricsProvider(DataProvider):
         # several timeseries (per partition/region), so we reduce per timestamp below.
         by_ts: dict = {}
         unit: str | None = None
+        scoped_ru = metric_name == "TotalRequestUnits" and aggregation == "Total" and bool(
+            dimension_filter and "CollectionName" in dimension_filter)
+        account_ru = metric_name == "TotalRequestUnits" and aggregation == "Total" and not dimension_filter
+        scoped_utilization = (metric_name == "NormalizedRUConsumption" and aggregation == "Maximum"
+                              and window.granularity == timedelta(hours=1) and bool(dimension_filter))
+        container_storage = (metric_name == "DataUsage" and aggregation == "Maximum"
+                             and window.granularity == timedelta(hours=1)
+                             and set(dimension_filter or {}) == {"DatabaseName", "CollectionName"})
+        if container_storage:
+            # A physical or regional component is not a measurement of total container data storage.
+            _check_throughput_response(response, metric_name, window, dimension_filter, scalar_count=True)
+            for metric in response.metrics:
+                if "byte" not in str(metric.unit).casefold() or any(
+                    set(_metadata(ts)) - {"databasename", "collectionname"} for ts in metric.timeseries
+                ):
+                    raise ValueError("DataUsage did not return container-scoped bytes")
+        if metric_name == "TotalRequests" and window.granularity == timedelta(hours=1):
+            _check_throughput_response(response, metric_name, window, dimension_filter)
+        if scoped_utilization or require_single_series:
+            _check_throughput_response(response, metric_name, window, dimension_filter, scalar_count=require_single_series)
+        components = 0
         for metric in response.metrics:
             unit = str(metric.unit) if metric.unit is not None else None
             for ts in metric.timeseries:
+                components += 1
+                strict = scoped_ru or scoped_utilization or account_ru or require_single_series or container_storage
+                seen = set() if strict else None
                 for datum in ts.data:
                     value = getattr(datum, aggregation.lower(), None)
                     if value is not None:
+                        if seen is not None:
+                            if datum.timestamp in seen or not isfinite(value) or value < 0:
+                                raise ValueError(f"Invalid or duplicate scoped {metric_name} measurement")
+                            seen.add(datum.timestamp)
                         by_ts.setdefault(datum.timestamp, []).append(value)
 
         points = [
             MetricPoint(timestamp=ts, value=_reduce(vals, aggregation))
             for ts, vals in sorted(by_ts.items())
+            # Partial positive consumption rules out idle; a zero requires all returned components.
+            if (not scoped_ru or len(vals) == components or any(vals))
+            and (not scoped_utilization or len(vals) == components)
+            and (not account_ru or len(vals) == components)
         ]
         series = MetricSeries(
             name=metric_name,
@@ -177,7 +241,7 @@ class AzureMonitorMetricsProvider(DataProvider):
             unit=unit,
             points=tuple(points),
         )
-        if points and metric_name in {"NormalizedRUConsumption", "TotalRequests"}:
+        if points and metric_name in {"NormalizedRUConsumption", "TotalRequests", "PhysicalPartitionCount"}:
             self._remember(key, series)
         return series
 
@@ -217,6 +281,16 @@ class AzureMonitorMetricsProvider(DataProvider):
             max_results=SERIES_LIMIT,
         )
         rows = [ts for metric in response.metrics for ts in metric.timeseries]
+        if metric_name == "AutoscaledRU":
+            _check_throughput_response(response, metric_name, window, dimension_filter)
+        if metric_name == "TotalRequests" and split_dimension in {"StatusCode", "OperationType"}:
+            _check_throughput_response(response, metric_name, window, dimension_filter)
+            scope = {k.casefold(): v for k, v in (dimension_filter or {}).items()}
+            for ts in rows:
+                dims = _metadata(ts)
+                if (set(dims) - {split_dimension.casefold(), *scope}
+                        or any(k in dims and dims[k] != v for k, v in scope.items())):
+                    raise ValueError(f"{split_dimension} response did not match the requested scope")
         out, conflicts, unknown = split_series(rows, metric_name, aggregation, split_dimension)
         if conflicts or unknown or len(rows) >= SERIES_LIMIT:
             raise ValueError(f"Incomplete or ambiguous {metric_name} split by {split_dimension}")

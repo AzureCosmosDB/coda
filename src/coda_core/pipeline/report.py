@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from coda_core.framework.cost_rate import CostEstimateIssue
 from coda_core.pipeline.finding import (
     STATUS_ABSTAINED,
+    STATUS_FINDING,
     STATUS_NOT_DETECTED,
     THRESHOLD_PROPOSAL,
     Finding,
@@ -77,8 +78,10 @@ def _humanize_abstain(summary: str) -> str:
     """Turn an internal abstention reason into one plain phrase (no detector tokens leak out)."""
     text = summary.replace("Insufficient data:", "").strip()
     normalized = text.lower()
-    if normalized.startswith(("incomplete partition coverage:", "indexing metrics incomplete:", "azure monitor ")) or (
-        "requests returned http 429" in normalized
+    if normalized.startswith(("incomplete partition coverage:", "indexing metrics incomplete:", "azure monitor ",
+                              "query fan-out:", "observed partition skew in ")) or (
+        "requests returned http 429" in normalized or "history to judge capacity" in normalized
+        or "retirement requires" in normalized or "physical partitions; storage is unknown" in normalized
     ):
         return text
     if ("minimum age unverified" in normalized or "shared member" in normalized
@@ -168,6 +171,14 @@ def render_markdown(report: DiagnosticReport) -> str:
     s = report.summary
     observations = [f for f in report.findings
                     if f.status == STATUS_NOT_DETECTED and f.evidence.get("observed_throttling")]
+    fanout_observations = [f for f in report.findings if f.detection_id == "DX-007"
+                           and f.evidence.get("fanout_result") in {"review", "observation"}]
+    regional_reviews = [f for f in report.findings if f.detection_id == "DX-008" and
+                        f.status == STATUS_NOT_DETECTED and f.evidence.get("root_cause") == "nonprod_multi_region_writes"]
+    storage_notes = [f for f in report.findings if f.detection_id == "DX-015" and
+                     not f.is_actionable() and f.evidence.get("logical_partition_storage")]
+    review_notes = [f for f in report.findings if f.status != STATUS_FINDING
+                    and f.evidence.get("visible_observation")]
     actionable = sorted(
         (f for f in report.findings if f.is_actionable()),
         key=lambda f: (_SEVERITY_RANK.get(f.severity, 9),
@@ -201,6 +212,14 @@ def render_markdown(report: DiagnosticReport) -> str:
         lines.append("**No actionable findings on verified offers.** Some allocations could not be evaluated.")
     elif s.abstained:
         lines.append("**No actionable findings in completed checks.** See the incomplete checks below.")
+    elif review_notes:
+        lines.append("**No graded findings.** See the observations and review prompts below.")
+    elif regional_reviews:
+        lines.append("**No graded findings.** See the configuration review below.")
+    elif fanout_observations:
+        lines.append("**No graded findings.** See the query fan-out observations below.")
+    elif storage_notes:
+        lines.append("**No graded findings.** See the partition storage observations below.")
     elif observations:
         lines.append("**No actionable findings.** Throttling was observed; see the measurements below.")
     else:
@@ -231,6 +250,32 @@ def render_markdown(report: DiagnosticReport) -> str:
         lines += ["## Observed throttling", ""]
         for f in observations:
             lines.append(f"- {f.unit.describe()} (`{f.detection_id}`): {f.summary}.")
+        lines.append("")
+
+    if fanout_observations:
+        lines += ["## Query fan-out observations", ""]
+        for f in fanout_observations:
+            lines.append(f"- {f.unit.describe()} (`DX-007`): {f.summary}")
+        lines.append("")
+
+    if regional_reviews:
+        lines += ["## Configuration review", ""]
+        for f in regional_reviews:
+            lines.append(f"- {f.unit.describe()} (`DX-008`): {f.summary}")
+        lines.append("")
+
+    if storage_notes:
+        lines += ["## Partition storage observations", ""]
+        for f in storage_notes:
+            lines.append(f"- {f.unit.describe()} (`DX-015`): {f.summary}")
+        lines.append("")
+
+    if review_notes:
+        lines += ["## Observations and review prompts", ""]
+        for f in review_notes:
+            lines.append(f"- {f.unit.describe()} (`{f.detection_id}`): {f.summary}")
+            if f.recommended_action:
+                lines.append(f"  {f.recommended_action}")
         lines.append("")
 
     if actionable:

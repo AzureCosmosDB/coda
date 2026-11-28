@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from collections import defaultdict
 
 from coda_core.providers.partition_metrics import coverage_evidence
 
@@ -15,21 +16,25 @@ def regional_verdict(histories, classify_series, *, skew_cause: str, observation
     for history, row in zip(histories, evidence["partition_coverage"]):
         if history.series:
             row.update(observations(classify_series(history.series)))
-        for cohort in history.comparisons():
+        buckets = defaultdict(dict)
+        for key, series in history.series.items():
+            for point in series.points:
+                if point.value is not None:
+                    buckets[point.timestamp][key] = replace(series, points=(point,))
+        for stamp, cohort in buckets.items():
             verdict = classify_series(cohort)
             if verdict.root_cause == skew_cause:
-                witnesses.append((verdict, history.region, len(next(iter(cohort.values())).points)))
+                witnesses.append((verdict, history.region, stamp))
             elif history.complete:
                 negatives.append(verdict)
     if witnesses:
-        rank = {"high": 3, "medium": 2, "low": 1, "none": 0}
-        best, region, buckets = max(witnesses, key=lambda w: (rank[w[0].severity], w[2]))
-        evidence.update(witness_region=region, comparable_buckets=buckets,
+        best, region, stamp = max(witnesses, key=lambda w: (w[2], w[0].max_bytes, w[1]))
+        evidence.update(witness_region=region, witness_hour=stamp.isoformat(), comparable_buckets=1,
                         witness_regions=sorted({w[1] for w in witnesses}))
         scope = f"Observed in {region} across {best.partition_count} identified partitions"
         if not evidence["coverage_complete"]:
             return replace(best, methodology={**best.methodology, **evidence},
-                           recommended_action=f"{scope} over {buckets} comparable buckets. "
+                           recommended_action=f"{scope} at {stamp.isoformat()}. "
                            "Coverage is partial; review this region's observed skew and "
                            "partition-key distribution before changing capacity or keys.")
         return replace(best, methodology={**best.methodology, **evidence},
