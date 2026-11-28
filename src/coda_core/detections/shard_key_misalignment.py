@@ -1,118 +1,108 @@
-"""DX-007: Shard-key misalignment (structural escalation of DX-002).
-
-DX-002 flags individual query *shapes* that fan out. DX-007 is the container-level **structural**
-verdict: when the **dominant** share of query executions fans out across multiple partitions, the
-problem is the **partition key itself** (the data model), not individual queries — so the remediation
-is to **re-key** the container (migration-class), not tweak queries.
-
-Signal: identical to DX-002 — ``CDBQueryRuntimeStatistics`` fan-out (``dcount(PartitionKeyRangeId)`` per
-``CorrelatedActivityId``). Like DX-002 it is **structural, not cost-gated** (ADR-0068, superseding
-ADR-0033's RU gate): DX-007 fires when fan-out dominates (>= 60% of query executions) at a material
-volume (>= DX-002's minimum fan-out rate), and its severity uses the same partition-count and
-volume bands as DX-002 (:func:`cross_partition_query.fanout_severity`). DX-007 reuses
-:func:`cross_partition_query.detect_cross_partition_queries` and applies a higher, structural
-threshold; it therefore requires **both** the ``QueryRuntimeStatistics`` and ``DataPlaneRequests``
-categories. There is **no** independent "is the partition key in the filter" signal: query text is
-anonymized (``p1``/``p2``) and ``AggregatedQueryRuntimeStatistics5M`` does not exist, so misalignment is
-**inferred from fan-out dominance**, not read from field names (ADR-0024).
-
-Correlation: when DX-007 fires it **supersedes DX-002** on the same container in the rollup — re-keying
-subsumes per-query fixes. Read-only / diagnose-only.
-"""
+"""DX-007: separate repeated all-query fan-out from a mixed workload's design-review prompt."""
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from dataclasses import dataclass
+from math import isfinite
 
-from coda_core.detections import cross_partition_query as cpq
+from coda_core.detections.cross_partition_query import MIXED_SPAN_NS, clean_query_text, production_window, query_shape_kql
 from coda_core.providers.base import TimeWindow
 from coda_core.providers.log_analytics import LogAnalyticsProvider
 
-
-def production_window(now: datetime | None = None) -> TimeWindow:
-    return cpq.production_window(now)
+__all__ = ["ShardKeyConfig", "detect_shard_key_misalignment", "production_window"]
 
 
 @dataclass(frozen=True)
 class ShardKeyConfig:
-    structural_pct: float = 60.0   # >= this share of executions fanning out => the KEY is misaligned
-    min_partitions: int = 2        # needs multiple physical partitions for a key-level problem
+    """Evidence required for the High exception, independent of query rate and cost."""
+
+    min_start_hours: int = 3
+    min_elapsed_hours: int = 4
 
 
 @dataclass(frozen=True)
 class ShardKeyVerdict:
-    is_misaligned: bool
-    # shard_key_misaligned | not_misaligned | log_analytics_unavailable | insufficient_data
-    root_cause: str
-    cross_partition_pct: float
-    container_partitions: int
-    worst_shape: str | None
-    severity: str  # high | medium | low | none
-    recommended_action: str
-    methodology: dict = field(default_factory=dict)
-    fanout_queries_per_sec: float = 0.0
+    """Only `rekey` is a graded finding; observations remain visible without counting twice."""
 
-    def as_dict(self) -> dict:
-        return asdict(self)
+    kind: str
+    summary: str
+    action: str
+    evidence: dict
 
 
-def _from_cpq(v: cpq.CrossPartitionVerdict, root_cause: str, cfg: ShardKeyConfig, **kw) -> ShardKeyVerdict:
-    method = dict(v.methodology)
-    method["dx007_structural_pct"] = cfg.structural_pct
-    method["dx007_min_partitions"] = cfg.min_partitions
-    base = dict(
-        is_misaligned=False, root_cause=root_cause, cross_partition_pct=v.cross_partition_pct,
-        container_partitions=v.container_partitions, worst_shape=v.worst_shape, severity="none",
-        recommended_action="", methodology=method,
-        fanout_queries_per_sec=v.fanout_queries_per_sec,
-    )
-    base.update(kw)
-    return ShardKeyVerdict(**base)
+def _cost(row: dict) -> float | None:
+    """Only call a sum a total when every fan-out activity has a usable charge."""
+    ru = row["observedRU"]
+    if row["missingCharges"] != 0 or ru is None or not isfinite(ru) or ru < 0:
+        return None
+    return float(ru)
+
+
+def _stamp(value) -> str | None:
+    """Use a JSON-safe timestamp for both SDK datetimes and recorded fixture rows."""
+    if value is None:
+        return None
+    return value.isoformat() if hasattr(value, "isoformat") else str(value)
 
 
 def detect_shard_key_misalignment(
-    la: LogAnalyticsProvider,
-    account_resource_id: str,
-    database: str,
-    container: str,
-    window: TimeWindow,
-    *,
-    config: ShardKeyConfig | None = None,
-    cpq_config: cpq.CrossPartitionConfig | None = None,
+    la: LogAnalyticsProvider, account_resource_id: str, database: str, container: str,
+    window: TimeWindow, *, history_issues: list[str], config: ShardKeyConfig | None = None,
 ) -> ShardKeyVerdict:
-    """End-to-end DX-007 for one container, escalating DX-002's fan-out signal."""
+    """Read totals computed before top-shape limits; never infer every query from examples."""
     cfg = config or ShardKeyConfig()
-    cpq_cfg = cpq_config or cpq.CrossPartitionConfig()
-    v = cpq.detect_cross_partition_queries(
-        la, account_resource_id, database, container, window, config=cpq_cfg
-    )
-
-    # Propagate the non-judgable cases (abstain) so the report's LA guardrail still fires.
-    if v.root_cause in ("log_analytics_unavailable", "insufficient_data"):
-        return _from_cpq(v, v.root_cause, cfg)
-
-    misaligned = (
-        v.measurements.share_pct >= cfg.structural_pct
-        and v.container_partitions >= cfg.min_partitions
-        and v.measurements.rate_qps >= cpq_cfg.min_rate_qps
-    )
-    if not misaligned:
-        # Aligned, single-partition, occasional, or only a per-query problem (DX-002's domain).
-        return _from_cpq(v, "not_misaligned", cfg)
-
-    severity = cpq.fanout_severity(v.container_partitions, v.measurements.rate_qps, cpq_cfg)
-    action = (
-        f"{v.cross_partition_pct:.0f}% of this container's query executions fan out across "
-        f"~{v.container_partitions} physical partitions (about {v.fanout_queries_per_sec:.2f} fan-out "
-        f"queries per second) — the **partition key is structurally "
-        f"misaligned** with the workload (this is the data model, not a single bad query). Re-key the "
-        f"container so the dominant query filter becomes the partition key. This is migration-class: "
-        f"create a new container with the corrected key, backfill the data, and cut over. Per-query "
-        f"fixes (DX-002) cannot resolve a fundamentally mismatched key, and the cost grows as the "
-        f"container adds partitions."
-    )
-    return _from_cpq(
-        v, "shard_key_misaligned", cfg, is_misaligned=True, severity=severity,
-        recommended_action=action,
-    )
+    try:
+        rows = la.query_resource(account_resource_id, query_shape_kql(database, container, window),
+                                 (window.start, window.end))
+    except Exception as exc:  # noqa: BLE001 - report the failed read, not an aligned key
+        return ShardKeyVerdict("incomplete", f"Log Analytics query failed: {exc}", "",
+                               {"abstained": "query_failed", "error": str(exc)})
+    totals = [r for r in rows if r.get("recordKind") == "total"]
+    if len(totals) != 1:
+        reason = "No query telemetry" if not rows else "No unique complete execution summary"
+        return ShardKeyVerdict("incomplete", f"{reason} for this container.", "", {"abstained": reason})
+    row = totals[0]
+    fan, single, unknown = (row[k] for k in ("fanExecutions", "singleExecutions", "unknownGroups"))
+    observed_hours = (window.end - window.start).total_seconds() / 3600
+    evidence = dict(fanout_executions=fan, single_partition_executions=single,
+                    unclassifiable_groups=unknown, occupied_start_hours=row["occupiedHours"],
+                    first_fanout_start=_stamp(row["firstFan"]), last_fanout_start=_stamp(row["lastFan"]),
+                    total_fanout_ru=_cost(row), observation_start=window.start.isoformat(),
+                    observation_end=window.end.isoformat(), history_issues=history_issues)
+    if unknown:
+        evidence["abstained"] = "unclassifiable_queries"
+    prefix = f"{fan:,} fan-out and {single:,} single-partition logical queries observed"
+    if (fan and not single and not unknown and not history_issues and observed_hours == 24
+            and row["occupiedHours"] >= cfg.min_start_hours and row["spanNs"] is not None
+            and row["spanNs"] >= cfg.min_elapsed_hours * 3_600_000_000_000):
+        return ShardKeyVerdict("rekey", f"All {fan:,} observed logical queries fanned out, with starts "
+                               f"in {row['occupiedHours']} distinct UTC hours spanning at least "
+                               f"{cfg.min_elapsed_hours} hours.",
+                               "Re-key the container to serve the recurring application lookups. "
+                               "Verify the replacement key against the access patterns before migration.", evidence)
+    if fan and single:
+        patterns = []
+        for r in rows:
+            if (r.get("recordKind") == "review" and r["fanExecutions"] >= 2
+                    and r["patternSpanNs"] >= MIXED_SPAN_NS):
+                patterns.append(dict(query_shape=clean_query_text(r["QueryText"]),
+                                     executions=r["fanExecutions"], total_ru=_cost(r),
+                                     executions_per_hour=r["fanExecutions"] / observed_hours,
+                                     first_start=_stamp(r["firstFan"]), last_start=_stamp(r["lastFan"])))
+        if patterns:
+            patterns.sort(key=lambda p: (p["total_ru"] is None, -(p["total_ru"] or 0),
+                                         -p["executions"], p["query_shape"]))
+            evidence["recurring_patterns"] = patterns
+            p = patterns[0]
+            charge = f"{p['total_ru']:,.2f} measured RU" if p["total_ru"] is not None else "total RU unknown"
+            return ShardKeyVerdict("review", f"Partition-key design review: a recurring query pattern "
+                                   f"fanned out {p['executions']:,} times in {observed_hours:g} hours "
+                                   f"({charge}). Can the caller supply the existing partition key?",
+                                   "", evidence)
+    if unknown:
+        return ShardKeyVerdict("incomplete", f"Query fan-out: {prefix}; {unknown:,} unclassifiable "
+                               "groups prevent an all-query conclusion.", "", evidence)
+    if not fan:
+        return ShardKeyVerdict("scoped", f"{prefix}.", "", evidence)
+    detail = f"; {'; '.join(history_issues)}" if history_issues else ""
+    return ShardKeyVerdict("observation", f"{prefix}{detail}; no re-key recommendation.", "", evidence)

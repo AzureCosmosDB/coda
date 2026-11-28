@@ -23,6 +23,7 @@ THROUGHPUT_METER_UNIT_RU = 100.0
 STANDARD_METER = "100 RU/s"
 MULTI_WRITE_METER = "100 Multi-master RU/s"
 THROUGHPUT_METERS = (STANDARD_METER, MULTI_WRITE_METER)
+MANUAL_ZONE_SURCHARGE = 0.25
 
 
 def throughput_meter(config: AccountConfig | None) -> str | None:
@@ -63,13 +64,13 @@ class BillingQuantity:
 
 def billing_quantity(config: AccountConfig, meter: str, mode: str, recovered_ru: float,
                      *, already_regional: bool) -> BillingQuantity | None:
-    """Translate offer-local capacity or DX-008's already-regional amount exactly once."""
+    """Translate offer-local or already-regional capacity exactly once."""
     if (meter != throughput_meter(config) or meter not in THROUGHPUT_METERS
             or mode not in {"manual", "autoscale"} or not math.isfinite(recovered_ru) or recovered_ru <= 0):
         return None
     if already_regional:
         if mode != "manual" or meter != MULTI_WRITE_METER:
-            return None  # Only DX-008 supplies a regional input.
+            return None
         return BillingQuantity(meter, recovered_ru, "removed_regional_ru", config.region_count - 1,
                                0, 1.0, recovered_ru / THROUGHPUT_METER_UNIT_RU)
     zones = 0
@@ -82,9 +83,30 @@ def billing_quantity(config: AccountConfig, meter: str, mode: str, recovered_ru:
             if type(count) is not int or not 0 <= count <= config.region_count:
                 return None
             zones = count
-    units = recovered_ru / THROUGHPUT_METER_UNIT_RU * (config.region_count + 0.25 * zones) * factor
+    units = recovered_ru / THROUGHPUT_METER_UNIT_RU * (config.region_count + MANUAL_ZONE_SURCHARGE * zones) * factor
     return BillingQuantity(meter, recovered_ru, "offer_ru_per_region", config.region_count, zones,
                            factor, units) if math.isfinite(units) else None
+
+
+def regional_mode_units(config: AccountConfig, meter: str, capacity: float) -> dict[str, tuple[float, float]]:
+    """Return full-capacity manual/autoscale units per hour in each region, never a blended price."""
+    manual = billing_quantity(config, meter, "manual", capacity, already_regional=False)
+    auto = billing_quantity(config, meter, "autoscale", capacity, already_regional=False)
+    if not manual or not auto:
+        return {}
+    names = set(config.location_names)
+    if meter == STANDARD_METER and config.zone_redundant_locations is not None:
+        zones = set(config.zone_redundant_locations)
+        if (not zones <= names or len(zones) != manual.zone_premium_regions
+                or len(zones) != len(config.zone_redundant_locations)):
+            return {}
+    elif manual.zone_premium_regions in (0, len(names)):
+        zones = names if manual.zone_premium_regions else set()
+    else:
+        return {}
+    base = capacity / THROUGHPUT_METER_UNIT_RU
+    return {r: (base * (1 + MANUAL_ZONE_SURCHARGE * (r in zones)), base * auto.mode_factor)
+            for r in config.location_names}
 
 
 RATE_SOURCE_CUSTOMER_AMORTIZED_BILL = "customer_amortized_bill"

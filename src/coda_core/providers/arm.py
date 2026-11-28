@@ -24,6 +24,8 @@ from azure.core.credentials import TokenCredential
 from azure.core.exceptions import AzureError, HttpResponseError, ResourceNotFoundError
 from azure.mgmt.cosmosdb import CosmosDBManagementClient
 
+from .diagnostic_settings import LogExport, read_log_exports
+
 
 @dataclass(frozen=True)
 class ThroughputOffer:
@@ -148,7 +150,7 @@ class AccountConfig:
     subscription_name: str | None = None  # subscription display name (env-classification signal)
     default_consistency_level: str | None = None  # e.g. "Session", "Strong", "BoundedStaleness"
     is_serverless: bool = False           # EnableServerless capability (a per-account capacity mode)
-    is_pppra_enabled: bool = False        # enablePerRegionPerPartitionAutoscale
+    is_pppra_enabled: bool | None = None  # an omitted enablePerRegionPerPartitionAutoscale is unknown
     capabilities: tuple[str, ...] = ()    # all capability names (e.g. EnableServerless, EnableMongo)
     backup_mode: str | None = None        # ARM ``backupPolicy.type``: "Continuous" (PITR) | "Periodic"
     continuous_backup_tier: str | None = None  # Continuous7Days/30Days/35Days (PITR only)
@@ -157,6 +159,11 @@ class AccountConfig:
     all_versions_and_deletes_enabled: bool | None = None  # enablement, not consumer activity
     zone_redundant_region_count: int | None = None  # None if even one location lacks explicit evidence
     free_tier: bool | None = None
+    priority_based_execution: bool | None = None
+    burst_capacity: bool | None = None
+    capability_inventory_complete: bool = False
+    reported_replica_regions: tuple[str, ...] = ()
+    zone_redundant_locations: tuple[str, ...] | None = None  # named zone premiums only from complete location flags
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -184,7 +191,8 @@ class AccountConfig:
 def account_config_from_arm(acct, *, subscription_name: str | None = None) -> AccountConfig:
     """Parse an ARM ``DatabaseAccountGetResults`` into a :class:`AccountConfig` (pure, no I/O)."""
     kind = getattr(acct, "kind", None) or ""
-    cap_names = tuple(n for n in (getattr(c, "name", "") for c in (getattr(acct, "capabilities", None) or [])) if n)
+    cap_names = tuple(n for n in (getattr(c, "name", "") for c in (getattr(acct, "capabilities", None) or []))
+                      if isinstance(n, str) and n.strip())
     caps = set(cap_names)
     is_mongo = kind.lower() == "mongodb" or "EnableMongo" in caps
     write_locs = getattr(acct, "write_locations", None) or []
@@ -207,6 +215,10 @@ def account_config_from_arm(acct, *, subscription_name: str | None = None) -> Ac
     migration_target = getattr(migration, "target_type", None)
     # Older SDK/API models omit this flag. Absence is unknown, never evidence of disabled usage.
     full_fidelity = getattr(acct, "enable_all_versions_and_deletes_change_feed", None)
+    capability_inventory = getattr(acct, "capabilities", None)
+    priority = getattr(acct, "enable_priority_based_execution", None)
+    burst = getattr(acct, "enable_burst_capacity", None)
+    dynamic_scaling = getattr(acct, "enable_per_region_per_partition_autoscale", None)
     return AccountConfig(
         name=getattr(acct, "name", "") or "",
         api_kind=kind,
@@ -217,12 +229,21 @@ def account_config_from_arm(acct, *, subscription_name: str | None = None) -> Ac
         location_names=names,
         zone_redundant_region_count=(sum(zone_flags) if zone_flags and
                                      all(isinstance(v, bool) for v in zone_flags) else None),
+        zone_redundant_locations=(tuple(n for n, flag in zip(names, zone_flags) if flag)
+                                  if len(names) == len(zone_flags) and zone_flags
+                                  and all(isinstance(v, bool) for v in zone_flags) else None),
         free_tier=getattr(acct, "enable_free_tier", None),
+        priority_based_execution=priority if isinstance(priority, bool) else None,
+        burst_capacity=burst if isinstance(burst, bool) else None,
+        capability_inventory_complete=(isinstance(capability_inventory, (list, tuple))
+                                       and len(cap_names) == len(capability_inventory)),
+        reported_replica_regions=tuple(getattr(loc, "location_name", None) or "" for loc in
+                                       (*write_locs, *(getattr(acct, "read_locations", None) or ()))),
         tags=dict(getattr(acct, "tags", None) or {}),
         subscription_name=subscription_name,
         default_consistency_level=str(consistency) if consistency is not None else None,
         is_serverless="EnableServerless" in caps,
-        is_pppra_enabled=bool(getattr(acct, "enable_per_region_per_partition_autoscale", False) or False),
+        is_pppra_enabled=dynamic_scaling if isinstance(dynamic_scaling, bool) else None,
         capabilities=cap_names,
         backup_mode=_enum_text(backup_mode),
         continuous_backup_tier=_enum_text(continuous_tier),
@@ -337,6 +358,16 @@ class ArmProvider:
         system_data = getattr(acct, "system_data", None)
         return getattr(system_data, "created_at", None) if system_data else None
 
+    def diagnostic_log_exports(self, resource_id: str) -> dict[str, LogExport]:
+        """Check DX-002/007 and optional DX-015 export configuration once for the account."""
+        from azure.mgmt.monitor import MonitorManagementClient
+
+        with MonitorManagementClient(self._credential, self._subscription_id) as monitor:
+            return read_log_exports(monitor, resource_id, {
+                "CDBQueryRuntimeStatistics": "QueryRuntimeStatistics", "CDBDataPlaneRequests": "DataPlaneRequests",
+                "CDBPartitionKeyStatistics": "PartitionKeyStatistics",
+            }, connection_timeout=5, read_timeout=20, retry_total=0)
+
     def get_container_created_at(
         self, resource_group: str, account: str, database: str, container: str,
         *, lookback_days: int = 89,
@@ -431,6 +462,7 @@ class ArmProvider:
                     issues.append(f"{db_name} database offer: {type(exc).__name__}")
             for cont in listed(f"{db_name} container enumeration", lambda: sql.list_sql_containers(
                     resource_group, account, db_name), unresolved):
+                ages[db_name, cont.name] = ResourceAge.from_arm(cont)
                 try:
                     ct = sql.get_sql_container_throughput(resource_group, account, db_name, cont.name)
                     offers.append(
@@ -438,7 +470,6 @@ class ArmProvider:
                                               level="container", owner_rid=getattr(cont.resource, "rid", None))
                     )
                     dedicated.append(cont.name)
-                    ages[db_name, cont.name] = ResourceAge.from_arm(cont)
                 except AzureError as exc:
                     if pool and isinstance(exc, ResourceNotFoundError):
                         shared.append(cont.name)

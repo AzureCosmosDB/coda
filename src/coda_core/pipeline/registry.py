@@ -15,7 +15,6 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import timedelta
 
-from azure.core.exceptions import AzureError
 
 from coda_core.detections import autoscale_signal as asig
 from coda_core.detections import consistency as cons
@@ -24,6 +23,7 @@ from coda_core.detections import error_analysis as ea
 from coda_core.detections import hot_partition as hp
 from coda_core.detections import idle_container as idle
 from coda_core.detections import indexing_cost as ic
+from coda_core.detections.logical_partition_storage import LogicalStorage
 from coda_core.detections import mode_switch as ms
 from coda_core.detections import multi_region_write as mrw
 from coda_core.detections import over_provisioning as op
@@ -50,7 +50,9 @@ from coda_core.framework.cost_rate import (
     throughput_meter,
 )
 from coda_core.pipeline.capabilities import (
+    CAP_COST_MANAGEMENT,
     CAP_LA_DATAPLANE,
+    CAP_LA_KEYSTATS,
     CAP_LA_QUERYSTATS,
     CAP_LA_REQUEST_AGGREGATES,
     CAPABILITIES,
@@ -93,56 +95,21 @@ THRESHOLD_VALIDATED_DETECTIONS = frozenset({
     "DX-001",  # over-provisioning: 1%/5% materiality + 30% peak (fleet-utilization-distribution.md)
     "DX-002",  # structural fan-out (avg fan-out ≥1.5, ≥10% share), severity by partitions × rate (ADR-0068)
     "DX-003",  # shared-pool monopolization 60% (55% of shared DBs) + throttle (grounded)
-    "DX-004",  # idle ≈ 0 requests (definitional)
+    "DX-004",  # exactly zero consumed RU across 30 measured days (definitional)
     "DX-005",  # throttle 5%/20% ≈ p25/p50 of fleet throttle dist; 90% saturation = 99.8% fleet
     "DX-006",  # shares DX-005's fleet-validated 90% saturation cutoff
-    "DX-007",  # structural shard-key misalignment: ≥60% fan-out share, reuses DX-002 severity (ADR-0068)
     "DX-008",  # multi-region-writes config fact (deterministic)
     "DX-009",  # partition-merge: multi-partition + low RU (86% of multi-partition are ≤6000 RU)
-    "DX-010",  # uncontrolled ingestion: write-RU ≥80% (20.2% of fleet; per-op RU telemetry) + throttle ≥10%/20%
     "DX-011",  # autoscale max over-provisioned: peak <30% of max (74% of autoscale fleet; autoscale RU telemetry)
-    "DX-012",  # manual→autoscale: bursty peak/avg ≥5 (8.4% of manual fleet)
-    "DX-013",  # autoscale→manual: steady avg ≥66% & ratio ≤1.3 (3.3% of autoscale fleet)
-    "DX-014",  # serverless sporadic <10% avg/peak (70% of fleet) + verified 5,000 RU/s ceiling
-    "DX-015",  # storage skew: 0.7 balance (13.2% of multi-partition) + 40/25 GiB of verified 50 GiB
+    "DX-014",  # deterministic equal-period throughput cost comparison; no traffic-shape cutoff
     "DX-016",  # consistency-level config fact (deterministic)
-    "DX-017",  # storage growth: <30d/<90d-to-50GiB horizons (13.3%/43% of growing material partitions)
-    "DX-018",  # serverless throttle 5%/20% (fleet throttle distribution)
     "DX-019",  # paid continuous tier + non-production config facts (deterministic)
-    "DX-022",  # multi-region + provisioned + PRPA-disabled config facts (deterministic)
-    "DX-024",  # index/data >0.3 Low (27.5% of fleet), >1.0 Medium (3.3%) (dx024-indexing-ratio.md)
+    "DX-022",  # verified autoscale offer and explicitly disabled dynamic scaling (deterministic)
+    "DX-024",  # index/data >0.3 footprint (27.5% in historical sample); not severity or savings
 })
 
-# Conditional investigation only: account status counts do not establish a request sequence.
-DX020_AGENT_KIT_RULES = {
-    404: "sdk-conditional-create-etag",
-    409: "sdk-conditional-create-etag",
-    412: "sdk-etag-concurrency",
-}
-
-
-def dx020_agent_kit_rule(status: str, dominant_code: int | None) -> str | None:
-    """Select verified guidance only for findings dominated by an explicitly mapped status."""
-    if status != STATUS_FINDING or dominant_code is None:
-        return None
-    return DX020_AGENT_KIT_RULES.get(dominant_code)
-
-
-# Finding-only remediation routing for DX-021's detector-authored dominant category.
-DX021_AGENT_KIT_RULES = {
-    "write": "sdk-ingestion-rate-control",
-    "read": "partition-avoid-hotspots",
-    "query": "query-avoid-cross-partition",
-    "execute": "monitoring-ru-consumption",
-    "other": "monitoring-throttling",
-}
-
-
-def dx021_agent_kit_rule(status: str, dominant_category: str | None) -> str | None:
-    """Map a DX-021 finding to remediation; clean and abstained results never emit a rule."""
-    if status != STATUS_FINDING:
-        return None
-    return DX021_AGENT_KIT_RULES.get(dominant_category or "other", DX021_AGENT_KIT_RULES["other"])
+# Private campaign metadata also checks this: operation recipients alone have no prescribed fix.
+DX021_AGENT_KIT_RULES: dict[str, str] = {}
 
 
 def threshold_status_for(detection_id: str) -> str:
@@ -158,6 +125,7 @@ class DetectionAdapter:
     run: Callable[[DetectionContext], Finding]
     requires: frozenset[str] = frozenset()
     minimum_age: timedelta | None = None
+    optional_requires: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -247,7 +215,7 @@ def _is_positive_finite(value: object) -> bool:
 
 
 def _savings_fields(
-    ctx: DetectionContext | AccountDetectionContext,
+    ctx: DetectionContext,
     recoverable_ru: float | None,
 ) -> dict:
     """Translate removable capacity into bill-derived dollar fields, or empty when not defensible.
@@ -275,14 +243,11 @@ def _savings_fields(
         or rate.basis.get("rate_scope") != rate.rate_scope
     ):
         return {}
-    if isinstance(ctx, AccountDetectionContext):
-        config, mode, regional = ctx.config, "manual", True  # DX-008's prequalified removed regions.
-    else:
-        config, mode, regional = ctx.account_config, ctx.offer.mode, False
+    config = ctx.account_config
     meter = throughput_meter(config)
     if meter is None or config is None or rate.basis.get("meters") != [meter]:
         return {"evidence": {"throughput_pricing_issue": "Matching billing meter or topology unavailable"}}
-    quantity = billing_quantity(config, meter, mode, recoverable_ru, already_regional=regional)
+    quantity = billing_quantity(config, meter, ctx.offer.mode, recoverable_ru, already_regional=False)
     if quantity is None:
         return {"evidence": {"throughput_pricing_issue":
                              "Regional billed quantity is unknown; verify offer mode and regional zone settings."}}
@@ -420,9 +385,10 @@ def run_container(
     if caps is not None and (missing := caps.missing(adapter.requires)):
         return gated_finding(adapter.detection_id, adapter.title, _unit(ctx), missing, caps)
     try:
-        if ctx.mode == MODE_PRODUCTION and adapter.minimum_age and ctx.resource_created_at is None:
+        if (ctx.mode == MODE_PRODUCTION and adapter.minimum_age and ctx.resource_created_at is None
+                and adapter.detection_id != "DX-004"):  # DX-004 reads usage before gating retirement.
             # A sufficiently old same-instance modification proves a lower bound, not a birth date.
-            anchor = (ctx.partition_anchor if adapter.detection_id in {"DX-005", "DX-006", "DX-015"}
+            anchor = (ctx.partition_anchor if adapter.detection_id == "DX-015"
                       else ctx.now)
             if ctx.resource_existed_by is None or anchor - ctx.resource_existed_by < adapter.minimum_age:
                 return Finding(adapter.detection_id, adapter.title, _unit(ctx), STATUS_ABSTAINED,
@@ -471,15 +437,36 @@ def run_inventory(
 
 # --- DX-002: cross-partition query fan-out (Log Analytics; container + serverless) ----
 
+def _fanout_window(ctx, *, one_day: bool = False) -> tuple[TimeWindow | None, list[str]]:
+    """Clip to known lifetime and use the same verified resource/log history for both adapters."""
+    requested = ctx.window_for(cpq.production_window(ctx.now))
+    end = min(ctx.now, requested.end)
+    start = max(requested.start, ctx.resource_created_at) if ctx.resource_created_at else requested.start
+    if one_day:
+        start = max(start, end - timedelta(days=1))
+    if start >= end:
+        return None, ["no elapsed query observation window"]
+    issues = []
+    if end - start < timedelta(days=1):
+        issues.append("less than 24 hours observed")
+    existed_by = ctx.resource_created_at or ctx.resource_existed_by
+    if existed_by is None or existed_by > start:
+        issues.append("container history unverified at window start")
+    logs = ctx.fanout_log_history
+    if logs is None or logs.since is None or logs.since > start:
+        issues.append((logs.issue if logs else None) or "24-hour logging history unverified")
+    return TimeWindow(start, end, requested.granularity), issues
+
+
 def _dx002_finding(
-    la, account_resource_id: str, database: str, container: str, window, unit: UnitRef,
+    ctx: DetectionContext | ServerlessDetectionContext, unit: UnitRef,
 ) -> Finding:
     """Shared DX-002 verdict→Finding mapping, used by both the container and serverless passes.
 
     ``la is None`` (no Log Analytics provider) abstains with the ``la_unavailable`` flag so the report's
     consolidated "enable Log Analytics" guardrail picks it up.
     """
-    if la is None:
+    if ctx.la is None:
         return Finding(
             detection_id="DX-002", title="Cross-partition query fan-out", unit=unit,
             status=STATUS_ABSTAINED, severity="none",
@@ -487,8 +474,36 @@ def _dx002_finding(
             recommended_action="", agent_kit_rule=None, threshold_status=THRESHOLD_VALIDATED,
             evidence={"abstained": "no Log Analytics provider", "la_unavailable": True},
         )
-    v = cpq.detect_cross_partition_queries(la, account_resource_id, database, container, window)
-    if v.root_cause in ("log_analytics_unavailable", "insufficient_data"):
+    window, issues = _fanout_window(ctx)
+    if window is None:
+        return Finding("DX-002", "Cross-partition query fan-out", unit, STATUS_ABSTAINED, "none",
+                       "No elapsed query observation window for this container.", "", None, THRESHOLD_VALIDATED,
+                       evidence={"abstained": "no_elapsed_window"})
+    start, end = window.start, window.end
+    existed_by = ctx.resource_created_at or ctx.resource_existed_by
+    logs = ctx.fanout_log_history
+    logging_known = logs is not None and logs.since is not None and logs.since <= start
+    v = cpq.detect_cross_partition_queries(ctx.la, ctx.account_resource_id, unit.database, unit.container, window)
+    evidence = {**v.methodology, "observation_start": start.isoformat(), "observation_end": end.isoformat(),
+                "container_existed_by": existed_by.isoformat() if existed_by else None,
+                "log_configuration_since": logs.since.isoformat() if logs and logs.since else None,
+                "history_issues": issues}
+    if v.total_queries > 0:
+        evidence.update(total_queries=v.total_queries, observed_partitions=v.container_partitions,
+                        fanout_executions=v.measurements.executions)
+    if v.root_cause == "log_analytics_unavailable":
+        status, summary = STATUS_ABSTAINED, f"Insufficient data: {v.methodology['abstained']}"
+    elif issues:
+        # Dividing by an unverified day would silently treat unknown time as quiet.
+        if not logging_known or existed_by is None or existed_by > start:
+            evidence.pop("fanout_queries_per_sec", None)
+        observed = (f"{evidence['fanout_executions']:,} of {v.total_queries:,} observed queries fanned out "
+                    f"(widest query touched {v.container_partitions} partitions)"
+                    if "fanout_executions" in evidence else "No usable query observations")
+        status = STATUS_ABSTAINED
+        summary = f"Query fan-out: {observed}; not graded ({'; '.join(issues)})."
+        evidence["abstained"] = "insufficient_fanout_history"
+    elif v.root_cause == "insufficient_data":
         status = STATUS_ABSTAINED
         summary = f"Insufficient data: {v.methodology.get('abstained', v.root_cause)}"
     elif v.is_cross_partition:
@@ -506,123 +521,125 @@ def _dx002_finding(
         status, summary = STATUS_NOT_DETECTED, "Queries are partition-scoped"
     return Finding(
         detection_id="DX-002", title="Cross-partition query fan-out", unit=unit, status=status,
-        severity=v.severity, summary=summary, recommended_action=v.recommended_action,
-        agent_kit_rule="query-avoid-cross-partition" if v.is_cross_partition else None,
-        threshold_status=THRESHOLD_VALIDATED, evidence=v.methodology,
+        severity=v.severity if status == STATUS_FINDING else "none", summary=summary,
+        recommended_action=v.recommended_action if status == STATUS_FINDING else "",
+        agent_kit_rule="query-avoid-cross-partition" if status == STATUS_FINDING else None,
+        threshold_status=THRESHOLD_VALIDATED, evidence=evidence,
     )
 
 
 def _run_dx002(ctx: DetectionContext) -> Finding:
-    o = ctx.offer
-    return _dx002_finding(
-        ctx.la, ctx.account_resource_id, o.database, o.container,
-        ctx.window_for(cpq.production_window(ctx.now)), _unit(ctx),
-    )
+    return _dx002_finding(ctx, _unit(ctx))
 
 
 # --- DX-007: shard-key misalignment (structural escalation of DX-002; container + serverless) ----
 
-def _shardkey_finding(
-    la, account_resource_id: str, database: str, container: str, window, unit: UnitRef,
-) -> Finding:
-    """Shared DX-007 verdict→Finding mapping (container and serverless passes)."""
-    if la is None:
+def _shardkey_finding(ctx: DetectionContext | ServerlessDetectionContext, unit: UnitRef) -> Finding:
+    """Expose observations separately from graded re-key advice for both container surfaces."""
+    if ctx.la is None:
         return Finding(
             detection_id="DX-007", title="Shard-key misalignment", unit=unit,
             status=STATUS_ABSTAINED, severity="none",
             summary="Insufficient data: Log Analytics not configured",
-            recommended_action="", agent_kit_rule=None, threshold_status=THRESHOLD_VALIDATED,
+            recommended_action="", agent_kit_rule=None, threshold_status=THRESHOLD_PROPOSAL,
             evidence={"abstained": "no Log Analytics provider", "la_unavailable": True},
         )
-    v = skm.detect_shard_key_misalignment(la, account_resource_id, database, container, window)
-    if v.root_cause in ("log_analytics_unavailable", "insufficient_data"):
-        status = STATUS_ABSTAINED
-        summary = f"Insufficient data: {v.methodology.get('abstained', v.root_cause)}"
-    elif v.is_misaligned:
-        status = STATUS_FINDING
-        summary = (f"{v.cross_partition_pct:.0f}% of queries fan out across ~{v.container_partitions} "
-                   f"partitions at ~{v.fanout_queries_per_sec:.2f} fan-out queries/s — the partition "
-                   f"key is structurally misaligned (re-key)")
-    else:
-        status = STATUS_NOT_DETECTED
-        summary = "Partition key aligned with the workload (no sustained dominant cross-partition fan-out)"
+    window, issues = _fanout_window(ctx, one_day=True)
+    if window is None:
+        return Finding("DX-007", "Shard-key misalignment", unit, STATUS_ABSTAINED, "none",
+                       "No elapsed query observation window.", "", None, THRESHOLD_PROPOSAL,
+                       evidence={"abstained": "no_elapsed_window"})
+    v = skm.detect_shard_key_misalignment(ctx.la, ctx.account_resource_id, unit.database, unit.container,
+                                         window, history_issues=issues)
+    high = v.kind == "rekey"
     return Finding(
-        detection_id="DX-007", title="Shard-key misalignment", unit=unit, status=status,
-        severity=v.severity, summary=summary, recommended_action=v.recommended_action,
-        agent_kit_rule="partition-rekey-migration" if v.is_misaligned else None,
-        threshold_status=THRESHOLD_VALIDATED, evidence=v.methodology,
+        detection_id="DX-007", title="Shard-key misalignment", unit=unit,
+        status=STATUS_FINDING if high else STATUS_ABSTAINED if v.kind == "incomplete" else STATUS_NOT_DETECTED,
+        severity="high" if high else "none", summary=v.summary, recommended_action=v.action,
+        agent_kit_rule="partition-rekey-migration" if high else None, threshold_status=THRESHOLD_PROPOSAL,
+        evidence={**v.evidence, "fanout_result": v.kind},
     )
 
 
 def _run_dx007(ctx: DetectionContext) -> Finding:
-    o = ctx.offer
-    return _shardkey_finding(
-        ctx.la, ctx.account_resource_id, o.database, o.container,
-        ctx.window_for(skm.production_window(ctx.now)), _unit(ctx),
-    )
+    return _shardkey_finding(ctx, _unit(ctx))
 
 
 # --- DX-010: uncontrolled ingestion / burst writes (container-scoped, Log Analytics) --
 
 def _run_dx010(ctx: DetectionContext) -> Finding:
+    """Report server-side operation counts, not a causal writer or application failure."""
     unit = _unit(ctx)
     o = ctx.offer
     if ctx.la is None:
         return Finding(
-            detection_id="DX-010", title="Uncontrolled ingestion", unit=unit,
+            detection_id="DX-010", title="Write activity and server-side throttling", unit=unit,
             status=STATUS_ABSTAINED, severity="none",
             summary="Insufficient data: Log Analytics not configured",
-            recommended_action="", agent_kit_rule=None, threshold_status=THRESHOLD_VALIDATED,
+            recommended_action="", agent_kit_rule=None, threshold_status=THRESHOLD_PROPOSAL,
             evidence={"abstained": "no Log Analytics provider", "la_unavailable": True},
         )
     if ctx.dataplane_source is None:
         raise ValueError("No request-log source was selected for DX-010.")
     v = ui.detect_uncontrolled_ingestion(
         ctx.la, ctx.account_resource_id, o.database, o.container,
-        ctx.window_for(ui.production_window(ctx.now, ctx.dataplane_source)),
-        source=ctx.dataplane_source,
+        ctx.window_for(ui.production_window(ctx.now)), source=ctx.dataplane_source, as_of=ctx.now,
     )
     if v.root_cause in ("log_analytics_unavailable", "insufficient_data", "query_error"):
         status = STATUS_ABSTAINED
-        summary = f"Insufficient data: {v.methodology.get('abstained', v.root_cause)}"
-    elif v.is_uncontrolled:
-        status = STATUS_FINDING
-        summary = (f"Write-dominant ({v.write_ru_pct:.0f}% of RU) and throttling at "
-                   f"{v.throttle_rate_pct:.0f}% — uncontrolled ingestion (rate-control)")
+        summary = f"Insufficient data: {v.summary}"
     else:
-        status = STATUS_NOT_DETECTED
-        summary = (f"Ingestion controlled ({v.write_ru_pct:.0f}% write RU, "
-                   f"{v.throttle_rate_pct:.1f}% throttling)")
+        status = STATUS_FINDING if v.is_uncontrolled else STATUS_NOT_DETECTED
+        summary = v.summary
+    action = v.recommended_action
+    burst = v.methodology.get("burst_factor")
+    if action and burst is not None:
+        action += (f" Across the observation window, peak write RU was {burst:.1f}× the average "
+                   f"of observed {v.methodology['burst_interval']} write buckets (context only).")
     return Finding(
-        detection_id="DX-010", title="Uncontrolled ingestion", unit=unit, status=status,
-        severity=v.severity, summary=summary, recommended_action=v.recommended_action,
+        detection_id="DX-010", title=("Throttling during write activity" if v.is_uncontrolled
+                                      else "Write activity and server-side request observations"), unit=unit, status=status,
+        severity=v.severity, summary=summary, recommended_action=action,
         agent_kit_rule="sdk-ingestion-rate-control" if v.is_uncontrolled else None,
-        threshold_status=THRESHOLD_VALIDATED, evidence=v.methodology,
+        threshold_status=THRESHOLD_PROPOSAL, evidence=v.methodology,
     )
 
 
 # --- DX-001: manual over-provisioning -------------------------------------------------
 
 def _run_dx001(ctx: DetectionContext) -> Finding:
+    """Expose measured utilization without prematurely leaking a sizing target or money."""
     o = ctx.offer
     v = op.detect_over_provisioning(
         ctx.metrics, ctx.account_resource_id, o.database, o.container, o.provisioned_ru,
         ctx.window_for(op.production_window(ctx.now)),
-        scope_provisioned_ru=ctx.scope_provisioned_ru, resource_created_at=ctx.created_at(),
-        owner_rid=o.owner_rid,
+        scope_provisioned_ru=ctx.scope_provisioned_ru, resource_created_at=ctx.resource_created_at,
+        resource_existed_by=ctx.resource_existed_by, owner_rid=o.owner_rid,
     )
     recoverable = v.wasted_ru if v.is_over_provisioned else None
     sav = _savings_fields(ctx, recoverable)
     if v.band == "insufficient_data":
         status, summary = STATUS_ABSTAINED, f"Insufficient data: {v.methodology.get('abstained', '')}"
+    elif v.methodology.get("advice_stage") in {"review", "observation"}:
+        status = STATUS_NOT_DETECTED
+        summary = (f"Observed manual utilization: p99 {v.trigger_pct:.1f}%, peak "
+                   f"{v.methodology['peak_pct']:.1f}% of {o.provisioned_ru:g} RU/s "
+                   f"over {v.methodology['evaluated_samples']} samples; "
+                   f"{v.methodology['latest_consecutive_hours']} consecutive completed hours.")
+        if v.methodology["unverified_leading_zero_samples"]:
+            summary += " Leading zero readings without resource-existence evidence do not establish history."
     elif v.is_over_provisioned:
         status = STATUS_FINDING
-        summary = (f"{v.band} utilization (p99 {v.trigger_pct:.1f}% of {o.provisioned_ru:.0f} RU/s); "
+        summary = (f"{v.band} utilization (p99 {v.trigger_pct:.1f}%, peak {v.methodology['peak_pct']:.1f}% "
+                   f"of {o.provisioned_ru:.0f} RU/s across {v.methodology['evaluated_samples']} completed hours); "
                    f"~{v.wasted_ru:.0f} RU/s recoverable by right-sizing")
     else:
-        status, summary = STATUS_NOT_DETECTED, f"Utilization healthy (p99 {v.trigger_pct:.1f}%)"
+        status, summary = STATUS_NOT_DETECTED, (f"Measured p99 utilization {v.trigger_pct:.1f}%, "
+                                                f"peak {v.methodology['peak_pct']:.1f}%; no downsize indicated.")
     action = (f"Right-size {o.provisioned_ru:.0f} -> {v.recommended_ru:.0f} RU/s"
               if v.is_over_provisioned else "")
+    if v.methodology.get("advice_stage") == "review":
+        action = "Review whether this low-utilization week is typical of the workload."
     return Finding(
         detection_id="DX-001", title="Manual over-provisioning", unit=_unit(ctx), status=status,
         severity=v.severity, summary=summary, recommended_action=action,
@@ -634,7 +651,7 @@ def _run_dx001(ctx: DetectionContext) -> Finding:
         savings_currency=sav.get("savings_currency"),
         savings_basis=sav.get("savings_basis"),
         evidence={**v.methodology, "band": v.band, "trigger_pct": v.trigger_pct,
-                  **sav.get("evidence", {})},
+                  "visible_observation": status == STATUS_NOT_DETECTED, **sav.get("evidence", {})},
     )
 
 
@@ -645,8 +662,8 @@ def _run_dx004(ctx: DetectionContext) -> Finding:
     v = idle.detect_idle(
         ctx.metrics, ctx.account_resource_id, o.database, o.container, o,
         ctx.window_for(idle.production_window(ctx.now)),
-        scope_provisioned_ru=ctx.scope_provisioned_ru, resource_created_at=ctx.created_at(),
-        pool_members=ctx.pool_members,
+        scope_provisioned_ru=ctx.scope_provisioned_ru, resource_created_at=ctx.resource_created_at,
+        resource_existed_by=ctx.resource_existed_by, pool_members=ctx.pool_members,
     )
     recoverable = v.recoverable_ru if v.is_idle else None
     sav = _savings_fields(ctx, recoverable)
@@ -654,10 +671,10 @@ def _run_dx004(ctx: DetectionContext) -> Finding:
         status, summary = STATUS_ABSTAINED, f"Insufficient data: {v.methodology.get('detail') or v.methodology.get('abstained', '')}"
     elif v.is_idle:
         status = STATUS_FINDING
-        summary = (f"Idle (peak ~{v.peak_ru:.0f} RU/5min in window); "
+        summary = ("Idle (zero RU for 30 consecutive days); "
                    f"~{v.recoverable_ru:.0f} RU/s recoverable by decommission")
     else:
-        status, summary = STATUS_NOT_DETECTED, f"Active (peak ~{v.peak_ru:.0f} RU/5min in window)"
+        status, summary = STATUS_NOT_DETECTED, f"Consumption observed (peak {v.peak_ru:g} RU in a bucket)"
     return Finding(
         detection_id="DX-004", title="Idle container", unit=_unit(ctx), status=status,
         severity=v.severity, summary=summary, recommended_action=v.recommended_action,
@@ -668,7 +685,8 @@ def _run_dx004(ctx: DetectionContext) -> Finding:
         estimated_monthly_savings=sav.get("estimated_monthly_savings"),
         savings_currency=sav.get("savings_currency"),
         savings_basis=sav.get("savings_basis"),
-        evidence={**v.methodology, **sav.get("evidence", {})},
+        evidence={**v.methodology, **({"age_read_error": ctx.age_read_error} if ctx.age_read_error else {}),
+                  **sav.get("evidence", {})},
     )
 
 
@@ -689,15 +707,19 @@ def _partition_abstention(methodology: dict) -> str:
 
 
 def _run_dx005(ctx: DetectionContext) -> Finding:
+    """Keep offer-level observed counts separate from the two-hour capacity diagnosis."""
     o = ctx.offer
     v = up.detect_under_provisioning(
         ctx.metrics, ctx.account_resource_id, o.database, o.container, o,
-        ctx.window_for(up.production_window(ctx.partition_anchor)), resource_created_at=ctx.created_at(),
+        ctx.window_for(up.production_window(ctx.now)), resource_created_at=ctx.resource_created_at,
         regions=ctx.partition_regions,
         pool_members=ctx.pool_members, read_counts=ctx.read_counts,
+        as_of=ctx.now,
     )
     throttled = v.methodology.get("throttled_requests", 0)
-    observed = _observed_429s(throttled, v.methodology.get("total_requests", 0))
+    total = v.methodology.get("total_requests")
+    observed = (_observed_429s(throttled, total) if total is not None else
+                f"{throttled:,} HTTP 429s observed; offer rate unknown")
     if v.root_cause == "insufficient_data":
         status, summary, rule = STATUS_ABSTAINED, _partition_abstention(v.methodology), None
         if throttled and v.methodology.get("abstained") == "too_few_requests":
@@ -706,7 +728,10 @@ def _run_dx005(ctx: DetectionContext) -> Finding:
             summary += f"; {observed}. A capacity diagnosis is inconclusive"
     elif v.is_under_provisioned:
         status = STATUS_FINDING
-        summary = f"Throttling {v.throttle_rate_pct:.1f}% with all partitions saturated"
+        hours = v.methodology["intervals"]
+        details = "; ".join(f"{h['start']}: {_observed_429s(h['throttled_requests'], h['total_requests'])}"
+                            for h in hours)
+        summary = f"Broad saturation across all configured regions in two consecutive completed hours: {details}"
         rule = "throughput-autoscale" if o.mode == "autoscale" else "throughput-right-size"
     elif v.root_cause == "skew_suspected":
         # Skew is DX-006's domain — DX-005 reports no *global* under-provisioning here.
@@ -725,8 +750,11 @@ def _run_dx005(ctx: DetectionContext) -> Finding:
                                  "nor a hot partition. They do not explain the throttling or justify more RU/s", None)
     elif v.root_cause == "below_throttle_threshold":
         status, summary, rule = (STATUS_NOT_DETECTED,
-                                 f"{observed}; below the {v.methodology['thresholds']['throttle_pct']:g}% "
+                                 f"{observed}; below the {v.methodology['thresholds']['throttle_rate_pct']:g}% "
                                  "throttling threshold", None)
+    elif v.root_cause == "pressure_observed":
+        status, summary, rule = (STATUS_NOT_DETECTED, f"{observed}; two consecutive completed hours of "
+                                 "verified broad pressure were not established", None)
     else:
         status, summary, rule = STATUS_NOT_DETECTED, "No HTTP 429s observed", None
     return Finding(
@@ -734,7 +762,7 @@ def _run_dx005(ctx: DetectionContext) -> Finding:
         status=status, severity=v.severity, summary=summary,
         recommended_action=v.recommended_action, agent_kit_rule=rule,
         threshold_status=THRESHOLD_VALIDATED, evidence={**v.methodology, "root_cause": v.root_cause,
-                                                        "observed_throttling": bool(throttled)},
+                                                       "observed_throttling": bool(throttled)},
     )
 
 
@@ -742,66 +770,89 @@ def _run_dx005(ctx: DetectionContext) -> Finding:
 
 def _run_dx006(ctx: DetectionContext) -> Finding:
     o = ctx.offer
+    # New resources need an observable first interval, even before the next closed hour.
+    anchor = ctx.partition_anchor
+    if ctx.resource_created_at and ctx.resource_created_at > anchor - timedelta(days=1):
+        anchor = ctx.now
     v = hp.detect_hot_partition(
         ctx.metrics, ctx.account_resource_id, o.database, o.container, o,
-        ctx.window_for(hp.production_window(ctx.partition_anchor)), resource_created_at=ctx.created_at(),
+        ctx.window_for(hp.production_window(anchor)), resource_created_at=ctx.resource_created_at, as_of=ctx.now,
         regions=ctx.partition_regions,
         pool_members=ctx.pool_members, read_counts=ctx.read_counts,
     )
     if v.root_cause == "insufficient_data":
         status = STATUS_ABSTAINED
         summary = _partition_abstention(v.methodology)
-    elif v.is_hot_partition:
-        status = STATUS_FINDING
-        if v.throttling is None:
-            warn = "shared-member throttling unknown; severity is a lower bound"
-        elif v.methodology["throttled_requests"]:
-            warn = _observed_429s(v.methodology["throttled_requests"], v.methodology["total_requests"])
-        else:
-            warn = "no HTTP 429s observed (early warning)"
-        summary = (f"Hot partition: busiest p99 {v.max_p99:.0f}% vs coolest {v.min_p99:.0f}% "
-                   f"among {v.partition_count} observed partitions in "
-                   f"{v.methodology['witness_region']} ({warn})")
+    elif v.is_hot_partition or v.root_cause == "skew_observed":
+        status = STATUS_FINDING if v.is_hot_partition else STATUS_ABSTAINED
+        hours = v.methodology["intervals"]
+        details = []
+        for h in hours:
+            t, r = h["total_requests"], h["throttled_requests"]
+            impact = (_observed_429s(r, t) if t is not None and r is not None else
+                      f"{r:,} measured 429s, offer rate unknown" if r is not None else
+                      f"{t:,} requests, offer throttling unknown" if t is not None else "offer throttling unknown")
+            details.append(f"{h['start']} to {h['end']}: {h['hot_id']} reached {h['hot_pct']:g}%, "
+                           f"{h['cool_id']} peaked at {h['cool_pct']:g}% ({impact})")
+        summary = f"Observed partition skew in {v.methodology['witness_region']}: " + "; ".join(details)
+        if not v.is_hot_partition:
+            summary += "; observation only, no second consecutive completed hour for this hot partition"
         if not v.methodology["coverage_complete"]:
             summary += "; partial partition coverage"
     else:
         status, summary = STATUS_NOT_DETECTED, "No within-region hot partition detected"
+    other_throttles = v.methodology.get("other_observed_429s", v.methodology.get("window_observed_429s"))
+    if other_throttles:
+        scope = "outside the reported intervals" if "intervals" in v.methodology else "in the window"
+        summary += f"; {other_throttles:,} offer-level HTTP 429s observed {scope}, not attributed to skew"
     return Finding(
         detection_id="DX-006", title="Hot partition", unit=_unit(ctx), status=status,
         severity=v.severity, summary=summary, recommended_action=v.recommended_action,
         agent_kit_rule="partition-high-cardinality" if v.is_hot_partition else None,
-        threshold_status=THRESHOLD_VALIDATED, evidence=v.methodology,
+        threshold_status=THRESHOLD_VALIDATED, evidence={**v.methodology, "root_cause": v.root_cause,
+                                                        "observed_throttling": bool(v.methodology.get("window_observed_429s"))},
     )
 
 
 # --- DX-015: partition storage skew ---------------------------------------------------
 
 def _run_dx015(ctx: DetectionContext) -> Finding:
+    """Combine independent storage observations; only a recent logical-key sample can be High."""
     o = ctx.offer
-    v = ss.detect_storage_skew(
-        ctx.metrics, ctx.account_resource_id, o.database, o.container, o,
-        ctx.window_for(ss.production_window(ctx.partition_anchor)), resource_created_at=ctx.created_at(),
-        regions=ctx.partition_regions,
-    )
-    gib = 1024**3
-    if v.root_cause == "insufficient_data":
-        status = STATUS_ABSTAINED
-        summary = _partition_abstention(v.methodology)
-    elif v.is_storage_skew:
-        status = STATUS_FINDING
-        summary = (f"Storage skew: busiest partition {v.max_bytes / gib:.1f} GiB "
-                   f"({v.busiest_pct_of_limit:.0f}% of the 50 GiB limit) vs coolest "
-                   f"{v.min_bytes / gib:.1f} GiB among {v.partition_count} observed partitions "
-                   f"in {v.methodology['witness_region']}")
-        if not v.methodology["coverage_complete"]:
-            summary += "; partial partition coverage"
+    logical = ctx.logical_storage or LogicalStorage("configuration_unknown",
+        "Logical-key risk not assessed: diagnostic settings unverified. Check PartitionKeyStatistics configuration.")
+    try:
+        v = ss.detect_storage_skew(
+            ctx.metrics, ctx.account_resource_id, o.database, o.container, o,
+            ctx.window_for(ss.production_window(ctx.partition_anchor)), resource_created_at=ctx.resource_created_at,
+            regions=ctx.partition_regions,
+        )
+    except Exception as exc:  # noqa: BLE001 - preserve the independent logical result
+        physical = _error_finding("DX-015", "Partition storage skew", _unit(ctx), exc)
+        evidence = physical.evidence.copy()
+        status, summary = physical.status, physical.summary
     else:
-        status, summary = STATUS_NOT_DETECTED, "No material within-region storage skew detected"
+        evidence = {**v.methodology, "physical_result": v.root_cause}
+        status = STATUS_NOT_DETECTED
+        if v.root_cause == "insufficient_data":
+            status, summary = STATUS_ABSTAINED, _partition_abstention(v.methodology)
+        elif v.is_storage_skew:
+            summary = (f"Physical storage skew in {v.methodology['witness_region']} at {v.methodology['witness_hour']}: "
+                       f"{v.max_bytes/1024**3:.1f} GiB vs {v.min_bytes/1024**3:.1f} GiB. "
+                       "Check the largest logical partitions.")
+            if not v.methodology["coverage_complete"]:
+                summary += " Physical partition coverage is partial."
+        else:
+            summary = "No material within-region physical storage skew observed."
+    high = logical.status == "high"
+    evidence["logical_partition_storage"] = asdict(logical)
     return Finding(
-        detection_id="DX-015", title="Partition storage skew", unit=_unit(ctx), status=status,
-        severity=v.severity, summary=summary, recommended_action=v.recommended_action,
-        agent_kit_rule="partition-high-cardinality" if v.is_storage_skew else None,
-        threshold_status=THRESHOLD_VALIDATED, evidence=v.methodology,
+        detection_id="DX-015", title="Logical partition storage risk" if high else "Partition storage skew",
+        unit=_unit(ctx), status=STATUS_FINDING if high else status, severity="high" if high else "none",
+        summary=f"{summary} {logical.message}",
+        recommended_action="Review the largest logical keys and their growth before changing the partition key." if high else "",
+        agent_kit_rule="partition-high-cardinality" if high else None,
+        threshold_status=THRESHOLD_PROPOSAL, evidence=evidence,
     )
 
 
@@ -813,7 +864,7 @@ def _run_dx011(ctx: DetectionContext) -> Finding:
     v = asig.detect_autoscale_max_over_provisioned(
         ctx.metrics, ctx.account_resource_id, o.database, o.container, o.provisioned_ru,
         ctx.window_for(op.production_window(ctx.now)),
-        scope_provisioned_ru=ctx.scope_provisioned_ru, resource_created_at=ctx.created_at(),
+        scope_provisioned_ru=ctx.scope_provisioned_ru, resource_created_at=ctx.resource_created_at,
         pool_members=ctx.pool_members,
     )
     recoverable = v.wasted_ru if v.is_over_provisioned else None
@@ -821,6 +872,12 @@ def _run_dx011(ctx: DetectionContext) -> Finding:
     if v.band == "insufficient_data":
         reason = v.methodology.get("detail") or v.methodology.get("abstained", "")
         status, summary = STATUS_ABSTAINED, f"Insufficient data: {reason}"
+    elif v.methodology.get("advice_stage") in {"review", "observation"}:
+        status = STATUS_NOT_DETECTED
+        summary = (f"Measured autoscale peak {v.methodology['peak_scaled_ru']:g} RU/s "
+                   f"({v.trigger_pct:.1f}% of {o.provisioned_ru:g} RU/s maximum) "
+                   f"over {v.methodology['evaluated_samples']} samples; "
+                   f"{v.methodology['latest_consecutive_hours']} consecutive completed hours.")
     elif v.is_over_provisioned:
         status = STATUS_FINDING
         if v.recommended_ru < o.provisioned_ru:
@@ -832,8 +889,10 @@ def _run_dx011(ctx: DetectionContext) -> Finding:
                        f"(peak provisioned {v.trigger_pct:.1f}% of max); no reduction is available")
     else:
         status = STATUS_NOT_DETECTED
-        summary = f"Autoscale max is appropriate (peak provisioned {v.trigger_pct:.1f}% of max)"
+        summary = f"Measured autoscale peak {v.trigger_pct:.1f}% of maximum; no downsize indicated."
     action = ""
+    if v.methodology.get("advice_stage") == "review":
+        action = "Review whether this week's low scaled throughput is typical of the workload."
     if v.is_over_provisioned:
         action = (
             f"Review lowering the autoscale max {o.provisioned_ru:.0f} -> "
@@ -856,53 +915,43 @@ def _run_dx011(ctx: DetectionContext) -> Finding:
         savings_currency=sav.get("savings_currency"),
         savings_basis=sav.get("savings_basis"),
         evidence={**v.methodology, "band": v.band, "trigger_pct": v.trigger_pct,
-                  **sav.get("evidence", {})},
+                  "visible_observation": status == STATUS_NOT_DETECTED, **sav.get("evidence", {})},
     )
 
 
 def _run_dx013(ctx: DetectionContext) -> Finding:
+    """Compare actual scaled throughput with fixed manual throughput at the same capacity."""
     o = ctx.offer
     v = ms.detect_autoscale_to_manual(
         ctx.metrics, ctx.account_resource_id, o.database, o.container, o.provisioned_ru,
-        ctx.window_for(op.production_window(ctx.now)), resource_created_at=ctx.created_at(),
+        ctx.window_for(op.production_window(ctx.now)), resource_created_at=ctx.resource_created_at, account=ctx.account_config,
     )
-    if v.root_cause == "insufficient_data":
-        status, summary = STATUS_ABSTAINED, f"Insufficient data: {v.methodology.get('abstained', '')}"
-    elif v.recommend_switch:
-        status = STATUS_FINDING
-        summary = (f"Steady-high load (autoscale sat at average {v.avg:.0f}% of max, little "
-                   f"spikiness) — manual would avoid the autoscale premium")
-    else:
-        status, summary = STATUS_NOT_DETECTED, "Load shape benefits from autoscale"
-    return Finding(
-        detection_id="DX-013", title="Autoscale to manual candidate", unit=_unit(ctx), status=status,
-        severity=v.severity, summary=summary, recommended_action=v.recommended_action,
-        agent_kit_rule="throughput-right-size" if v.recommend_switch else None,
-        threshold_status=THRESHOLD_VALIDATED, evidence=v.methodology,
-    )
+    return _mode_finding(ctx, v, "DX-013", "Autoscale to manual candidate", "throughput-right-size")
 
 
-# --- DX-012: manual -> autoscale candidate (spiky duty cycle) -------------------------
+# --- DX-012: manual -> autoscale at equal capacity -----------------------------------
 
 def _run_dx012(ctx: DetectionContext) -> Finding:
+    """Compare each measured hourly peak, not a duty-cycle heuristic."""
     o = ctx.offer
     v = ms.detect_manual_to_autoscale(
         ctx.metrics, ctx.account_resource_id, o.database, o.container, o.provisioned_ru,
-        ctx.window_for(op.production_window(ctx.now)), resource_created_at=ctx.created_at(),
+        ctx.window_for(op.production_window(ctx.now)), resource_created_at=ctx.resource_created_at, account=ctx.account_config,
+        resource_existed_by=ctx.resource_existed_by,
     )
-    if v.root_cause == "insufficient_data":
-        status, summary = STATUS_ABSTAINED, f"Insufficient data: {v.methodology.get('abstained', '')}"
-    elif v.recommend_switch:
-        status = STATUS_FINDING
-        summary = (f"Bursty load (peak {v.max_util:.0f}% vs average {v.avg:.0f}%, "
-                   f"{v.peak_to_avg:.0f}x) — autoscale would cut idle-time cost while covering peaks")
-    else:
-        status, summary = STATUS_NOT_DETECTED, "Load shape is well matched to manual throughput"
+    return _mode_finding(ctx, v, "DX-012", "Manual to autoscale candidate", "throughput-autoscale")
+
+
+def _mode_finding(ctx, v, detector, title, rule):
+    """Surface reviews without an actionable finding, recoverable quantity, or estimated dollars."""
+    status = (STATUS_ABSTAINED if v.root_cause == "no_data" else
+              STATUS_FINDING if v.recommend_switch else STATUS_NOT_DETECTED)
     return Finding(
-        detection_id="DX-012", title="Manual to autoscale candidate", unit=_unit(ctx), status=status,
-        severity=v.severity, summary=summary, recommended_action=v.recommended_action,
-        agent_kit_rule="throughput-autoscale" if v.recommend_switch else None,
-        threshold_status=THRESHOLD_VALIDATED, evidence=v.methodology,
+        detection_id=detector, title=title, unit=_unit(ctx), status=status,
+        severity=v.severity, summary=v.summary, recommended_action=v.recommended_action,
+        agent_kit_rule=rule if v.recommend_switch else None,
+        threshold_status=THRESHOLD_PROPOSAL, evidence={**v.methodology, "root_cause": v.root_cause,
+                                                      "visible_observation": status == STATUS_NOT_DETECTED},
     )
 
 
@@ -919,13 +968,19 @@ def _run_dx009(ctx: DetectionContext) -> Finding:
     )
     if v.root_cause == "insufficient_data":
         status, summary = STATUS_ABSTAINED, "Insufficient data: no partition-count telemetry"
+    elif v.root_cause == "storage_unknown":
+        status = STATUS_ABSTAINED
+        summary = (f"Observed {v.actual_partitions} physical partitions; storage is unknown. "
+                   "Cannot determine how many partitions are needed.")
+        if v.methodology["merge_eligibility"] == "blocked_pitr":
+            summary += " Partition merge is currently blocked by continuous backup (PITR)."
     elif v.is_over_partitioned:
         status = STATUS_FINDING
         summary = (f"Over-partitioned: {v.actual_partitions} physical partitions but only "
                    f"{v.needed_partitions} needed (~{v.ru_per_partition:.0f} RU/s each)")
         eligibility = v.methodology["merge_eligibility"]
         if eligibility == "blocked_pitr":
-            summary += "; partition merge blocked by continuous backup (PITR)"
+            summary += "; partition merge currently blocked by continuous backup (PITR)"
         elif eligibility == "blocked_full_fidelity":
             summary += "; partition merge blocked by enabled full-fidelity change feed"
         elif eligibility == "unknown":
@@ -938,39 +993,46 @@ def _run_dx009(ctx: DetectionContext) -> Finding:
         detection_id="DX-009", title="Partition merge candidate", unit=_unit(ctx), status=status,
         severity=v.severity, summary=summary, recommended_action=v.recommended_action,
         agent_kit_rule=None,  # merge is a platform (Portal/CLI) operation, no code remediation
-        threshold_status=THRESHOLD_VALIDATED, evidence=v.methodology,
+        threshold_status=THRESHOLD_VALIDATED, evidence={**v.methodology, "actual_partitions": v.actual_partitions or None,
+                                                       "storage_bytes": v.storage_bytes},
     )
 
 
 # --- DX-017: rapid storage growth -----------------------------------------------------
 
 def _run_dx017(ctx: DetectionContext) -> Finding:
+    """Report observed container data changes; do not generate a capacity deadline or graded issue."""
     o = ctx.offer
-    v = sg.detect_storage_growth(
+    evidence = sg.detect_storage_growth(
         ctx.metrics, ctx.account_resource_id, o.database, o.container,
         ctx.window_for(sg.production_window(ctx.now)),
     )
-    if v.root_cause == "insufficient_data":
-        status, summary = STATUS_ABSTAINED, "Insufficient data: no per-partition storage telemetry"
-    elif v.is_rapid_growth:
-        status = STATUS_FINDING
-        summary = (f"Storage growing ~{v.growth_rate_gib_per_day:.2f} GiB/day "
-                   f"(busiest partition {v.busiest_current_gib:.1f} GiB) — ~{v.days_to_limit:.0f} "
-                   f"days to the 50 GiB limit")
+    action = ""
+    if not evidence["measured_hours"]:
+        status, summary = STATUS_ABSTAINED, "No container data-storage measurements available"
     else:
-        status, summary = STATUS_NOT_DETECTED, "Storage growth is within a safe horizon"
+        status = STATUS_NOT_DETECTED
+        evidence["visible_observation"] = True
+        summary = (f"Container data storage: {evidence['first_bytes'] / sg.GIB:,.3g} GiB "
+                   f"at {evidence['first_sample_utc']}")
+        if evidence["change_bytes"] is not None:
+            summary += (f" to {evidence['last_bytes'] / sg.GIB:,.3g} GiB at {evidence['last_sample_utc']} "
+                        f"({evidence['change_bytes'] / sg.GIB:+,.3g} GiB measured change, not a forecast)")
+        else:
+            summary += "; one measurement cannot establish a change"
+        if days := evidence["retention_review_days"]:
+            action = (f"Storage ended higher than it began on each fully measured UTC day from "
+                      f"{days[0]} through {days[-1]}. Review retention or archival needs with the data owner.")
     return Finding(
         detection_id="DX-017", title="Rapid storage growth", unit=_unit(ctx), status=status,
-        severity=v.severity, summary=summary, recommended_action=v.recommended_action,
-        agent_kit_rule="throughput-ttl-stale-data" if v.is_rapid_growth else None,
-        threshold_status=THRESHOLD_VALIDATED, evidence=v.methodology,
+        severity="none", summary=summary, recommended_action=action,
+        agent_kit_rule=None, threshold_status=threshold_status_for("DX-017"), evidence=evidence,
     )
 
 
 REGISTRY: list[DetectionAdapter] = [
     DetectionAdapter("DX-001", "Manual over-provisioning",
-                     lambda o: _is_metrics_scoped(o) and o.mode == "manual", _run_dx001,
-                     minimum_age=op.DATA_REQUIREMENT.window_floor),
+                     lambda o: _is_metrics_scoped(o) and o.mode == "manual", _run_dx001),
     DetectionAdapter("DX-002", "Cross-partition query fan-out", _is_container, _run_dx002,
                      requires=frozenset({CAP_LA_QUERYSTATS, CAP_LA_DATAPLANE})),
     DetectionAdapter("DX-007", "Shard-key misalignment", _is_container, _run_dx007,
@@ -978,15 +1040,16 @@ REGISTRY: list[DetectionAdapter] = [
     DetectionAdapter("DX-010", "Uncontrolled ingestion", _is_container, _run_dx010,
                      requires=frozenset({CAP_LA_REQUEST_AGGREGATES})),
     DetectionAdapter("DX-004", "Idle container", _is_metrics_scoped, _run_dx004, minimum_age=idle.AGE_FLOOR),
-    DetectionAdapter("DX-005", "Under-provisioning / throttling", _is_metrics_scoped, _run_dx005, minimum_age=up.AGE_FLOOR),
-    DetectionAdapter("DX-006", "Hot partition", _is_metrics_scoped, _run_dx006, minimum_age=hp.AGE_FLOOR),
-    DetectionAdapter("DX-015", "Partition storage skew", _is_container, _run_dx015, minimum_age=ss.AGE_FLOOR),
+    DetectionAdapter("DX-005", "Under-provisioning / throttling", _is_metrics_scoped, _run_dx005),
+    DetectionAdapter("DX-006", "Hot partition", _is_metrics_scoped, _run_dx006),
+    DetectionAdapter("DX-015", "Partition storage skew", _is_container, _run_dx015,
+                     optional_requires=frozenset({CAP_LA_KEYSTATS})),
     DetectionAdapter("DX-011", "Autoscale max over-provisioned",
-                     lambda o: _is_metrics_scoped(o) and o.mode == "autoscale", _run_dx011, minimum_age=op.DATA_REQUIREMENT.window_floor),
+                     lambda o: _is_metrics_scoped(o) and o.mode == "autoscale", _run_dx011),
     DetectionAdapter("DX-012", "Manual to autoscale candidate",
-                     lambda o: _is_container(o) and o.mode == "manual", _run_dx012, minimum_age=op.DATA_REQUIREMENT.window_floor),
+                     lambda o: _is_container(o) and o.mode == "manual", _run_dx012),
     DetectionAdapter("DX-013", "Autoscale to manual candidate",
-                     lambda o: _is_container(o) and o.mode == "autoscale", _run_dx013, minimum_age=op.DATA_REQUIREMENT.window_floor),
+                     lambda o: _is_container(o) and o.mode == "autoscale", _run_dx013),
     DetectionAdapter("DX-009", "Partition merge candidate", _is_container, _run_dx009),
     DetectionAdapter("DX-017", "Rapid storage growth", _is_container, _run_dx017),
 ]
@@ -996,50 +1059,29 @@ REGISTRY: list[DetectionAdapter] = [
 
 def _run_dx008(ctx: AccountDetectionContext) -> Finding:
     v = mrw.detect_multi_region_writes(ctx.config, ctx.throughput_offers, inventory_issues=ctx.inventory_issues)
-    capacity = v.methodology.get("regional_capacity", {})
-    removable = capacity.get("removable_extra_region_ru") if isinstance(capacity, dict) else None
-    savings = (
-        _savings_fields(ctx, removable)
-        if v.is_antipattern
-        and isinstance(capacity, dict)
-        and capacity.get("status") == "quantified"
-        and _is_positive_finite(removable)
-        else {}
-    )
-    if v.is_antipattern:
-        status = STATUS_FINDING
-        summary = _dx008_summary(
-            v,
-            estimated_monthly_savings=savings.get("estimated_monthly_savings"),
-            savings_currency=savings.get("savings_currency"),
-        )
+    review = v.root_cause == "nonprod_multi_region_writes"
+    if review or v.is_antipattern:
+        status = STATUS_NOT_DETECTED if review else STATUS_FINDING
+        summary = _dx008_summary(v)
     elif v.root_cause == "legitimate_ha":
         status = STATUS_NOT_DETECTED
         summary = "Multi-region writes on a production account — treated as intentional RTO=0 HA"
     else:
         status, summary = STATUS_NOT_DETECTED, "Multi-region writes are not enabled"
     client_review = v.methodology.get("client_write_failover") == "not_assessed"
+    title = "Review writable regions" if review else "Multi-region writes antipattern"
     return Finding(
-        detection_id="DX-008", title=("Verify client write failover" if client_review else
-                                      "Multi-region writes antipattern"), unit=_account_unit(ctx),
+        detection_id="DX-008", title="Verify client write failover" if client_review else title, unit=_account_unit(ctx),
         status=status, severity=v.severity, summary=summary,
         recommended_action=v.recommended_action,
         agent_kit_rule="global-multi-region-write-antipattern" if v.is_antipattern and not client_review else None,
         threshold_status=THRESHOLD_VALIDATED,
-        estimated_monthly_savings=savings.get("estimated_monthly_savings"),
-        savings_currency=savings.get("savings_currency"),
-        savings_basis=savings.get("savings_basis"),
-        evidence={**v.methodology, **savings.get("evidence", {})},
+        evidence={**v.methodology, "root_cause": v.root_cause},
     )
 
 
-def _dx008_summary(
-    v: mrw.MultiRegionWriteVerdict,
-    *,
-    estimated_monthly_savings: float | None = None,
-    savings_currency: str | None = None,
-) -> str:
-    """Summarize DX-008 with bill-derived savings first and regional capacity as context."""
+def _dx008_summary(v: mrw.MultiRegionWriteVerdict) -> str:
+    """Report the observed topology and verified footprint without inferring removable capacity."""
     capacity = v.methodology["regional_capacity"]
     if v.methodology.get("client_write_failover") == "not_assessed":
         summary = (f"Multi-region writes enabled for {v.methodology['api_family']}; "
@@ -1047,10 +1089,10 @@ def _dx008_summary(
     elif v.root_cause == "nonprod_multi_region_writes":
         summary = (
             f"Multi-region writes across {v.write_region_count} write regions on a "
-            "non-production account (no RTO=0 need)"
+            "non-production account. Review whether these regions support availability or failover testing"
         )
     else:
-        summary = "Multi-region writes enabled on a single-region account (latent tripwire)"
+        summary = "Multi-region writes are enabled with only one write region; adding another region can change billing"
     if (
         capacity["status"] == "quantified"
         and _is_positive_finite(capacity.get("configured_per_region_ru"))
@@ -1060,21 +1102,8 @@ def _dx008_summary(
             f"; {capacity['configured_per_region_ru']:,.0f} RU/s per region yields "
             f"{capacity['global_regional_ru']:,.0f} regional RU/s globally"
         )
-        removable = capacity["removable_extra_region_ru"]
-        if _is_positive_finite(removable):
-            summary += (
-                f", with {removable:,.0f} regional RU/s removable only by removing "
-                "the unnecessary extra region(s)"
-            )
-    if (
-        _is_positive_finite(estimated_monthly_savings)
-        and isinstance(savings_currency, str)
-        and savings_currency.strip()
-    ):
-        summary = (
-            "Estimated monthly savings from your amortized bill: "
-            f"~{estimated_monthly_savings:,.2f} {savings_currency}/month; {summary}"
-        )
+    elif v.root_cause == "nonprod_multi_region_writes":
+        summary += "; regional throughput footprint not quantified"
     return summary
 
 
@@ -1143,7 +1172,10 @@ def _run_dx016(ctx: AccountDetectionContext) -> Finding:
                     },
                 }
     else:
-        status, summary = STATUS_NOT_DETECTED, f"Consistency level is appropriate ({v.consistency_level})"
+        if v.root_cause == "unknown":
+            status, summary = STATUS_ABSTAINED, "Consistency level or region count is unknown"
+        else:
+            status, summary = STATUS_NOT_DETECTED, f"No quorum-read review for {v.consistency_level}"
     return Finding(
         detection_id="DX-016", title="Expensive consistency", unit=_account_unit(ctx), status=status,
         severity=v.severity, summary=summary, recommended_action=v.recommended_action,
@@ -1155,17 +1187,20 @@ def _run_dx016(ctx: AccountDetectionContext) -> Finding:
 # --- DX-019: PITR (continuous backup) on a non-production account (account-scoped) -----
 
 
-def _dx019_savings_fields(ctx: AccountDetectionContext) -> dict:
-    """Build strictly evidenced list-price savings fields for a paid DX-019 finding."""
+def _dx019_storage_cost(ctx: AccountDetectionContext) -> dict:
+    """Price current backup retention, not recoverable savings or a customer bill."""
     if ctx.arm is None:
         raise ValueError("ARM provider unavailable")
     if ctx.retail_prices is None:
         raise ValueError("Retail Prices provider unavailable")
-    if not ctx.config.location_names:
-        raise ValueError("account has no configured regions")
+    if not ctx.config.location_names or len(ctx.config.location_names) != ctx.config.region_count:
+        raise ValueError("account region inventory is incomplete")
 
     expected = tuple(ctx.arm.list_containers(ctx.resource_group, ctx.account))
     canonical_regions = ctx.arm.resolve_arm_region_names(ctx.config.location_names)
+    if (len(canonical_regions) != ctx.config.region_count or
+            len(set(canonical_regions)) != len(canonical_regions)):
+        raise ValueError("account region mapping is incomplete")
     reference_region = ctx.config.location_names[0]
     metric_window = TimeWindow(
         ctx.now - timedelta(hours=24),
@@ -1185,6 +1220,8 @@ def _dx019_savings_fields(ctx: AccountDetectionContext) -> dict:
         ctx.now,
     )
     prices = ctx.retail_prices.pitr_storage_prices(canonical_regions, as_of=ctx.now)
+    if sorted(p.arm_region_name for p in prices) != sorted(canonical_regions):
+        raise ValueError("Retail Prices did not return exactly one price per configured region")
     currencies = {price.currency for price in prices}
     if len(currencies) != 1:
         raise ValueError("Retail Prices returned mixed currencies")
@@ -1192,64 +1229,62 @@ def _dx019_savings_fields(ctx: AccountDetectionContext) -> dict:
     regional_rate = sum(price.rate_per_gb_month for price in prices)
     amount = round(snapshot.decimal_gb * regional_rate, 2)
     return {
-        "estimated_monthly_savings": amount,
-        "savings_currency": currency,
-        "savings_basis": "azure_retail_price",
-        "evidence": {
-            "storage_snapshot": {
-                "metric": "DataUsageV2",
-                "timestamp": snapshot.timestamp.isoformat(),
-                "reference_region": snapshot.reference_region,
-                "logical_containers": snapshot.logical_containers,
-                "total_bytes": snapshot.total_bytes,
-                "logical_storage_gb": snapshot.decimal_gb,
-                "gb_conversion": "decimal",
-                "bytes_per_gb": 1_000_000_000,
-            },
-            "retail_pricing": {
-                "source": RETAIL_PRICES_BASE_URL,
-                "meter_name": PITR_STORAGE_METER_NAME,
-                "unit_of_measure": PITR_UNIT,
-                "currency": currency,
-                "regions": [
-                    {
-                        "arm_region_name": price.arm_region_name,
-                        "rate_per_gb_month": price.rate_per_gb_month,
-                        "meter_id": price.meter_id,
-                        "effective_start_date": price.effective_start_date,
-                        "effective_end_date": price.effective_end_date,
-                    }
-                    for price in prices
-                ],
-                "sum_per_region_rate_per_gb_month": regional_rate,
-            },
-            "formula": (
-                "logical_storage_gb_decimal * sum(per_region_current_storage_rate_per_gb_month)"
-            ),
-            "restore_charges_included": False,
+        "estimated_monthly_backup_storage_cost": amount,
+        "cost_currency": currency,
+        "storage_snapshot": {
+            "metric": "DataUsageV2",
+            "timestamp": snapshot.timestamp.isoformat(),
+            "reference_region": snapshot.reference_region,
+            "logical_containers": snapshot.logical_containers,
+            "total_bytes": snapshot.total_bytes,
+            "logical_storage_gb": snapshot.decimal_gb,
+            "gb_conversion": "decimal",
+            "bytes_per_gb": 1_000_000_000,
         },
+        "retail_pricing": {
+            "source": RETAIL_PRICES_BASE_URL,
+            "meter_name": PITR_STORAGE_METER_NAME,
+            "unit_of_measure": PITR_UNIT,
+            "currency": currency,
+            "regions": [
+                {
+                    "arm_region_name": price.arm_region_name,
+                    "rate_per_gb_month": price.rate_per_gb_month,
+                    "meter_id": price.meter_id,
+                    "effective_start_date": price.effective_start_date,
+                    "effective_end_date": price.effective_end_date,
+                }
+                for price in prices
+            ],
+            "sum_per_region_rate_per_gb_month": regional_rate,
+        },
+        "formula": "logical_storage_gb_decimal * sum(per_region_current_storage_rate_per_gb_month)",
+        "restore_charges_included": False,
     }
 
 
 def _run_dx019(ctx: AccountDetectionContext) -> Finding:
+    """Keep the protective retention choice visible even when its current cost cannot be estimated."""
     v = pitr.detect_pitr_on_nonprod(ctx.config)
-    savings: dict = {}
     evidence = dict(v.methodology)
     evidence["root_cause"] = v.root_cause
     if v.is_antipattern:
-        status = STATUS_FINDING
+        status = STATUS_NOT_DETECTED
+        evidence["visible_observation"] = True
         summary = (f"Continuous backup / PITR ({v.continuous_backup_tier or 'continuous'}) on a "
-                   f"non-production account — paid backup-storage tier may be unnecessary")
+                   f"non-production account — review the required recovery window")
         try:
-            savings = _dx019_savings_fields(ctx)
-            evidence.update(savings.pop("evidence"))
+            evidence.update(_dx019_storage_cost(ctx))
+            summary += (f"; estimated monthly backup-storage cost at retail rates: "
+                        f"{evidence['cost_currency']} {evidence['estimated_monthly_backup_storage_cost']:,.2f}")
         except Exception as exc:  # noqa: BLE001 - enrichment must never suppress the qualitative finding
-            evidence["savings_enrichment"] = {
+            summary += "; monthly backup-storage cost unavailable"
+            evidence["cost_enrichment"] = {
                 "status": "unavailable",
                 "reason": f"{type(exc).__name__}: {str(exc)[:200]}",
             }
     elif v.root_cause == "legitimate_prod_backup":
-        status, summary = STATUS_NOT_DETECTED, "Continuous backup on a production account (legitimate)"
+        status, summary = STATUS_NOT_DETECTED, "No positive non-production classification; no retention review"
     elif v.root_cause == "uncharged_7day_backup":
         status = STATUS_NOT_DETECTED
         summary = (
@@ -1269,34 +1304,39 @@ def _run_dx019(ctx: AccountDetectionContext) -> Finding:
         detection_id="DX-019", title="PITR on non-prod", unit=_account_unit(ctx), status=status,
         severity=v.severity, summary=summary, recommended_action=v.recommended_action,
         agent_kit_rule=None, threshold_status=threshold_status_for("DX-019"), evidence=evidence,
-        **savings,
     )
 
 
 # --- DX-020: non-throttling error-code analysis (account-scoped, metrics only) ---------
 
 def _run_dx020(ctx: AccountDetectionContext) -> Finding:
-    """Translate unchanged status-only detection into conditional investigation guidance."""
+    """Keep 4xx context visible without using it to grade or explain a 5xx service response."""
     window = ctx.window_for(ea.production_window(ctx.now))
-    series = ctx.metrics.get_metric_split(
-        ctx.account_resource_id, "TotalRequests", window,
-        split_dimension="StatusCode", aggregation="Count",
-    )
-    counts = {code: int(sum(s.values())) for code, s in series.items()}
-    v = ea.detect_error_patterns(counts)
-    if v.root_cause == "too_few_requests":
-        status, summary = STATUS_ABSTAINED, "Insufficient data: not enough requests to judge error rate"
-    elif v.is_finding:
-        status = STATUS_FINDING
-        summary = (f"{v.hard_error_rate_pct:.1f}% non-throttling errors "
-                   f"(top: HTTP {v.dominant_code} at {v.dominant_rate_pct:.1f}%)")
+    evidence = ea.observe(ctx.metrics, ctx.account_resource_id, window)
+    severity, action = "none", ""
+    if rows := evidence["affected_intervals"]:
+        rank = {"none": 0, "low": 1, "medium": 2, "high": 3}
+        row = max(rows, key=lambda r: (rank[r["severity"]], r["service_error_rate_pct"], r["start_utc"]))
+        severity = row["severity"]
+        status = STATUS_FINDING if severity != "none" else STATUS_NOT_DETECTED
+        evidence["visible_observation"] = status == STATUS_NOT_DETECTED
+        counts = ", ".join(f"HTTP {c}: {n:,} ({row['status_rates_pct'][c]:.3g}%)"
+                           for c, n in row["status_code_counts"].items())
+        summary = (f"[{row['start_utc']}, {row['end_utc']}): {row['total_requests']:,} server responses; "
+                   f"{counts}. 5xx alone: {row['service_error_rate_pct']:.3g}%; {len(rows)} affected interval(s)")
+        action = ("Check SDK diagnostics and service health for the observed 5xx interval. "
+                  if severity != "none" else "")
+        action += ("Status counts alone do not identify a cause or failed user requests. "
+                   "Check application intent before interpreting 4xx, including expected misses, "
+                   "conflicts or precondition failures.")
+    elif evidence["measured_intervals"]:
+        status, summary = STATUS_NOT_DETECTED, "No non-429 4xx or 5xx responses observed"
     else:
-        status, summary = STATUS_NOT_DETECTED, "No material non-throttling error pattern"
+        status, summary = STATUS_ABSTAINED, "No status-code measurements available"
     return Finding(
         detection_id="DX-020", title="Error-code analysis", unit=_account_unit(ctx), status=status,
-        severity=v.severity, summary=summary, recommended_action=v.recommended_action,
-        agent_kit_rule=dx020_agent_kit_rule(status, v.dominant_code),
-        threshold_status=threshold_status_for("DX-020"), evidence=v.methodology,
+        severity=severity, summary=summary, recommended_action=action, agent_kit_rule=None,
+        threshold_status=threshold_status_for("DX-020"), evidence=evidence,
     )
 
 
@@ -1315,64 +1355,28 @@ def _observed_429s(throttled: float, total: float) -> str:
 
 
 def _run_dx021(ctx: AccountDetectionContext) -> Finding:
+    """Describe which operations received throttles, never inferred causes or a second issue."""
     window = ctx.window_for(trc.production_window(ctx.now))
-    by_code = ctx.metrics.get_metric_split(
-        ctx.account_resource_id, "TotalRequests", window,
-        split_dimension="StatusCode", aggregation="Count",
-    )
-    code_counts = {code: int(sum(s.values())) for code, s in by_code.items()}
-    total_requests = sum(code_counts.values())
-    total_throttled = code_counts.get("429", 0)
-    # Ask for operations only if attribution could change the result. A split failure must
-    # not discard successful status counts or turn a measured negative into an abstention.
-    v = trc.detect_throttling_root_cause(total_requests, total_throttled, {})
-    operation_error = None
-    operation_limit = None
-    if v.root_cause == "insufficient_data":
-        try:
-            by_op = ctx.metrics.get_metric_split(
-                ctx.account_resource_id, "TotalRequests", window, split_dimension="OperationType",
-                dimension_filter={"StatusCode": "429"}, aggregation="Count",
-            )
-        except (AzureError, ValueError) as exc:
-            operation_error = type(exc).__name__
-            if isinstance(exc, MonitorUnavailable):
-                operation_limit = exc
-        else:
-            v = trc.detect_throttling_root_cause(total_requests, total_throttled,
-                                                 {op: sum(s.values()) for op, s in by_op.items()})
-    evidence = {**v.methodology, "root_cause": v.root_cause, "observed_throttling": bool(total_throttled)}
-    observed = _observed_429s(total_throttled, total_requests)
-    if v.root_cause == "too_few_requests":
-        status, summary = STATUS_ABSTAINED, "Insufficient data: not enough requests to decompose throttling"
-        if total_throttled:
-            summary = f"{observed}; not enough requests to judge the throttling rate"
-    elif v.root_cause == "insufficient_data":
-        status = STATUS_ABSTAINED
-        detail = "the operation breakdown contained no usable counts"
-        if "attributed_throttled" in evidence:
-            detail = (f"the operation breakdown did not reconcile "
-                      f"({evidence['attributed_throttled']:,} attributed vs {total_throttled:,} status-code 429s)")
-        if operation_error:
-            detail = "the operation breakdown could not be read"
-            evidence.update(abstained="operation_breakdown_read_error", operation_error=operation_error)
-            if operation_limit is not None:
-                detail += f": {operation_limit}"
-                evidence.update(http_status=operation_limit.status_code,
-                                retry_after_seconds=operation_limit.retry_after_seconds)
-        summary = f"{observed}; cannot determine which operations were throttled because {detail}"
-    elif v.is_finding:
-        status = STATUS_FINDING
-        summary = (f"{v.throttle_rate_pct:.1f}% throttled; {v.dominant_share_pct:.0f}% on "
-                   f"'{v.dominant_operation}' ({v.dominant_category})")
-    else:
+    evidence = trc.observe(ctx.metrics, ctx.account_resource_id, window)
+    if rows := evidence["affected_intervals"]:
         status = STATUS_NOT_DETECTED
-        summary = (f"{observed}; below the {trc.THROTTLE_RATE_PCT:g}% throttling threshold"
-                   if total_throttled else "No HTTP 429s observed")
+        evidence["observed_throttling"] = True
+        row = max(rows, key=lambda r: (r["total_throttled"], r["start_utc"]))
+        summary = (f"{_observed_429s(row['total_throttled'], row['total_requests'])} "
+                   f"in [{row['start_utc']}, {row['end_utc']}); {len(rows)} affected interval(s). ")
+        if row["attribution"] == "reconciled":
+            summary += "Recipients (share of all 429s): " + ", ".join(
+                f"{op}: {n:,} ({row['op_share_of_429s_pct'][op]:.3g}%)"
+                for op, n in row["op_throttled_counts"].items())
+        else:
+            summary += "Operation attribution unavailable; no reconciled same-hour breakdown"
+    elif evidence["measured_intervals"]:
+        status, summary = STATUS_NOT_DETECTED, "No HTTP 429s observed"
+    else:
+        status, summary = STATUS_ABSTAINED, "No account request status measurements available"
     return Finding(
-        detection_id="DX-021", title="Throttling root cause", unit=_account_unit(ctx), status=status,
-        severity=v.severity, summary=summary, recommended_action=v.recommended_action,
-        agent_kit_rule=dx021_agent_kit_rule(status, v.dominant_category),
+        detection_id="DX-021", title="Throttling by operation", unit=_account_unit(ctx), status=status,
+        severity="none", summary=summary, recommended_action="", agent_kit_rule=None,
         threshold_status=threshold_status_for("DX-021"), evidence=evidence,
     )
 
@@ -1380,19 +1384,21 @@ def _run_dx021(ctx: AccountDetectionContext) -> Finding:
 # --- DX-022: Per-Region Provisioned Autoscale opportunity (account-scoped, ARM) --------
 
 def _run_dx022(ctx: AccountDetectionContext) -> Finding:
-    v = prpa.detect_prpa_candidate(ctx.config)
+    v = prpa.detect_prpa_candidate(ctx.config, ctx.throughput_offers, inventory_complete=not ctx.inventory_issues)
     if v.is_candidate:
         status = STATUS_FINDING
-        summary = f"Multi-region ({v.region_count} regions) without PRPA — evaluate per-region autoscale"
+        summary = "Dynamic autoscale is disabled on an account with confirmed autoscale throughput"
     else:
         summary = {
-            "single_region": "Single region — PRPA not applicable",
-            "already_enabled": "PRPA already enabled",
+            "no_autoscale_offers": "No autoscale offer in the verified inventory",
+            "unknown_offers": "Incomplete inventory: no autoscale offer could be verified",
+            "unknown_setting": "Dynamic autoscale setting was not reported by ARM",
+            "already_enabled": "Dynamic autoscale already enabled",
             "serverless": "Serverless — no provisioned per-region autoscale",
-        }.get(v.root_cause, "Not a PRPA candidate")
-        status = STATUS_NOT_DETECTED
+        }[v.root_cause]
+        status = STATUS_ABSTAINED if v.root_cause.startswith("unknown_") else STATUS_NOT_DETECTED
     return Finding(
-        detection_id="DX-022", title="PRPA opportunity", unit=_account_unit(ctx), status=status,
+        detection_id="DX-022", title="Dynamic autoscale", unit=_account_unit(ctx), status=status,
         severity=v.severity, summary=summary, recommended_action=v.recommended_action,
         agent_kit_rule=None, threshold_status=threshold_status_for("DX-022"), evidence=v.methodology,
     )
@@ -1403,17 +1409,15 @@ def _run_dx022(ctx: AccountDetectionContext) -> Finding:
 def _run_dx023(ctx: AccountDetectionContext) -> Finding:
     v = rc.detect_reserved_capacity_candidate(
         ctx.scope_provisioned_ru, is_serverless=ctx.config.is_serverless,
+        confirmed_provisioned=bool(ctx.throughput_offers) or ctx.config.capability_inventory_complete,
     )
-    if v.is_candidate:
-        status = STATUS_FINDING
-        summary = f"~{v.provisioned_ru:,.0f} RU/s provisioned baseline — evaluate reserved capacity"
+    if v.root_cause == "reservation_review":
+        status = STATUS_NOT_DETECTED
+        summary = "Review existing reservation coverage for provisioned throughput in Cost Management"
     elif v.root_cause == "unknown":
-        status, summary = STATUS_ABSTAINED, "Insufficient data: provisioned throughput unknown"
+        status, summary = STATUS_ABSTAINED, "No provisioned throughput could be confirmed"
     else:
-        summary = {
-            "serverless": "Serverless — nothing provisioned to reserve",
-            "below_baseline": "Provisioned baseline below the reserved-capacity floor",
-        }.get(v.root_cause, "Not a reserved-capacity candidate")
+        summary = "Serverless — nothing provisioned to reserve"
         status = STATUS_NOT_DETECTED
     return Finding(
         detection_id="DX-023", title="Reserved capacity", unit=_account_unit(ctx), status=status,
@@ -1425,24 +1429,17 @@ def _run_dx023(ctx: AccountDetectionContext) -> Finding:
 # --- DX-014: provisioned -> serverless candidate (account-scoped) ----------------------
 
 def _run_dx014(ctx: AccountDetectionContext) -> Finding:
+    """Return one account result, never a migration directive or a rollup savings estimate."""
     v = svc.detect_serverless_candidate(
-        ctx.metrics, ctx.account_resource_id, ctx.window_for(svc.production_window()),
-        is_serverless=ctx.config.is_serverless,
+        ctx.metrics, ctx.account_resource_id, ctx.window_for(svc.production_window(ctx.now)),
+        account=ctx.config, offers=ctx.throughput_offers, inventory_issues=ctx.inventory_issues, cost=ctx.cost,
     )
-    if v.root_cause == "already_serverless":
-        status, summary = STATUS_NOT_DETECTED, "Account is already serverless"
-    elif v.root_cause == "insufficient_data":
-        status, summary = STATUS_ABSTAINED, "Insufficient data: not enough consumed-RU history"
-    elif v.is_candidate:
-        status = STATUS_FINDING
-        summary = (f"Low, sporadic throughput (peak {v.peak_ru_per_s:.0f} RU/s, "
-                   f"{v.avg_to_peak * 100:.0f}% avg-to-peak) — evaluate serverless")
-    else:
-        status, summary = STATUS_NOT_DETECTED, "Throughput shape does not fit serverless"
+    status = (STATUS_FINDING if v.root_cause == "serverless_candidate" else STATUS_NOT_DETECTED
+              if v.root_cause in {"not_applicable", "not_cheaper"} else STATUS_ABSTAINED)
     return Finding(
         detection_id="DX-014", title="Serverless candidate", unit=_account_unit(ctx), status=status,
-        severity=v.severity, summary=summary, recommended_action=v.recommended_action,
-        agent_kit_rule="throughput-serverless-migration" if v.is_candidate else None,
+        severity="low" if status == STATUS_FINDING else "none", summary=v.summary,
+        recommended_action=v.recommended_action, agent_kit_rule=None,
         threshold_status=THRESHOLD_VALIDATED, evidence=v.methodology,
     )
 
@@ -1453,11 +1450,12 @@ ACCOUNT_REGISTRY: list[AccountDetectionAdapter] = [
         "DX-016", "Expensive consistency", _run_dx016,
         optional_requires=frozenset({CAP_LA_REQUEST_AGGREGATES}),
     ),
-    AccountDetectionAdapter("DX-014", "Serverless candidate", _run_dx014),
+    AccountDetectionAdapter("DX-014", "Serverless candidate", _run_dx014,
+                            optional_requires=frozenset({CAP_COST_MANAGEMENT})),
     AccountDetectionAdapter("DX-019", "PITR on non-prod", _run_dx019),
     AccountDetectionAdapter("DX-020", "Error-code analysis", _run_dx020),
-    AccountDetectionAdapter("DX-021", "Throttling root cause", _run_dx021),
-    AccountDetectionAdapter("DX-022", "PRPA opportunity", _run_dx022),
+    AccountDetectionAdapter("DX-021", "Throttling by operation", _run_dx021),
+    AccountDetectionAdapter("DX-022", "Dynamic autoscale", _run_dx022),
     AccountDetectionAdapter("DX-023", "Reserved capacity", _run_dx023),
 ]
 
@@ -1470,25 +1468,34 @@ def _run_dx003(ctx: DatabaseDetectionContext) -> Finding:
     win = ctx.window_for(sht.production_window(ctx.now, ctx.dataplane_source))
     v = sht.detect_shared_throughput_starvation(
         ctx.la, ctx.account_resource_id, ctx.database, ctx.shared_ru, win,
-        source=ctx.dataplane_source, pool_members=ctx.pool_members,
+        source=ctx.dataplane_source, pool_members=ctx.pool_members, as_of=ctx.now,
     )
+    observed = v.methodology.get("observed_429s", 0)
     if v.root_cause in ("log_analytics_unavailable", "insufficient_data", "query_error"):
         status = STATUS_ABSTAINED
         summary = f"Insufficient data: {v.methodology.get('abstained', v.root_cause)}"
-    elif v.is_starvation:
-        status = STATUS_FINDING
-        summary = (f"Starvation in shared DB '{v.database}': '{v.monopolizer}' consumes "
-                   f"{v.monopolizer_ru_share_pct:.0f}% of the pool while '{v.victim}' throttles at "
-                   f"{v.victim_throttle_rate_pct:.0f}%")
+        if observed:
+            summary += f"; {_observed_429s(observed, v.methodology['observed_requests'])} among observed members"
+    elif v.is_starvation or v.root_cause == "possible_contention":
+        status = STATUS_FINDING if v.is_starvation else STATUS_NOT_DETECTED
+        bins = v.methodology["intervals"]
+        label = "Likely shared-pool contention" if v.is_starvation else "Possible shared-pool contention"
+        summary = (f"{label} in '{v.database}', {bins[0]['start']} to {bins[-1]['end']}: "
+                   f"'{v.monopolizer}' dominated measured RU while '{v.victim}' was throttled "
+                   f"in {len(bins)} completed five-minute interval(s). In the last interval "
+                   f"'{v.monopolizer}' consumed {v.monopolizer_ru_share_pct:g}% of active members' RU; "
+                   f"for '{v.victim}', {_observed_429s(bins[-1]['affected_429s'], bins[-1]['affected_requests'])}.")
     else:
         status = STATUS_NOT_DETECTED
-        summary = (f"Shared pool healthy (DB 429 rate {v.pool_throttle_rate_pct:.1f}%, "
-                   f"{v.collection_count} collections)")
+        summary = "No sustained shared-pool contention established in the observed intervals"
+        if observed:
+            summary += f"; {_observed_429s(observed, v.methodology['observed_requests'])} among observed members"
     return Finding(
         detection_id="DX-003", title="Shared-throughput starvation", unit=_database_unit(ctx),
         status=status, severity=v.severity, summary=summary, recommended_action=v.recommended_action,
         agent_kit_rule="throughput-container-vs-database" if v.is_starvation else None,
-        threshold_status=THRESHOLD_VALIDATED, evidence=v.methodology,
+        threshold_status=THRESHOLD_VALIDATED, evidence={**v.methodology, "root_cause": v.root_cause,
+                                                        "observed_throttling": bool(observed)},
     )
 
 
@@ -1504,42 +1511,48 @@ def _run_dx002_serverless(ctx: ServerlessDetectionContext) -> Finding:
     """DX-002 on a serverless container. Serverless emits CDBQueryRuntimeStatistics, so the same
     cross-partition fan-out detection applies (verified live); it just runs on the serverless pass
     since serverless containers have no throughput offer."""
-    return _dx002_finding(
-        ctx.la, ctx.account_resource_id, ctx.database, ctx.container,
-        ctx.window_for(cpq.production_window(ctx.now)), _serverless_unit(ctx),
-    )
+    return _dx002_finding(ctx, _serverless_unit(ctx))
 
 
 def _run_dx007_serverless(ctx: ServerlessDetectionContext) -> Finding:
     """DX-007 on a serverless container (same fan-out signal as the container pass)."""
-    return _shardkey_finding(
-        ctx.la, ctx.account_resource_id, ctx.database, ctx.container,
-        ctx.window_for(skm.production_window(ctx.now)), _serverless_unit(ctx),
-    )
+    return _shardkey_finding(ctx, _serverless_unit(ctx))
 
 
 # --- DX-018: serverless throttling (serverless-container-scoped) -----------------------
 
 def _run_dx018(ctx: ServerlessDetectionContext) -> Finding:
-    v = svt.detect_serverless_throttling(
+    """Keep the worst incident visible, but gate account capacity-mode advice on recurrence."""
+    evidence = svt.detect_serverless_throttling(
         ctx.metrics, ctx.account_resource_id, ctx.database, ctx.container,
         ctx.window_for(svt.production_window(ctx.now)),
     )
-    if v.root_cause == "insufficient_data":
-        status = STATUS_ABSTAINED
-        summary = f"Insufficient data: {v.methodology.get('abstained', v.root_cause)}"
-    elif v.is_throttling:
-        status = STATUS_FINDING
-        summary = (f"Serverless container throttling at {v.throttle_rate_pct:.1f}% 429s "
-                   f"(hitting the 5,000 RU/s per-partition ceiling; no throughput knob)")
+    severity, action = "none", ""
+    if rows := evidence["affected_intervals"]:
+        rank = {"none": 0, "low": 1, "medium": 2, "high": 3}
+        row = max(rows, key=lambda r: (rank[r["severity"]], r["throttle_rate_pct"] or 0, r["start_utc"]))
+        severity = row["severity"]
+        status = STATUS_FINDING if severity != "none" else STATUS_NOT_DETECTED
+        evidence["observed_throttling"] = True
+        label = (_observed_429s(row["total_throttled"], row["total_requests"])
+                 if row["throttle_rate_pct"] is not None else
+                 f"{row['total_throttled']:,} HTTP 429 responses; same-hour rate unavailable")
+        summary = f"{label} in [{row['start_utc']}, {row['end_utc']}); {len(rows)} affected interval(s)"
+        if severity != "none":
+            action = ("Investigate this server-side throttling interval using SDK retry diagnostics and "
+                      "request distribution. Container counts do not identify a hot partition or client failures.")
+        if evidence["capacity_mode_review"]:
+            action += (" Ask the owner whether this traffic is representative. If it is, evaluate "
+                       "provisioned throughput for the account; a mode change does not fix a hot key.")
+    elif evidence["measured_pairs"]:
+        status, summary = STATUS_NOT_DETECTED, "No HTTP 429s in the paired container request measurements"
     else:
-        status = STATUS_NOT_DETECTED
-        summary = f"Serverless container not throttling ({v.throttle_rate_pct:.1f}% 429s)"
+        status, summary = STATUS_ABSTAINED, "No paired container request and 429 measurements"
     return Finding(
         detection_id="DX-018", title="Serverless throttling", unit=_serverless_unit(ctx),
-        status=status, severity=v.severity, summary=summary, recommended_action=v.recommended_action,
-        agent_kit_rule="throughput-serverless" if v.is_throttling else None,
-        threshold_status=THRESHOLD_VALIDATED, evidence=v.methodology,
+        status=status, severity=severity, summary=summary, recommended_action=action,
+        agent_kit_rule="throughput-serverless" if evidence["capacity_mode_review"] else None,
+        threshold_status=threshold_status_for("DX-018"), evidence=evidence,
     )
 
 
@@ -1565,9 +1578,9 @@ def _run_dx024(ctx: InventoryDetectionContext) -> Finding:
         status = STATUS_ABSTAINED
         summary = f"Insufficient data: {v.methodology.get('abstained', v.root_cause)}"
     elif v.is_risk:
-        status = STATUS_FINDING
-        summary = (f"Index storage is {v.ratio:.0%} of data storage "
-                   f"({v.user_excluded_path_count} user-excluded path(s)) — likely over-indexed")
+        status = STATUS_NOT_DETECTED
+        summary = (f"Index storage: {v.index_bytes:,.0f} bytes; data storage: {v.data_bytes:,.0f} bytes "
+                   f"(index is {v.ratio:.1%} of data). Review index usage.")
     elif v.root_cause == "indexing_disabled":
         status, summary = STATUS_NOT_DETECTED, "Indexing is disabled (mode none)"
     else:

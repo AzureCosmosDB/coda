@@ -17,10 +17,11 @@ COHORT_SIZE = 16
 POINT_BUDGET = 50_000
 FILTER_BUDGET = 3500
 _TERM = re.compile(r"(\w+) eq '((?:[^']|'')*)'")
-_SCALAR = {"NormalizedRUConsumption", "TotalRequestUnits", "TotalRequests", "PhysicalPartitionCount", "DataUsage"}
+_SCALAR = {"NormalizedRUConsumption", "TotalRequestUnits", "TotalRequests", "PhysicalPartitionCount", "DataUsage",
+           "ProvisionedThroughput"}
 _UNITS = {"NormalizedRUConsumption": "Percent", "TotalRequestUnits": "Count", "TotalRequests": "Count",
           "PhysicalPartitionCount": "Count", "DataUsage": "Bytes", "PhysicalPartitionSizeInfo": "Bytes",
-          "AutoscaledRU": "Count"}
+          "AutoscaledRU": "Count", "ProvisionedThroughput": "Count"}
 
 
 class CohortClient:
@@ -82,10 +83,13 @@ class CohortClient:
         target = dims.get(axis)
         inventory = self.axes.get(axis, ())
         physical_split = dims.get("PhysicalPartitionId") == "*"
-        needs_count = physical_split and "Region" not in dims and name in {"PhysicalPartitionSizeInfo", "AutoscaledRU"}
+        bounded_split = physical_split and (name == "AutoscaledRU" or
+                                            ("Region" not in dims and name == "PhysicalPartitionSizeInfo"))
+        # Autoscale readers now verify the count at 5m grain on the exact and grouped paths alike.
+        needs_count = bounded_split and name == "PhysicalPartitionSizeInfo"
         allowed = (name in _SCALAR and not physical_split) or (
             physical_split and "Region" in dims and name in {"NormalizedRUConsumption", "PhysicalPartitionSizeInfo"}
-        ) or needs_count
+        ) or bounded_split
         if (len(names) != 1 or not allowed or len(inventory) < 2 or kwargs.get("raw_response_hook")
                 or dims.get("DatabaseName") != self.db or len(terms) != len(dims)
                 or filt != " and ".join(f"{k} eq {quote(v)}" for k, v in terms)
@@ -95,7 +99,7 @@ class CohortClient:
             return None
         if name == "NormalizedRUConsumption" and not physical_split and grain.total_seconds() == 300:
             inventory = tuple(n for n in inventory if n in self.consumption_observed)
-        per = 8 if needs_count else top if physical_split else 1
+        per = 8 if bounded_split else top if physical_split else 1
         grains = ceil((span[1] - span[0]) / grain)
         if target not in inventory or not per or per >= SERIES_LIMIT or grains <= 0:
             return None

@@ -1,4 +1,4 @@
-"""Fail-closed storage snapshot selection and DX-019 retail-price savings math.
+"""Fail-closed storage snapshot selection for estimating current DX-019 retail backup costs.
 
 Azure Monitor emits ``DataUsageV2`` as one byte-valued series per logical container and region.
 DX-019 intentionally reads one configured reference region and one timestamp: summing time buckets
@@ -17,7 +17,7 @@ MAX_FUTURE_SKEW = timedelta(minutes=5)
 
 
 class PitrSavingsUnavailable(ValueError):
-    """The storage or price evidence is not complete enough to assert dollar savings."""
+    """The storage or price evidence cannot support a retail backup-storage cost estimate."""
 
 
 @dataclass(frozen=True)

@@ -1299,8 +1299,10 @@ function renderIncomplete(findings, costIssue = null) {
 function renderAccountReport(report) {
   const summary = report.summary || {};
   const actionable = actionableFindings(report);
-  const observations = (report.findings || []).filter(f =>
-    f.status === "not_detected" && f.evidence?.observed_throttling);
+  const observationSection = (title, items) => items.length ? `<section class="panel section"><h3>${title}</h3><ul>
+    ${items.map(f => `<li><span class="muted">${escapeHtml(unitLabel(f.unit))}</span> (${escapeHtml(f.detection_id)}) — ${escapeHtml(f.summary)}${f.evidence?.visible_observation && f.recommended_action ? `<p>${escapeHtml(f.recommended_action)}</p>` : ""}</li>`).join("")}
+    </ul></section>` : "";
+  const observations = (report.findings || []).filter(f => f.status === "not_detected");
   const hasEstimatedSavings = isFiniteNonnegativeNumber(summary.total_estimated_monthly_savings)
     && summary.total_estimated_monthly_savings > 0;
   const hasRecoverableRu = typeof summary.total_recoverable_ru === "number"
@@ -1342,9 +1344,15 @@ function renderAccountReport(report) {
         ${actionable.length ? actionable.map(f => renderFindingCard(f, report)).join("") : `<div class="empty">No actionable findings in this report.</div>`}
       </div>
     </section>
-    ${observations.length ? `<section class="panel section"><h3>Observed throttling</h3><ul>
-      ${observations.map(f => `<li>${escapeHtml(unitLabel(f.unit))} (${escapeHtml(f.detection_id)}) — ${escapeHtml(f.summary)}</li>`).join("")}
-    </ul></section>` : ""}
+    ${observationSection("Observed throttling", observations.filter(f => f.evidence?.observed_throttling))}
+    ${observationSection("Query fan-out observations", observations.filter(f =>
+      f.detection_id === "DX-007" && ["review", "observation"].includes(f.evidence?.fanout_result)))}
+    ${observationSection("Configuration review", observations.filter(f =>
+      f.detection_id === "DX-008" && f.evidence?.root_cause === "nonprod_multi_region_writes"))}
+    ${observationSection("Partition storage observations", (report.findings || []).filter(f =>
+      f.detection_id === "DX-015" && f.status !== "finding" && f.evidence?.logical_partition_storage))}
+    ${observationSection("Observations and review prompts", (report.findings || []).filter(f =>
+      f.status !== "finding" && f.evidence?.visible_observation))}
     ${report.inventory_issues?.length ? `<section class="panel"><strong>Incomplete throughput inventory</strong><p>Only verified offers are included. Account capacity is unknown.</p><ul>${report.inventory_issues.map(issue => `<li>${escapeHtml(issue)}</li>`).join("")}</ul></section>` : ""}
     ${renderIncomplete(report.findings || [], report.cost_estimate_issue)}`;
 }

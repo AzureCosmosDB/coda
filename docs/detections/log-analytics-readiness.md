@@ -3,7 +3,7 @@
 [Getting started](../../README.md) | [Detector reference](../detectors.md) | [Permissions](../permissions.md)
 
 Four CODA detectors require Cosmos DB resource logs. Other detectors use configuration and Azure
-Monitor metrics, with optional log enrichment for DX-016. **Log Analytics is not required to start
+Monitor metrics, with optional log enrichment for DX-015 and DX-016. **Log Analytics is not required to start
 using CODA**, and enabling it does not guarantee that a detector will find a problem.
 
 This page covers shared telemetry setup, not a separate set of detectors. For each detector's
@@ -18,6 +18,7 @@ These are administrator actions in Azure Portal, not operations performed by COD
    access-control, and data-handling requirements.
 2. Open the **Cosmos DB account > Monitoring > Diagnostic settings > Add diagnostic setting**.
 3. Select **DataPlaneRequests5M** for DX-003, DX-010, and optional DX-016 enrichment.
+   For optional DX-015 logical-key size observations, select **PartitionKeyStatistics**.
    Add **DataPlaneRequests** and **QueryRuntimeStatistics** if you also need DX-002/DX-007
    query analysis; those checks still require per-request correlation.
 4. Select **Send to Log Analytics workspace**, then choose the workspace.
@@ -76,7 +77,7 @@ Configured, readable sources show a green check instead of a setup link; the dat
 still identifies older records. Observation times are displayed in the browser's local time zone
 to the minute. Structured responses retain precise UTC timestamps for inspection and automation.
 
-The check reports required log paths separately from DX-016's optional enrichment. Metrics,
+The check reports required log paths separately from DX-015/016 optional enrichment. Metrics,
 cost-query access and source readability are probed, while resource age, per-container sample
 sufficiency and detector applicability are still assessed during diagnosis. **Analyze account**
 and **Scan resource group** remain available after a warning. CODA does not enable collection or
@@ -99,6 +100,7 @@ interpreting the four log-dependent detectors as a full-window observation.
 | DX-003 Shared-throughput starvation | `CDBDataPlaneRequests5M`, or raw `CDBDataPlaneRequests` | 1 day |
 | DX-007 Shard-key misalignment | `CDBQueryRuntimeStatistics` **and** `CDBDataPlaneRequests` | 1 day |
 | DX-010 Uncontrolled ingestion | `CDBDataPlaneRequests5M`, or raw `CDBDataPlaneRequests` | 1 day |
+| DX-015 Optional logical partition storage | `CDBPartitionKeyStatistics` | 7 days; only samples within the last 24 hours of that window qualify for grading |
 | DX-016 Optional consistency-cost enrichment | `CDBDataPlaneRequests5M`, or raw `CDBDataPlaneRequests` | 1 day; the configuration finding does not require it |
 
 The two query detectors join request charges from `CDBDataPlaneRequests` because query statistics
@@ -132,6 +134,11 @@ Three separate constraints matter:
 CODA may evaluate a partially populated window when its sample thresholds are met. **Do not assume
 it proves that every minute of the requested window exists**, or that it always abstains until a
 complete day has accumulated. Inspect the evidence and your collection start time.
+
+**DX-002 report exception:** counts can appear immediately, but severity requires at least
+24 hours of verified container and logging configuration history and a successful read.
+A quiet hour needs no query row and incurs no per-hour Monitor check. A current configuration
+without a usable last-modified timestamp does not certify its history. See [DX-002](../detector-methodology/dx-002.md).
 
 The capability probe looks back up to **30 days** to distinguish a table that has been quiet recently
 from a table with no accessible evidence. That probe is **not a requirement to collect 30 days of

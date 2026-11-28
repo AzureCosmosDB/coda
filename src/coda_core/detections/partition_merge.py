@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
+import math
 
 from coda_core.providers.arm import AccountConfig
 from coda_core.providers.azure_monitor import AzureMonitorMetricsProvider
@@ -38,19 +39,23 @@ def recent_window(now: datetime | None = None) -> TimeWindow:
 
 def needed_partitions(provisioned_ru: float, storage_bytes: float) -> int:
     """The smallest physical-partition count that satisfies the RU/s and storage needs."""
-    import math
     for_ru = math.ceil(provisioned_ru / RU_PER_PARTITION) if provisioned_ru > 0 else 1
     for_storage = math.ceil(storage_bytes / BYTES_PER_PARTITION) if storage_bytes > 0 else 1
     return max(for_ru, for_storage, 1)
+
+
+def measured_storage_peak(values: list[float]) -> float | None:
+    """Return a measured nonnegative peak, never a zero synthesized from missing storage."""
+    return max(values, default=None) if all(math.isfinite(v) and v >= 0 for v in values) else None
 
 
 @dataclass(frozen=True)
 class PartitionMergeVerdict:
     is_over_partitioned: bool
     actual_partitions: int
-    needed_partitions: int
+    needed_partitions: int | None
     provisioned_ru: float
-    storage_bytes: float
+    storage_bytes: float | None
     ru_per_partition: float       # provisioned_ru / actual_partitions (the thin slice)
     severity: str                 # medium | low | none
     # over_partitioned | right_sized | single_partition | insufficient_data
@@ -72,7 +77,8 @@ def _merge_guidance(config: AccountConfig | None) -> tuple[str, str]:
     full_fidelity = config.all_versions_and_deletes_enabled is True
     if (config.backup_mode or "").strip().lower() == "continuous":
         action = (
-            "Partition merge is blocked by continuous backup (PITR). Continuous backup cannot "
+            "Partition merge is blocked by continuous backup (PITR) under the current service "
+            "eligibility rules. Keep PITR enabled. Continuous backup cannot "
             "be reverted to periodic backup on this account; disabling PITR is not a supported "
             "way to enable merge."
         )
@@ -109,11 +115,13 @@ def _merge_guidance(config: AccountConfig | None) -> tuple[str, str]:
 
 
 def classify(
-    actual: int, provisioned_ru: float, storage_bytes: float,
+    actual: int, provisioned_ru: float, storage_bytes: float | None,
     *, account_config: AccountConfig | None = None,
 ) -> PartitionMergeVerdict:
     """Preserve structural grading while restricting action text to supported backup evidence."""
-    needed = needed_partitions(provisioned_ru, storage_bytes)
+    if storage_bytes is not None and (not math.isfinite(storage_bytes) or storage_bytes < 0):
+        storage_bytes = None
+    needed = needed_partitions(provisioned_ru, storage_bytes) if storage_bytes is not None else None
     ru_slice = (provisioned_ru / actual) if actual > 0 else provisioned_ru
     eligibility, guidance = _merge_guidance(account_config)
     base = dict(actual_partitions=actual, needed_partitions=needed, provisioned_ru=provisioned_ru,
@@ -141,6 +149,9 @@ def classify(
     if actual == 1:
         return PartitionMergeVerdict(is_over_partitioned=False, severity="none",
                                      root_cause="single_partition", recommended_action="", **base)
+    if needed is None or storage_bytes is None:
+        return PartitionMergeVerdict(is_over_partitioned=False, severity="none",
+                                     root_cause="storage_unknown", recommended_action="", **base)
     if actual <= needed:
         return PartitionMergeVerdict(is_over_partitioned=False, severity="none",
                                      root_cause="right_sized", recommended_action="", **base)
@@ -176,9 +187,9 @@ def detect_partition_merge(
     if storage_peak is None:
         storage = metrics.get_metric(account_resource_id, "DataUsage", window,
                                      aggregation="Maximum", dimension_filter=scope)
-        storage_peak = max(storage.values(), default=0.0)
+        storage_peak = measured_storage_peak(storage.values())
     pvals = pcount.values()
     if not pvals:
-        return classify(0, provisioned_ru, 0.0, account_config=account_config)
+        return classify(0, provisioned_ru, storage_peak, account_config=account_config)
     actual = int(max(pvals))
     return classify(actual, provisioned_ru, storage_peak, account_config=account_config)

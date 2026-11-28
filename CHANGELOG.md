@@ -7,6 +7,49 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.17.19] - Unreleased
+
+### Changed
+
+- See utilization immediately, review low usage or favorable throughput-mode economics after a
+  measured week, and get numerical downsize or mode-change advice only after a fully measured
+  month. Retirement supersedes these options. Increasing throughput needs measured throttling
+  and broad saturation in two consecutive completed hours; a serverless cost comparison needs
+  verified eligibility and prices.
+- Identify throttled writes, other affected operations and service errors in their own intervals,
+  without treating retries as application failures. Review consistency by topology, measured
+  container growth rather than a physical-limit countdown, and paid backup cost rather than savings.
+- Get a High-priority dynamic autoscale recommendation for a verified autoscale offer when the
+  account setting is off, including in one region. Review reservation coverage in Cost Management
+  regardless of offer size. Index storage above 30% of data prompts an ungraded query review,
+  even above 100%; a large index does not prove that any path should be removed.
+
+- See physical storage imbalance without waiting for container age. Enable optional
+  `PartitionKeyStatistics` logs to check reported logical-key sizes automatically; CODA
+  warns above 14 GiB and flags High at 18 GiB relative to the default 20 GiB limit.
+- Review non-production writable regions without assuming failover is unnecessary or
+  claiming savings. If storage is unknown, show the measured partition count without
+  recommending a merge. Partition merge is currently unavailable with continuous backup.
+- Explain why disabling multi-region writes with only one writable NoSQL region can
+  prevent unintended charges when a region is added later.
+- Keep query-routing advice visible alongside partition-key review. Re-keying is High only
+  when every observed query fans out in a verified day, with starts in at least three UTC
+  hours spanning four elapsed hours. A lone report or mixed workload does not qualify.
+
+- See uneven partition load from the first measurement. A hot-partition finding requires
+  two consecutive completed hours; High also requires material throttling in both hours.
+- Shared-throughput contention is High only when the same pair qualifies in two consecutive
+  five-minute intervals. Start by investigating competing work, not by moving a container.
+- See query fan-out counts on new containers without a premature alert. Severity requires
+  a full day of resource and logging history; inactive hours still count toward that day.
+- Show a retirement review and potential savings only after 30 consecutive days of exactly
+  zero consumed RU. New resources are evaluated; low usage, missing readings and age alone
+  no longer qualify.
+- Show measured request and throttling counts even when a resource is too young for capacity
+  advice. Do not mistake a full set of minute-rounded Monitor buckets for missing history.
+- Collect indexing metrics concurrently across independent groups. A truncated retry no
+  longer produces an indexing recommendation; missing coverage stays visible by container.
+
 ## [0.17.18] - Unreleased
 
 ### Changed

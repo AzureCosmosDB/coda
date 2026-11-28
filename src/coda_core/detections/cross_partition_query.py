@@ -39,13 +39,14 @@ from datetime import datetime, timedelta, timezone
 from coda_core.providers.base import TimeWindow
 from coda_core.providers.log_analytics import LogAnalyticsProvider, primary_destination_filter
 
+MIXED_SPAN_NS = 3_600_000_000_000  # One elapsed hour between starts of the same fan-out pattern.
 
 def production_window(now: datetime | None = None) -> TimeWindow:
     anchor = now or datetime.now(timezone.utc)
     return TimeWindow(anchor - timedelta(days=1), anchor, timedelta(hours=1))
 
 
-def query_shape_kql(database: str, container: str) -> str:
+def query_shape_kql(database: str, container: str, window: TimeWindow | None = None) -> str:
     """KQL for the top query fan-out shapes for one container, **with per-query RU cost**.
 
     ``CDBQueryRuntimeStatistics`` has **no cost column**, so we join ``CDBDataPlaneRequests`` (which
@@ -59,25 +60,64 @@ def query_shape_kql(database: str, container: str) -> str:
     The runner reuses this exact string when it primes the per-run LA cache from a batched account
     query, so parallelization does not change detector semantics or cache keys.
     """
-    db = database.replace("'", "")
-    coll = container.replace("'", "")
-    return (
-        "CDBQueryRuntimeStatistics "
-        + primary_destination_filter("CDBQueryRuntimeStatistics")
-        + f"| where DatabaseName == '{db}' and CollectionName == '{coll}' "
-        "| project ActivityId, CorrelatedActivityId, QueryText, PartitionKeyRangeId "
-        "| join kind=leftouter ("
-        "CDBDataPlaneRequests "
-        + primary_destination_filter("CDBDataPlaneRequests")
-        + f"| where DatabaseName == '{db}' and CollectionName == '{coll}' "
-        "| summarize ru = sum(RequestCharge) by ActivityId"
-        ") on ActivityId "
-        "| summarize partitionsHit = dcount(PartitionKeyRangeId), queryRU = sum(ru) "
-        "by CorrelatedActivityId, QueryText "
-        "| summarize executions = count(), avgFanout = avg(partitionsHit), "
-        "maxFanout = max(partitionsHit), avgRU = avg(queryRU) by QueryText "
-        "| top 200 by executions desc"
-    )
+    return fanout_batch_kql([(database, container)], window)
+
+
+def fanout_batch_kql(units: list[tuple[str, str]], window: TimeWindow | None) -> str:
+    """Measure all logical executions before limiting the two independent lists of examples.
+
+    Both adapters use these same rows. Scope both sides of the activity join to the container;
+    duplicated visits must not inflate frequency or cost. A missing/ambiguous identity prevents
+    an all-query assertion; a missing/ambiguous charge prevents an exact RU total, not a count.
+    """
+    scope = " or ".join(f"(DatabaseName == {json.dumps(db)} and CollectionName == {json.dumps(c)})"
+                        for db, c in units)
+    bounds = (f"| where TimeGenerated >= datetime({window.start.isoformat()}) "
+              f"and TimeGenerated < datetime({window.end.isoformat()})" if window else "")
+    rank = ("| serialize rank=row_number(1, DatabaseName != prev(DatabaseName) "
+            "or CollectionName != prev(CollectionName)) | where rank <= 200 | project-away rank")
+    return f"""let logical=materialize(CDBQueryRuntimeStatistics {primary_destination_filter("CDBQueryRuntimeStatistics", window)}
+{bounds} | where {scope}
+| summarize started=min(TimeGenerated), ids=make_set(tostring(CorrelatedActivityId),2),
+    ranges=make_set(tostring(PartitionKeyRangeId),2), texts=make_set(tostring(QueryText),2),
+    patterns=make_set(coalesce(tostring(parse_json(QueryText).query),tostring(QueryText)),2)
+    by DatabaseName, CollectionName, ActivityId
+| extend cid=tostring(ids[0]), part=tostring(ranges[0]), shape=tostring(texts[0]), pattern=tostring(patterns[0])
+| extend invalid=isempty(ActivityId) or tostring(ActivityId)=='00000000-0000-0000-0000-000000000000'
+    or array_length(ids)!=1 or isempty(cid) or cid=='00000000-0000-0000-0000-000000000000'
+    or array_length(ranges)!=1 or isempty(part), ambiguousShape=array_length(texts)!=1, ambiguousPattern=array_length(patterns)!=1
+| join kind=leftouter (CDBDataPlaneRequests {primary_destination_filter("CDBDataPlaneRequests", window)}
+    {bounds} | where {scope}
+    | summarize charge=take_any(RequestCharge), copies=count() by DatabaseName, CollectionName, ActivityId
+    | extend charge=iff(copies==1 and isfinite(charge) and charge>=0, charge, real(null))
+    | project DatabaseName, CollectionName, ActivityId, charge) on ActivityId, DatabaseName, CollectionName
+| summarize started=min(started), invalid=countif(invalid), partitionsHit=dcount(part),
+    shapes=make_set(shape,2), ambiguous=countif(ambiguousShape), patternSet=make_set(pattern,2),
+    badPattern=countif(ambiguousPattern), queryRU=sum(charge), missingCost=countif(isnull(charge))
+    by DatabaseName, CollectionName, cid
+| extend QueryText=iff(array_length(shapes)==1 and ambiguous==0,tostring(shapes[0]),''),
+    Pattern=iff(array_length(patternSet)==1 and badPattern==0,tostring(patternSet[0]),''),
+    fan=invalid==0 and partitionsHit>=2, single=invalid==0 and partitionsHit==1
+| project DatabaseName, CollectionName, started, invalid, partitionsHit, queryRU, missingCost, QueryText, Pattern, fan, single);
+let totals=logical | summarize fanExecutions=countif(fan), singleExecutions=countif(single),
+    unknownGroups=countif(not(fan or single)), firstFan=minif(started,fan), lastFan=maxif(started,fan),
+    startHours=make_set_if(bin(started,1h),fan,25), observedRU=sumif(queryRU,fan), missingCharges=sumif(missingCost,fan)
+    by DatabaseName, CollectionName | extend recordKind='total', occupiedHours=array_length(startHours),
+    spanNs=datetime_diff('nanosecond',lastFan,firstFan) | project-away startHours;
+union totals,
+ (logical | where invalid==0 and isnotempty(QueryText)
+ | summarize executions=count(), avgFanout=avg(partitionsHit), maxFanout=max(partitionsHit),
+    avgRU=iff(countif(missingCost>0)==0,avg(queryRU),real(null))
+    by DatabaseName, CollectionName, QueryText
+ | sort by DatabaseName asc, CollectionName asc, executions desc, QueryText asc {rank}
+ | extend recordKind='shape'),
+ (logical | where fan and isnotempty(Pattern)
+ | summarize fanExecutions=count(), firstFan=min(started), lastFan=max(started), observedRU=sum(queryRU),
+    missingCharges=sum(missingCost) by DatabaseName, CollectionName, QueryText=Pattern
+ | extend patternSpanNs=datetime_diff('nanosecond',lastFan,firstFan)
+ | extend recurring=fanExecutions>=2 and patternSpanNs>={MIXED_SPAN_NS}, completeRU=iff(missingCharges==0,observedRU,real(null))
+ | sort by DatabaseName asc, CollectionName asc, recurring desc, completeRU desc nulls last, fanExecutions desc, QueryText asc {rank}
+ | extend recordKind='review')"""
 
 
 def clean_query_text(raw: str) -> str:
@@ -107,7 +147,7 @@ class QueryShape:
     executions: int
     avg_fanout: float
     max_fanout: int
-    avg_ru: float = 0.0              # avg RU of the logical query (from the CDBDataPlaneRequests join)
+    avg_ru: float | None = None      # unknown when the activity charge join is incomplete
 
 
 @dataclass(frozen=True)
@@ -148,6 +188,7 @@ class FanoutMeasurements:
 
     share_pct: float = 0.0
     rate_qps: float = 0.0
+    executions: int = 0
 
 
 @dataclass(frozen=True)
@@ -204,6 +245,7 @@ def classify(
     measurements = FanoutMeasurements(
         share_pct=(100.0 * cross_exec / total) if total else 0.0,
         rate_qps=cross_exec / window_seconds if window_seconds > 0 else 0.0,
+        executions=cross_exec,
     )
     cross_pct, rate_qps = measurements.share_pct, measurements.rate_qps
     worst = max(cross_shapes, key=lambda s: s.executions, default=None)
@@ -224,7 +266,7 @@ def classify(
                                         "high_partitions": cfg.high_partitions},
                          "cross_partition_shapes": len(cross_shapes),
                          "fanout_queries_per_sec": round(rate_qps, 3),
-                         "worst_shape_avg_ru": round(worst.avg_ru, 1) if worst else None,
+                         "worst_shape_avg_ru": round(worst.avg_ru, 1) if worst and worst.avg_ru is not None else None,
                          "note": "Query shapes are grouped by raw QueryText; literal values in a query "
                                  "produce distinct shapes (no server-side parameterisation). RU is "
                                  "evidence only; it does not gate the finding (ADR-0068)."},
@@ -245,11 +287,12 @@ def classify(
     short = clean_query_text(worst.text)
     if len(short) > 200:
         short = short[:200] + "…"
+    cost = f"~{worst.avg_ru:.0f} RU per run" if worst.avg_ru is not None else "unknown RU per run"
     action = (
         f"{cross_pct:.0f}% of query executions fan out across partitions (the container has "
         f"~{container_partitions} physical partitions), about {rate_qps:.2f} fan-out queries per "
         f"second. The most frequent offender averages "
-        f"{worst.avg_fanout:.1f} partitions and ~{worst.avg_ru:.0f} RU per run. Anonymized shape: "
+        f"{worst.avg_fanout:.1f} partitions and {cost}. Anonymized shape: "
         f"`{short}`. When the query can "
         f"carry the partition key, add the container's partition key to the filter (or a composite "
         f"index) so it targets one logical partition. For queries that inherently filter on a "
@@ -284,7 +327,7 @@ def detect_cross_partition_queries(
     honest "diagnostics are on, but there is no query telemetry to judge" answer.
     """
     span = (window.start, window.end)
-    kql = query_shape_kql(database, container)
+    kql = query_shape_kql(database, container, window)
     try:
         rows = la.query_resource(account_resource_id, kql, span)
     except Exception as exc:  # noqa: BLE001 - degrade gracefully
@@ -295,9 +338,9 @@ def detect_cross_partition_queries(
             executions=int(r.get("executions") or 0),
             avg_fanout=float(r.get("avgFanout") or 0.0),
             max_fanout=int(r.get("maxFanout") or 0),
-            avg_ru=float(r.get("avgRU") or 0.0),
+            avg_ru=float(r["avgRU"]) if r.get("avgRU") is not None else None,
         )
-        for r in rows if r.get("QueryText")
+        for r in rows if r.get("QueryText") and r.get("recordKind", "shape") == "shape"
     ]
     if not shapes:
         return _abstain("insufficient_data", "No query telemetry for this container.")

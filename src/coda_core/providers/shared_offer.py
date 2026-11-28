@@ -66,7 +66,12 @@ def traffic_metric(metrics, rid: str, metric: str, window: TimeWindow, *, databa
             detail = str(exc) if isinstance(exc, MonitorUnavailable) else type(exc).__name__
             raise IncompletePool(f"{metric} read failed for shared member {name}: "
                                  f"{detail}") from exc
-        values = {p.timestamp: p.value for p in series.points if p.value is not None}
+        values = {}
+        for p in series.points:
+            if p.value is not None:
+                if p.timestamp in values:
+                    raise IncompletePool(f"Duplicate {metric} bucket for shared member {name}")
+                values[p.timestamp] = p.value
         if not values:
             raise MissingMemberSamples(f"No usable {metric} samples for shared member {name}")
         if any(not isfinite(v) or v < 0 for v in values.values()):

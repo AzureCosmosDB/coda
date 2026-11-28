@@ -12,10 +12,9 @@ DX-019 identifies only the paid 30-day and 35-day storage tiers on a positively 
 as a legitimate protection choice. Missing or unrecognized continuous tiers abstain because their
 backup-storage charge cannot be established from configuration.
 
-This is a **configuration/state** detection (ARM only — no workload, metrics, or Log Analytics) and a
-**qualitative** finding per ADR-0012: it surfaces the paid retention trade-off and asks the customer
-to confirm the required recovery window; it does not assert a dollar figure. Read-only /
-diagnose-only.
+The configuration verdict is ungraded and requires only ARM. The report can independently
+enrich the review with current retail backup-storage cost, not savings, from complete and fresh
+storage and regional price evidence. No workload or Log Analytics is required.
 
 Data source: ``AccountConfig.backup_mode`` / ``continuous_backup_tier`` (ARM), classified against
 ``framework.env_classifier``. See ``docs/planning/active/cosmic-kusto-gap-buildability.md`` (this closes
@@ -51,7 +50,7 @@ class PitrBackupVerdict:
     # nonprod_paid_continuous_backup | uncharged_7day_backup | unknown_continuous_tier
     # | legitimate_prod_backup | periodic_backup | unknown
     root_cause: str
-    severity: str  # medium | none
+    severity: str  # configuration review is always ungraded
     backup_mode: str | None
     continuous_backup_tier: str | None
     is_non_prod: bool
@@ -113,13 +112,11 @@ def detect_pitr_on_nonprod(config: AccountConfig) -> PitrBackupVerdict:
     return verdict(
         is_antipattern=True,
         root_cause="nonprod_paid_continuous_backup",
-        severity="medium",
         recommended_action=(
             f"This {env.inferred_env} (non-production) account uses continuous backup / point-in-time "
-            f"restore ({tier_label}), which has a monthly backup-storage charge. Confirm the required "
-            "recovery window and evaluate switching to Continuous7Days if a 7-day window is "
-            "sufficient; that tier has no backup-storage charge and does not require migrating the "
-            "account. The tradeoff is losing restore points older than seven days. Restore operations "
+            f"restore ({tier_label}), which has a monthly backup-storage charge. Consider "
+            "Continuous7Days only if the owner confirms a seven-day recovery window is sufficient. "
+            "PITR stays enabled, but restore points older than seven days are lost. Restore operations "
             "are charged separately for every continuous tier."
         ),
     )

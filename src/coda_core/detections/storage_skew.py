@@ -1,25 +1,4 @@
-"""DX-015: Partition storage skew.
-
-A skewed partition key concentrates *data* (not just RU) on a subset of physical partitions, so one
-partition holds far more storage than its siblings. Unlike DX-006 (hot partition = throughput
-saturation/throttling), the risk here is **storage capacity**: a physical partition has a hard ~50 GiB
-ceiling, and a single *logical* partition key has a hard ~20 GiB ceiling. A physical partition that is
-both large and unable to split (because its data is concentrated in one logical key) trends toward a
-**hard write-failure wall** that adding RU cannot fix — the only remedy is a better partition key.
-
-Detection signal: per-physical-partition storage from Azure Monitor ``PhysicalPartitionSizeInfo``
-(Bytes), split by ``PhysicalPartitionId``, reduced to each partition's peak size over the window.
-Storage skew exists when partitions are **imbalanced** (the coolest holds materially less than the
-busiest) — imbalance is the proxy for partition-key concentration, since balanced large partitions
-simply split as they grow (which is healthy and needs no action). Severity scales with how close the
-busiest partition is to the physical ceiling: the nearer the 50 GiB limit, the more imminent the
-split-wall / write-failure risk.
-
-This is a distinct risk model from DX-006 (which is throughput, not storage); the two share only the
-bad-partition-key root cause. v1 detects **physical-partition storage skew** from Azure Monitor (no
-Log Analytics dependency). Identifying the specific oversized **logical key** and its 20 GiB headroom
-needs Log Analytics ``CDBPartitionKeyStatistics`` and is a follow-up. Read-only / diagnose-only.
-"""
+"""DX-015 physical storage observations. Physical sizes alone cannot establish logical-key risk."""
 
 from __future__ import annotations
 
@@ -30,7 +9,6 @@ from coda_core.detections.regional_skew import regional_verdict
 from coda_core.providers.arm import ThroughputOffer
 from coda_core.providers.azure_monitor import AzureMonitorMetricsProvider
 from coda_core.providers.base import MetricSeries, TimeWindow
-from coda_core.sufficiency import evaluate_age
 
 # Verified Cosmos DB limits (Microsoft Learn, partitioning-overview): a physical partition holds up to
 # 50 GiB of storage before the platform splits it; a single logical partition key is hard-capped at
@@ -38,9 +16,7 @@ from coda_core.sufficiency import evaluate_age
 PHYSICAL_PARTITION_LIMIT_BYTES = 50 * 1024**3
 LOGICAL_PARTITION_LIMIT_BYTES = 20 * 1024**3
 
-# Storage is a slow-moving level; a 7-day window with a 1-day age floor is plenty.
 PRODUCTION_WINDOW_DAYS = 7
-AGE_FLOOR = timedelta(days=1)
 
 
 def production_window(now: datetime | None = None) -> TimeWindow:
@@ -91,8 +67,6 @@ class StorageSkewConfig:
 
     min_busiest_bytes: float = 1.0 * 1024**3   # below this, storage is immaterial — no finding
     balance_floor: float = 0.7                 # coolest < this fraction of busiest = imbalanced
-    high_pct_of_limit: float = 80.0            # busiest >= 80% of 50 GiB (40 GiB) -> high
-    medium_pct_of_limit: float = 50.0          # busiest >= 50% of 50 GiB (25 GiB) -> medium
 
 
 @dataclass(frozen=True)
@@ -130,8 +104,6 @@ def classify(
                 "thresholds": {
                     "min_busiest_gib": round(cfg.min_busiest_bytes / 1024**3, 2),
                     "balance_floor": cfg.balance_floor,
-                    "high_pct_of_limit": cfg.high_pct_of_limit,
-                    "medium_pct_of_limit": cfg.medium_pct_of_limit,
                 },
                 "physical_partition_limit_gib": PHYSICAL_PARTITION_LIMIT_BYTES // 1024**3,
                 "logical_partition_limit_gib": LOGICAL_PARTITION_LIMIT_BYTES // 1024**3,
@@ -153,28 +125,9 @@ def classify(
         # Partitions are evenly filled -> healthy distribution; they split as they grow. No action.
         return verdict(root_cause="uniform_storage")
 
-    # Imbalanced + materially sized = storage skew. Severity by proximity to the physical ceiling.
-    if signal.busiest_pct_of_limit >= cfg.high_pct_of_limit:
-        severity = "high"
-    elif signal.busiest_pct_of_limit >= cfg.medium_pct_of_limit:
-        severity = "medium"
-    else:
-        severity = "low"
-
-    busiest_gib = signal.max_bytes / 1024**3
-    action = (
-        f"Storage is concentrated on the busiest of {signal.partition_count} physical partitions "
-        f"({busiest_gib:.1f} GiB, {signal.busiest_pct_of_limit:.0f}% of the 50 GiB physical limit) "
-        f"while the coolest holds {signal.min_bytes / 1024**3:.1f} GiB. The partition key is "
-        f"distributing data unevenly. Redesign the key for even distribution (higher cardinality, "
-        f"hierarchical keys such as tenantId+id, or a hash prefix); re-keying an existing container "
-        f"is migration-class. A physical partition cannot split when its data is one oversized "
-        f"logical key, and a single logical key is hard-capped at 20 GiB — at which point writes to "
-        f"it fail. Adding RU/s does not help storage skew."
-    )
     return verdict(
-        is_storage_skew=True, root_cause="storage_skew", severity=severity,
-        recommended_action=action,
+        is_storage_skew=True, root_cause="storage_skew",
+        recommended_action="Check the largest logical partitions; physical imbalance alone does not establish key size.",
     )
 
 
@@ -193,16 +146,10 @@ def detect_storage_skew(
     """End-to-end DX-015 for one container."""
     cfg = config or StorageSkewConfig()
 
-    if resource_created_at is not None:
-        age_insuff = evaluate_age(resource_created_at, window.end, AGE_FLOOR)
-        if age_insuff is not None:
-            return StorageSkewVerdict(
-                is_storage_skew=False, partition_count=0, max_bytes=0.0, min_bytes=0.0,
-                skew_ratio=0.0, busiest_pct_of_limit=0.0, root_cause="insufficient_data",
-                severity="none", recommended_action="",
-                methodology={"abstained": age_insuff.reason, "detail": age_insuff.detail},
-            )
-
+    if resource_created_at is not None and resource_created_at > window.start:
+        if resource_created_at >= window.end:
+            return classify(StorageSkewSignal(0, 0, 0, 0, 0, 0, 0), cfg)
+        window = TimeWindow(resource_created_at, window.end, window.granularity)
     histories = metrics.partition_histories(
         account_resource_id, "PhysicalPartitionSizeInfo", window, database=database,
         container=container, owner_rid=offer.owner_rid, regions=regions,

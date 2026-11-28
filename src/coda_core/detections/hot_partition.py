@@ -1,217 +1,207 @@
-"""DX-006: Hot partition (partition-key skew).
+"""DX-006: report co-observed physical partition skew separately from offer-level throttling.
 
-Physical skew concentrates RU on a subset of partitions while the offer can look under-utilized.
-Investigate logical-key distribution before recommending a key change. Offer-level 429 counts
-do not establish which partition returned a 429.
-
-Detection signal: per-partition ``NormalizedRUConsumption`` (split by ``PhysicalPartitionId``). A hot
-partition exists when the busiest partition is **saturated** (p99 >= ``saturation_pct``) **and** at
-least one other partition has **headroom** (p99 < ``uniform_min_pct``). This is
-partition-count-independent: it keys off "is some partition saturated while another is cool", not a
-skew ratio that scales with partition count (a fixed ratio would never fire on a 2-partition
-container). The skew ratio (max / mean) is reported as descriptive context only.
-
-Severity scales with throttling (container-level 429 rate): **active throttling -> high**;
-**saturated-but-not-throttling -> medium** (early warning — the hot partition is pinned and cannot
-borrow the cool partitions' capacity, which becomes a real problem as load grows / the container
-scales out to more partitions).
-
-v1 detects **physical-partition RU skew** (Azure Monitor, no Log Analytics dependency). Identifying
-the hot **logical key** (``CDBPartitionKeyRUConsumption``) and per-partition **storage** skew are
-follow-ups. Read-only / diagnose-only.
+A single hourly hot/cool contrast is an observation. A finding requires the same hot partition
+in the same region in two consecutive completed hours. Only the matching hours' request counts
+can promote it to High. Neither signal identifies a logical key or the source of a specific 429.
 """
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, replace
+from collections import defaultdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
+from math import isfinite
 
-from coda_core.detections.over_provisioning import utilization_stats
-from coda_core.detections.regional_skew import regional_verdict
-from coda_core.detections.under_provisioning import throttle_rate
+from azure.core.exceptions import AzureError
+
 from coda_core.providers.arm import ThroughputOffer
 from coda_core.providers.azure_monitor import AzureMonitorMetricsProvider
 from coda_core.providers.base import MetricSeries, TimeWindow
+from coda_core.providers.partition_metrics import RegionHistory, coverage_evidence
 from coda_core.providers.shared_offer import IncompletePool, PoolMembers, RequestCounts, request_series
-from coda_core.sufficiency import evaluate_age
 
-# Hot partition is present-tense: a short window with a 1-day age floor (like DX-005).
 PRODUCTION_WINDOW_DAYS = 7
-AGE_FLOOR = timedelta(days=1)
+HOUR = timedelta(hours=1)
 
 
 def production_window(now: datetime | None = None) -> TimeWindow:
-    anchor = now or datetime.now(timezone.utc)
-    return TimeWindow(anchor - timedelta(days=PRODUCTION_WINDOW_DAYS), anchor, timedelta(hours=1))
-
-
-@dataclass(frozen=True)
-class PartitionSkewSignal:
-    """Per-physical-partition utilization picture for one container."""
-
-    partition_count: int
-    max_p99: float            # busiest partition's p99 utilization
-    min_p99: float            # coolest partition's p99 utilization
-    mean_p99: float
-    hot_partitions: int       # partitions with p99 >= saturation_pct
-    cool_partitions: int      # partitions with p99 < uniform_min_pct (have headroom)
-    skew_ratio: float         # max / mean — descriptive only, NOT the trigger
-    throttle_rate_pct: float  # container-level 429 rate (drives severity)
-    total_requests: float
-
-    def as_dict(self) -> dict:
-        return asdict(self)
-
-
-def partition_skew(
-    per_partition: dict[str, MetricSeries], *, saturation_pct: float, uniform_min_pct: float
-) -> tuple[int, float, float, float, int, int, float]:
-    """Return (count, max_p99, min_p99, mean_p99, hot, cool, skew_ratio) of per-partition p99s."""
-    p99s = [utilization_stats(s).p99 for s in per_partition.values() if s.values()]
-    if not p99s:
-        return 0, 0.0, 0.0, 0.0, 0, 0, 0.0
-    mx, mn, mean = max(p99s), min(p99s), sum(p99s) / len(p99s)
-    hot = sum(1 for p in p99s if p >= saturation_pct)
-    cool = sum(1 for p in p99s if p < uniform_min_pct)
-    ratio = (mx / mean) if mean > 0 else 0.0
-    return len(p99s), mx, mn, mean, hot, cool, ratio
+    """Keep the seven-day hourly lookback; there is no separate age floor."""
+    end = now or datetime.now(timezone.utc)
+    return TimeWindow(end - timedelta(days=PRODUCTION_WINDOW_DAYS), end, HOUR)
 
 
 @dataclass(frozen=True)
 class HotPartitionConfig:
-    """Tunable knobs. The 90% saturation / 70% headroom cutoffs are the same per-partition
-    thresholds DX-005 uses (fleet-validated, ADR-0009)."""
+    """Utilization gates apply to hourly maxima; impact gates apply to each witness hour."""
 
-    saturation_pct: float = 90.0     # a partition >= this is "hot"
-    uniform_min_pct: float = 70.0    # a partition < this has "headroom"
-    throttle_rate_pct: float = 1.0   # >= this container 429 rate = active throttling
-    severity_high_throttle: float = 1.0  # throttling at/above this -> high severity
+    saturation_pct: float = 90.0
+    uniform_min_pct: float = 70.0
+    throttle_rate_pct: float = 1.0
+    min_total_requests: int = 1000
 
 
 @dataclass(frozen=True)
 class HotPartitionVerdict:
-    is_hot_partition: bool
-    partition_count: int
-    max_p99: float
-    min_p99: float
-    skew_ratio: float
-    throttling: bool | None
-    # hot_partition | uniform_saturation | not_saturated | single_partition | insufficient_data
+    """Only Medium and High are actionable; exact scope, measurements and times are in evidence."""
+
     root_cause: str
-    severity: str  # high | medium | low | none
+    severity: str
     recommended_action: str
-    methodology: dict = field(default_factory=dict)
+    methodology: dict
+
+    @property
+    def is_hot_partition(self) -> bool:
+        return self.root_cause == "hot_partition"
 
     def as_dict(self) -> dict:
-        return asdict(self)
+        return {**asdict(self), "is_hot_partition": self.is_hot_partition}
 
 
-def classify(
-    signal: PartitionSkewSignal, config: HotPartitionConfig | None = None
-) -> HotPartitionVerdict:
-    """Map a per-partition skew signal to a hot-partition verdict."""
+@dataclass(frozen=True)
+class _Contrast:
+    """One same-region, same-timestamp Maximum comparison between identified physical partitions."""
+
+    region: str
+    start: datetime
+    hot_id: str
+    hot_pct: float
+    cool_id: str
+    cool_pct: float
+    complete_hour: bool
+
+
+def _counts(series: MetricSeries) -> dict[datetime, int | None]:
+    """Never use a duplicate, absent, negative or fractional request count for escalation."""
+    result = {}
+    for p in series.points:
+        v = p.value
+        valid = isinstance(v, (int, float)) and not isinstance(v, bool) and isfinite(v) and v >= 0 and int(v) == v
+        result[p.timestamp] = int(v) if valid and p.timestamp not in result else None
+    return result
+
+
+def classify(histories: tuple[RegionHistory, ...], window: TimeWindow,
+             request_counts: tuple[MetricSeries, MetricSeries] | None, *,
+             config: HotPartitionConfig | None = None, pressure_issue: str | None = None) -> HotPartitionVerdict:
+    """Select the strongest, then latest, evidenced episode; never pool hours, regions or hot IDs."""
     cfg = config or HotPartitionConfig()
-    throttling = signal.throttle_rate_pct >= cfg.throttle_rate_pct
+    evidence = coverage_evidence(histories)
+    evidence.update(thresholds=asdict(cfg), observation_start=window.start.isoformat(),
+                    observation_end=window.end.isoformat())
+    totals, throttles = (_counts(s) for s in request_counts) if request_counts else ({}, {})
 
-    def verdict(**kw) -> HotPartitionVerdict:
-        base = dict(
-            is_hot_partition=False, partition_count=signal.partition_count,
-            max_p99=round(signal.max_p99, 1), min_p99=round(signal.min_p99, 1),
-            skew_ratio=round(signal.skew_ratio, 2), throttling=throttling,
-            root_cause="not_saturated", severity="none", recommended_action="",
-            methodology={"thresholds": {"saturation_pct": cfg.saturation_pct,
-                                        "uniform_min_pct": cfg.uniform_min_pct},
-                         "hot_partitions": signal.hot_partitions,
-                         "cool_partitions": signal.cool_partitions,
-                         "throttle_rate_pct": round(signal.throttle_rate_pct, 2)},
-        )
-        base.update(kw)
-        return HotPartitionVerdict(**base)
+    def counts_at(stamp):
+        if not window.start <= stamp < window.end:
+            return None, None
+        t, r = totals.get(stamp), throttles.get(stamp)
+        if t is not None and r is not None and r > t:
+            return None, None
+        return t, r
 
-    if signal.partition_count == 0:
-        return verdict(root_cause="insufficient_data")
-    if signal.partition_count == 1:
-        return verdict(root_cause="single_partition")  # a single partition cannot be skewed
-    if signal.max_p99 < cfg.saturation_pct:
-        return verdict(root_cause="not_saturated")      # no partition is hot
-    if signal.min_p99 >= cfg.uniform_min_pct:
-        # Every partition is busy -> add capacity, not re-key. DX-005's (global) domain.
-        return verdict(root_cause="uniform_saturation")
+    def material(stamp):
+        t, r = counts_at(stamp)
+        return t is not None and r is not None and t >= cfg.min_total_requests and 100*r >= cfg.throttle_rate_pct*t
 
-    # Saturated busiest partition + at least one cooler partition with headroom = hot partition.
-    severity = "high" if throttling else "medium"
-    action = (
-        f"{signal.hot_partitions} of {signal.partition_count} physical partitions saturated "
-        f"(busiest p99 {signal.max_p99:.0f}%) while others have headroom (coolest p99 "
-        f"{signal.min_p99:.0f}%). Investigate which keys consume the most RU before changing "
-        f"throughput or redesigning the partition key."
-    )
-    return verdict(
-        is_hot_partition=True, root_cause="hot_partition", severity=severity,
-        recommended_action=action,
-    )
+    best: tuple[_Contrast, ...] = ()
+    best_rank = None
+    measured_429s = {stamp: r for stamp in throttles if (r := counts_at(stamp)[1]) is not None}
+    evidence["window_observed_429s"] = sum(measured_429s.values()) if measured_429s else None
+    if pressure_issue:
+        evidence["throttling_unavailable"] = pressure_issue
+    negative_causes = set()
+    has_completed_hour = False
+    for h in histories:
+        if h.granularity != HOUR:
+            evidence["coverage_complete"] = False
+            continue
+        buckets = defaultdict(dict)
+        for key, series in h.series.items():
+            for point in series.points:
+                v, stamp = point.value, point.timestamp
+                if not (window.start - HOUR < stamp < window.end):
+                    continue
+                if v is None or not isfinite(v) or not 0 <= v <= 100:
+                    evidence["coverage_complete"] = False
+                    continue
+                buckets[stamp][key] = v
+        previous = {}
+        for stamp, readings in sorted(buckets.items()):
+            complete = window.start <= stamp and stamp + HOUR <= window.end
+            has_completed_hour |= complete
+            coolest = min(readings, key=lambda key: (readings[key], key))
+            hot = {key: v for key, v in readings.items() if v >= cfg.saturation_pct}
+            if h.complete and complete:
+                negative_causes.add("single_partition" if h.expected == 1 else
+                                    "uniform_saturation" if hot else "not_saturated")
+            current = {}
+            if hot and readings[coolest] < cfg.uniform_min_pct:
+                for key, value in hot.items():
+                    here = _Contrast(h.region, stamp, key, value, coolest, readings[coolest], complete)
+                    prior = previous.get(key)
+                    pair = (prior, here) if (complete and prior and prior.complete_hour
+                                             and prior.start + HOUR == stamp) else (here,)
+                    level = 0 if len(pair) == 1 else 2 if all(material(w.start) for w in pair) else 1
+                    rank = (level, stamp, value, h.region, key)
+                    if best_rank is None or rank > best_rank:
+                        best_rank, best = rank, pair
+                    current[key] = here
+            previous = current
+
+    if not best:
+        if not has_completed_hour or not evidence["coverage_complete"] or not negative_causes:
+            evidence["abstained"] = "incomplete_partition_coverage"
+            cause = "insufficient_data"
+        else:
+            cause = next(iter(negative_causes)) if len(negative_causes) == 1 else "no_regional_skew"
+        return HotPartitionVerdict(cause, "none", "", evidence)
+
+    hours = []
+    for w in best:
+        t, r = counts_at(w.start)
+        hours.append({**asdict(w), "start": max(w.start, window.start).isoformat(), "end": min(w.start+HOUR, window.end).isoformat(),
+                      "total_requests": t, "throttled_requests": r,
+                      "throttle_rate_pct": 100*r/t if t and r is not None else None})
+    counts_known = all(h["total_requests"] is not None and h["throttled_requests"] is not None for h in hours)
+    t = sum(h["total_requests"] for h in hours) if counts_known else None
+    r = sum(h["throttled_requests"] for h in hours) if counts_known else None
+    witness_stamps = {w.start for w in best}
+    evidence.update(witness_region=best[-1].region, physical_partition_id=best[-1].hot_id,
+                    comparable_buckets=len(hours), intervals=hours, total_requests=t, throttled_requests=r,
+                    throttle_rate_pct=100*r/t if t else None,
+                    other_observed_429s=sum(r for stamp, r in measured_429s.items() if stamp not in witness_stamps))
+    if not counts_known:
+        evidence["throttling_unavailable"] = pressure_issue or "Missing or inconsistent counts for a witness hour"
+    if len(best) == 1:
+        evidence["abstained"] = "skew_observed_once"
+        return HotPartitionVerdict("skew_observed", "none", "", evidence)
+    return HotPartitionVerdict("hot_partition", "high" if all(material(w.start) for w in best) else "medium",
+        "Investigate the workload and key distribution in the observed region. "
+        "These metrics cannot identify a logical partition key or tell which partition returned a 429.",
+        evidence)
 
 
 def detect_hot_partition(
-    metrics: AzureMonitorMetricsProvider,
-    account_resource_id: str,
-    database: str,
-    container: str,
-    offer: ThroughputOffer,
-    window: TimeWindow,
-    *,
-    config: HotPartitionConfig | None = None,
-    resource_created_at: datetime | None = None,
-    regions: tuple[str | None, ...] = (),
-    pool_members: PoolMembers | None = None,
-    read_counts: RequestCounts | None = None,
+    metrics: AzureMonitorMetricsProvider, account_resource_id: str, database: str, container: str | None,
+    offer: ThroughputOffer, window: TimeWindow, *, config: HotPartitionConfig | None = None,
+    resource_created_at: datetime | None = None, regions: tuple[str | None, ...] = (),
+    pool_members: PoolMembers | None = None, read_counts: RequestCounts | None = None,
+    as_of: datetime | None = None,
 ) -> HotPartitionVerdict:
-    """End-to-end DX-006 for one container."""
-    cfg = config or HotPartitionConfig()
-
-    if resource_created_at is not None:
-        age_insuff = evaluate_age(resource_created_at, window.end, AGE_FLOOR)
-        if age_insuff is not None:
-            return HotPartitionVerdict(
-                is_hot_partition=False, partition_count=0, max_p99=0.0, min_p99=0.0,
-                skew_ratio=0.0, throttling=False, root_cause="insufficient_data", severity="none",
-                recommended_action="",
-                methodology={"abstained": age_insuff.reason, "detail": age_insuff.detail},
-            )
-
-    histories = metrics.partition_histories(
-        account_resource_id, "NormalizedRUConsumption", window, database=database,
-        container=container, owner_rid=offer.owner_rid, regions=regions,
-    )
-    # TotalRequests is Count-native: aggregation="Count" gives the correct 429 rate; "Total"
-    # mis-weights the sum per status code and returns a wrong throttle rate.
-    pressure_issue = None
+    """Read the comparable hourly series once. A failed count read cannot erase observed skew."""
+    end = min(window.end, as_of or datetime.now(timezone.utc))
+    start = max(window.start, resource_created_at) if resource_created_at else window.start
+    if start >= end:
+        return HotPartitionVerdict("insufficient_data", "none", "", {"abstained": "no_elapsed_window"})
+    # Keep mature-offer reads identical to DX-005. For a clipped first hour, query from
+    # creation; a returned intersecting bucket may be described but cannot count as a full hour.
+    window = TimeWindow(start, end, HOUR)
+    histories = metrics.partition_histories(account_resource_id, "NormalizedRUConsumption", window,
+        database=database, container=container, owner_rid=offer.owner_rid, regions=regions)
+    issue = None
     try:
-        total, throttled = (read_counts(window) if read_counts is not None else
-                            request_series(metrics, account_resource_id, window, database, container, pool_members))
-        rate, t, count_429 = throttle_rate(total, throttled)
-    except IncompletePool as exc:
-        # Partition skew is observed independently of the missing rate used for escalation.
-        pressure_issue, rate, t = str(exc), 0, 0
-
-    def classify_series(series):
-        count, mx, mn, mean, hot, cool, ratio = partition_skew(
-            series, saturation_pct=cfg.saturation_pct, uniform_min_pct=cfg.uniform_min_pct)
-        return classify(PartitionSkewSignal(count, mx, mn, mean, hot, cool, ratio, rate, t), cfg)
-
-    verdict = regional_verdict(
-        histories, classify_series, skew_cause="hot_partition",
-        observations=lambda v: {"observed_hot": v.methodology["hot_partitions"],
-                                "observed_cool": v.methodology["cool_partitions"],
-                                "max_p99": v.max_p99, "min_p99": v.min_p99},
-    )
-    if verdict.is_hot_partition:
-        # Apply the limit after regional_verdict chooses the complete or partial-coverage advice.
-        verdict = replace(verdict, recommended_action=(
-            f"{verdict.recommended_action} These metrics cannot identify a logical partition key "
-            "or tell which partition returned a 429."))
-    if pressure_issue:
-        return replace(verdict, throttling=None, methodology={
-            **verdict.methodology, "throttle_rate_pct": None, "throttling_unavailable": pressure_issue})
-    return replace(verdict, methodology={**verdict.methodology, "throttled_requests": count_429,
-                                         "total_requests": t})
+        counts = (read_counts(window) if read_counts else
+                  request_series(metrics, account_resource_id, window, database, container, pool_members))
+    except (AzureError, IncompletePool, ValueError) as exc:
+        counts = None
+        issue = f"Offer request counts read failed: {getattr(exc, 'status_code', None) or type(exc).__name__}"
+    return classify(histories, window, counts, config=config, pressure_issue=issue)

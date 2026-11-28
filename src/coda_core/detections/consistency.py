@@ -1,9 +1,8 @@
-"""DX-016: Review Strong consistency, or multi-region Bounded Staleness, from ARM configuration.
+"""DX-016: Review Strong or Bounded Staleness from the ARM consistency and topology snapshot.
 
 **Strong** reads use a local replica quorum and cost twice the RU of Session reads even in one
-region. Cross-region write latency is a separate multi-region trade-off. ADR-0074 includes known
-single-region Strong at the existing Medium severity; single-region Bounded Staleness remains
-outside the finding policy. Internal "premium" labels refer to consistency trade-offs, not a SKU.
+region. Cross-region write latency is a separate multi-region trade-off. Single-region Strong
+and Bounded Staleness warrant High-priority review, not an automatic consistency change.
 Session can provide read-your-writes with token continuity, not Strong's global guarantees; changing
 consistency requires application review. An account has one default level: Strong OR Bounded
 Staleness are alternatives, never a simultaneous-level condition.
@@ -155,7 +154,7 @@ class ConsistencyVerdict:
     root_cause: str
     consistency_level: str | None
     region_count: int
-    severity: str  # medium | low | none
+    severity: str  # high | medium | low | none
     recommended_action: str
     methodology: dict = field(default_factory=dict)
 
@@ -164,10 +163,10 @@ class ConsistencyVerdict:
 
 
 def detect_expensive_consistency(config: AccountConfig) -> ConsistencyVerdict:
-    """Review Strong read cost in known regions without expanding single-region Bounded policy."""
+    """Distinguish local read cost from the application's cross-region consistency requirements."""
     level = _normalize(config.default_consistency_level)
     method = {"consistency_level": config.default_consistency_level,
-              "region_count": config.region_count}
+              "region_count": config.region_count, "write_region_count": config.write_region_count}
 
     def verdict(**kw) -> ConsistencyVerdict:
         base = dict(is_expensive=False, root_cause="default_or_relaxed", severity="none",
@@ -181,12 +180,12 @@ def detect_expensive_consistency(config: AccountConfig) -> ConsistencyVerdict:
     if level not in _PREMIUM_LEVELS:
         return verdict(root_cause="default_or_relaxed")  # Session / Eventual / ConsistentPrefix
     is_strong = level == "strong"
-    single_region_strong = is_strong and config.region_count == 1
-    if config.region_count < 2 and not single_region_strong:
-        return verdict(root_cause="single_region")
+    single_region = config.region_count == 1
+    if config.region_count <= 0:
+        return verdict(root_cause="unknown")
 
-    location = "in 1 region" if single_region_strong else f"across {config.region_count} regions"
-    if single_region_strong:
+    location = "in 1 region" if single_region else f"across {config.region_count} regions"
+    if single_region:
         write_tradeoff = "There is no cross-region write-latency cost in this single-region account. "
     elif is_strong:
         write_tradeoff = (
@@ -194,27 +193,30 @@ def detect_expensive_consistency(config: AccountConfig) -> ConsistencyVerdict:
             "write latency and tightening availability. "
         )
     else:
-        write_tradeoff = (
-            "Across multiple regions, Bounded Staleness constrains replication lag and can "
-            "throttle writes when the bound is exceeded. "
-        )
+        topology = ("With multiple writable regions, Bounded Staleness is a documented anti-pattern."
+                    if config.write_region_count > 1 else
+                    "One write region plus read replicas can use this bound to limit replica lag."
+                    if config.write_region_count == 1 else "Verify which regions are writable.")
+        write_tradeoff = f"Review the required staleness bound in versions or time. {topology} "
     return verdict(
         is_expensive=True,
-        root_cause="strong_single_region" if single_region_strong else "premium_multi_region",
-        severity=("medium" if is_strong else "low"),
+        root_cause=(("strong_single_region" if is_strong else "bounded_single_region")
+                    if single_region else "premium_multi_region"),
+        severity=("high" if single_region else "medium" if is_strong else "low"),
         recommended_action=(
             f"This account has one default consistency level: "
             f"{config.default_consistency_level} ({location}). "
             "Reads using this level use a local replica quorum and cost twice the RU of Session "
             f"reads. {write_tradeoff}"
-            "If application requirements permit, evaluate Session. It provides read-your-writes "
+            "If read-your-writes is sufficient, use Session. It provides read-your-writes "
             "with the latest relevant opaque, partition-bound SessionToken; a reused SDK client "
             "manages its session tokens. For a load-balanced web app, capture the Cosmos response "
             "SessionToken, return it through the web tier to the end-user client in a cookie "
             "(or equivalent client context), then receive it on a later web request. Pass the "
             "token in the Cosmos request options of whichever SDK instance handles that request; "
             "no direct SDK-to-SDK synchronization is required. Session is not equivalent to "
-            "Strong's global guarantees. Check per-request consistency overrides and validate "
+            "Strong's global guarantees: independent readers need not see the latest commit. "
+            "Check per-request consistency overrides and validate "
             "application requirements before changing the account default."
         ),
     )

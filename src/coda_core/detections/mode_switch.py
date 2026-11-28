@@ -1,232 +1,243 @@
-"""DX-012 / DX-013: throughput **mode-switch** recommendations (manual ↔ autoscale).
+"""Compare manual and autoscale throughput for the same capacity and measured hours (ADR-0086)."""
 
-Part of the throughput right-sizing family (docs/detections/throughput-right-sizing-family.md). These
-two share DX-001's utilization signal (``NormalizedRUConsumption``) but read a different shape of it —
-the **duty cycle** (how spiky vs steady the workload is) — and recommend a **mode change**, not a
-capacity change:
-
-* **DX-012 manual → autoscale.** A *manual* container whose load is **spiky** (high peak utilisation
-  but a low average — it sits mostly idle and occasionally spikes). Manual bills the fixed RU/s 24/7,
-  so a spiky workload wastes the idle time; autoscale's 10% floor cuts that. This is distinct from
-  DX-001, which fires on *steady-low* utilisation (low p99) — DX-012 needs a **high** p99 (the peaks
-  are real, so right-sizing down would cause throttling) with a **low** average.
-* **DX-013 autoscale → manual.** An *autoscale* container whose load is **steady-high** (average
-  sustained near the max, with little spikiness). Autoscale carries a per-RU premium over manual, so a
-  workload that stays high doesn't benefit from scaling and would be cheaper on manual at a fixed RU/s.
-
-Per ADR-0012 these are **qualitative** recommendations — a mode switch is a pricing optimisation, not
-a capacity (RU/s) recovery, so no RU/s waste figure is asserted. Read-only / diagnose-only.
-"""
-
-from __future__ import annotations
-
-import math
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
+from math import fsum, isclose
 
-from coda_core.detections.over_provisioning import (
-    DATA_REQUIREMENT,
-    UtilizationStats,
-    utilization_stats,
-)
-from coda_core.providers.base import DataProvider, TimeWindow
-from coda_core.sufficiency import evaluate_age, evaluate_series
+from azure.core.exceptions import AzureError
 
+from coda_core.detections.autoscale_signal import autoscaled_utilization_series
+from coda_core.detections.throughput_history import HOUR, MONTH, WEEK, throughput_history
+from coda_core.framework.cost_rate import MULTI_WRITE_METER, regional_mode_units, throughput_meter
+from coda_core.providers.arm import AccountConfig
+from coda_core.providers.base import MetricPoint, MetricSeries, TimeWindow
 
-@dataclass(frozen=True)
-class DutyCycleSignal:
-    """How spiky vs steady a container's utilisation is, over the window."""
-
-    avg: float            # average utilisation (% of provisioned)
-    p99: float            # p99 utilisation (% of provisioned)
-    max_util: float       # peak utilisation (% of provisioned)
-    peak_to_avg: float    # max / avg — high = spiky, ~1 = flat/steady
-    sample_count: int
-
-    @classmethod
-    def from_stats(cls, s: UtilizationStats) -> DutyCycleSignal:
-        ratio = (s.max / s.avg) if s.avg > 0 else 0.0
-        return cls(avg=s.avg, p99=s.p99, max_util=s.max, peak_to_avg=ratio,
-                   sample_count=s.sample_count)
+EMPTY = MetricSeries("Throughput", "Maximum", "Percent", ())
 
 
-@dataclass(frozen=True)
-class ModeSwitchConfig:
-    """Thresholds for the duty-cycle triggers (autoscale economics, ADR-0012 / family doc)."""
-
-    # DX-012 manual -> autoscale: a real peak (high max) but mostly idle (low avg) = bursty. Manual
-    # must provision for the peak 24/7; autoscale serves it on demand and floors at 10% when idle.
-    spiky_peak_floor: float = 40.0    # peak must reach this — the spike is genuine, not noise
-    spiky_avg_ceiling: float = 30.0   # average below this — mostly idle between spikes
-    spiky_ratio: float = 5.0          # peak-to-average (burst) ratio at/above this = bursty
-    # DX-013 autoscale -> manual: average sustained high, not spiky = steady-high.
-    steady_avg_floor: float = 66.0    # average at/above ~2/3 of max
-    steady_ratio_ceiling: float = 1.3  # peak barely above average = flat/steady
+def _offer_meter(account):
+    """Do not price only a subset of a topology if ARM also reports another replica region."""
+    meter = throughput_meter(account)
+    if meter and {r.casefold() for r in account.reported_replica_regions} <= {
+            r.casefold() for r in account.location_names}:
+        return meter
+    return None
 
 
 @dataclass(frozen=True)
 class ModeSwitchVerdict:
+    """Keep pricing-mode observations distinct from recommendations and currency estimates."""
+
     recommend_switch: bool
-    # spiky_manual | steady_autoscale | well_matched | insufficient_data
     root_cause: str
-    current_mode: str          # manual | autoscale
-    recommended_mode: str      # autoscale | manual | (same)
-    avg: float
-    p99: float
-    max_util: float
-    peak_to_avg: float
-    severity: str              # medium | low | none
+    severity: str
+    summary: str
     recommended_action: str
-    methodology: dict = field(default_factory=dict)
-
-    def as_dict(self) -> dict:
-        return asdict(self)
+    methodology: dict
 
 
-def classify_manual_to_autoscale(
-    signal: DutyCycleSignal, provisioned_ru: float, config: ModeSwitchConfig | None = None
-) -> ModeSwitchVerdict:
-    """DX-012: a bursty *manual* container is a candidate to convert to autoscale."""
-    cfg = config or ModeSwitchConfig()
-    method = {"avg": round(signal.avg, 1), "max": round(signal.max_util, 1),
-              "peak_to_avg": round(signal.peak_to_avg, 2),
-              "thresholds": {"spiky_peak_floor": cfg.spiky_peak_floor,
-                             "spiky_avg_ceiling": cfg.spiky_avg_ceiling,
-                             "spiky_ratio": cfg.spiky_ratio}}
+def assess_mode(current: str, series: MetricSeries, capacity: float, window: TimeWindow,
+                account: AccountConfig | None, created_at: datetime | None = None,
+                existed_by: datetime | None = None, *, regional: dict[str, MetricSeries] | None = None,
+                read_issues: dict[str, str] | None = None) -> ModeSwitchVerdict:
+    """Price both modes in units of their common throughput meter; its unit price cancels.
 
-    def verdict(**kw) -> ModeSwitchVerdict:
-        base = dict(recommend_switch=False, root_cause="well_matched", current_mode="manual",
-                    recommended_mode="manual", avg=round(signal.avg, 1), p99=round(signal.p99, 1),
-                    max_util=round(signal.max_util, 1), peak_to_avg=round(signal.peak_to_avg, 2),
-                    severity="none", recommended_action="", methodology=method)
-        base.update(kw)
-        return ModeSwitchVerdict(**base)
-
-    if signal.sample_count == 0:
-        return verdict(root_cause="insufficient_data")
-    spiky = (signal.max_util >= cfg.spiky_peak_floor
-             and signal.avg <= cfg.spiky_avg_ceiling
-             and signal.peak_to_avg >= cfg.spiky_ratio)
-    if not spiky:
-        return verdict(root_cause="well_matched")
-    # Autoscale max must be >= 1000 RU/s and a multiple of 1000; size it to cover the observed peak
-    # with headroom. The idle floor (10% of max) replaces the fixed manual RU/s when idle.
-    peak_ru = signal.max_util / 100.0 * provisioned_ru
-    target_max = max(1000.0, math.ceil(peak_ru * 1.3 / 1000.0) * 1000.0)
-    return verdict(
-        recommend_switch=True, root_cause="spiky_manual", recommended_mode="autoscale",
-        severity="medium",
-        recommended_action=(
-            f"Load is bursty on this manual container (peak {signal.max_util:.0f}% vs average "
-            f"{signal.avg:.0f}% of {provisioned_ru:.0f} RU/s — a {signal.peak_to_avg:.0f}x "
-            f"peak-to-average ratio). Manual bills the fixed RU/s 24/7 even though the workload is "
-            f"mostly idle between spikes. Convert to autoscale (max ≈ {target_max:.0f} RU/s, the "
-            f"smallest that covers the peak); autoscale's 10% floor cuts idle-time cost while still "
-            f"covering the peaks."
-        ),
-    )
-
-
-def classify_autoscale_to_manual(
-    signal: DutyCycleSignal, provisioned_ru: float, config: ModeSwitchConfig | None = None
-) -> ModeSwitchVerdict:
-    """DX-013: a steady-high *autoscale* container is a candidate to convert to manual."""
-    cfg = config or ModeSwitchConfig()
-    method = {"avg": round(signal.avg, 1), "max": round(signal.max_util, 1),
-              "peak_to_avg": round(signal.peak_to_avg, 2),
-              "thresholds": {"steady_avg_floor": cfg.steady_avg_floor,
-                             "steady_ratio_ceiling": cfg.steady_ratio_ceiling}}
-
-    def verdict(**kw) -> ModeSwitchVerdict:
-        base = dict(recommend_switch=False, root_cause="well_matched", current_mode="autoscale",
-                    recommended_mode="autoscale", avg=round(signal.avg, 1), p99=round(signal.p99, 1),
-                    max_util=round(signal.max_util, 1), peak_to_avg=round(signal.peak_to_avg, 2),
-                    severity="none", recommended_action="", methodology=method)
-        base.update(kw)
-        return ModeSwitchVerdict(**base)
-
-    if signal.sample_count == 0:
-        return verdict(root_cause="insufficient_data")
-    steady = (signal.avg >= cfg.steady_avg_floor
-              and signal.peak_to_avg <= cfg.steady_ratio_ceiling)
-    if not steady:
-        return verdict(root_cause="well_matched")
-    return verdict(
-        recommend_switch=True, root_cause="steady_autoscale", recommended_mode="manual",
-        severity="medium",
-        recommended_action=(
-            f"Load is steady and high on this autoscale container (average {signal.avg:.0f}% of the "
-            f"{provisioned_ru:.0f} RU/s max, peak {signal.max_util:.0f}% — little spikiness). "
-            f"Autoscale carries a per-RU premium over manual, and a workload that stays high doesn't "
-            f"benefit from scaling. Convert to manual at a fixed RU/s near the sustained level."
-        ),
-    )
-
-
-def _series_or_abstain(provider, account_resource_id, database, container, window):
-    series = provider.get_metric(
-        account_resource_id, "NormalizedRUConsumption", window, aggregation="Maximum",
-        dimension_filter={"DatabaseName": database, "CollectionName": container},
-    )
-    insuff = evaluate_series(series, DATA_REQUIREMENT)
-    return series, insuff
-
-
-def detect_manual_to_autoscale(
-    provider: DataProvider, account_resource_id: str, database: str, container: str,
-    provisioned_ru: float, window: TimeWindow, *,
-    config: ModeSwitchConfig | None = None, resource_created_at: datetime | None = None,
-) -> ModeSwitchVerdict:
-    """End-to-end DX-012 for one manual container."""
-    if resource_created_at is not None:
-        age = evaluate_age(resource_created_at, window.end, DATA_REQUIREMENT.window_floor)
-        if age is not None:
-            return _abstain_mode("manual", "autoscale", age.reason, age.detail)
-    series, insuff = _series_or_abstain(provider, account_resource_id, database, container, window)
-    if insuff is not None:
-        return _abstain_mode("manual", "autoscale", insuff.reason, insuff.detail)
-    signal = DutyCycleSignal.from_stats(utilization_stats(series))
-    return classify_manual_to_autoscale(signal, provisioned_ru, config)
-
-
-def detect_autoscale_to_manual(
-    provider: DataProvider, account_resource_id: str, database: str, container: str,
-    provisioned_ru: float, window: TimeWindow, *,
-    config: ModeSwitchConfig | None = None, resource_created_at: datetime | None = None,
-) -> ModeSwitchVerdict:
-    """End-to-end DX-013 for one autoscale container.
-
-    Uses the **AutoscaledRU**-as-%-of-configured-max series (not NormalizedRUConsumption, which for
-    autoscale measures against the currently-scaled value) so "steady-high" means autoscale sat near
-    the configured max with little spikiness.
+    DX-012 models autoscale from each hourly normalized peak. DX-013 uses the actual highest
+    scaled throughput in each hour. Neither direction resizes capacity or extrapolates dollars.
     """
-    from coda_core.detections.autoscale_signal import autoscaled_utilization_series
+    def history(data):
+        """Validate each region independently against the same closed-hour anchor."""
+        return throughput_history(data, window, created_at, existed_by=existed_by,
+                                  exclude_unverified_zero_padding=current == "manual")
 
-    if resource_created_at is not None:
-        age = evaluate_age(resource_created_at, window.end, DATA_REQUIREMENT.window_floor)
-        if age is not None:
-            return _abstain_mode("autoscale", "manual", age.reason, age.detail)
-    series = autoscaled_utilization_series(
-        provider, account_resource_id, database, container, provisioned_ru, window
-    )
-    insuff = evaluate_series(series, DATA_REQUIREMENT)
-    if insuff is not None:
-        return _abstain_mode("autoscale", "manual", insuff.reason, insuff.detail)
-    signal = DutyCycleSignal.from_stats(utilization_stats(series))
-    return classify_autoscale_to_manual(signal, provisioned_ru, config)
+    aggregate = history(series)
+    histories = ({r: history(regional.get(r, EMPTY)) for r in account.location_names}
+                 if regional is not None and account else {})
+    consecutive = min((h.consecutive for h in histories.values()), default=aggregate.consecutive)
+    size = MONTH if consecutive == MONTH else WEEK if consecutive >= WEEK else 0
+    inputs = {r: (h.evaluated.values()[-size:] if size else h.observed.values()) for r, h in histories.items()}
+    regional_values = [v for region_values in inputs.values() for v in region_values]
+    values = regional_values or aggregate.evaluated.values()
+    evidence = aggregate.evidence() if not histories else {
+        "observed_samples": (sum(len(h.observed.points) for h in histories.values()) if regional_values
+                             else len(aggregate.observed.points)),
+        "evaluated_samples": len(values), "latest_consecutive_hours": consecutive,
+        "observation_scope": "regional_readings" if regional_values else "offer_aggregate_only",
+        "coverage_end_exclusive": aggregate.end.isoformat(),
+        "regional_measured_hours": {r: h.consecutive for r, h in histories.items()},
+        "regional_read_issues": read_issues or {},
+    }
+    if not values:
+        detail = ("No usable manual utilization measurements." if current == "manual" else
+                  "No usable complete hourly scaled-throughput totals.")
+        if histories:
+            detail += " Region-resolved hourly evidence is unavailable."
+        return ModeSwitchVerdict(False, "no_data", "none", detail,
+                                 "", {**evidence, "abstained": "no_data"})
+    avg, peak = fsum(values) / len(values), max(values)
+    label = "actual scaled throughput"
+    if current == "manual":
+        label = "hourly peak utilization" if window.granularity == HOUR else "normalized utilization"
+    if histories and any(inputs.values()):
+        label = "regional " + label
+    summary = (f"Observed {label}: average {avg:.1f}%, peak {peak:.1f}% of {capacity:g} RU/s "
+               f"over {len(values)} samples; {consecutive} consecutive completed hours"
+               f"{' across all configured regions' if histories else ''}.")
+    if current == "autoscale":
+        peak_ru = peak / 100 * capacity
+        summary += f" Highest observed scaled throughput: {peak_ru:g} RU/s."
+        evidence.update(peak_scaled_ru=peak_ru, average_scaled_ru=avg / 100 * capacity)
+    meter = _offer_meter(account)
+    if meter == MULTI_WRITE_METER:
+        summary += " The multi-write meter has the same per-unit price for manual and autoscale."
+    if any(h.unverified_leading_zeros for h in (histories.values() if histories else (aggregate,))):
+        summary += " Leading zero readings without resource-existence evidence do not establish history."
+    evidence.update(average_pct=avg, peak_pct=peak, configured_capacity_ru=capacity, advice_stage="observation")
+
+    def observation(reason: str, detail: str = "") -> ModeSwitchVerdict:
+        """A missing economic comparison never hides the measured signal."""
+        return ModeSwitchVerdict(False, reason, "none", summary + detail, "", evidence)
+
+    if consecutive < WEEK:
+        return observation("incomplete_week", " Regional evidence is incomplete." if histories else "")
+    if (not meter or capacity < 1000 or capacity % 1000 != 0
+            or account.region_count > 1 and account.is_pppra_enabled is None):
+        return observation("comparison_unavailable", " An equal-capacity comparison is unavailable "
+                           "for this topology or setting.")
+    factors = regional_mode_units(account, meter, capacity)
+    if not factors:
+        return observation("comparison_unavailable", " Regional billing factors are unverified.")
+    if not inputs:
+        if account.region_count > 1 and (current != "manual" or account.is_pppra_enabled is not False):
+            return observation("comparison_unavailable", " Region-resolved hourly measurements are required.")
+        # Only traditional autoscale applies the modeled busiest partition/region to all regions.
+        inputs = dict.fromkeys(account.location_names, values)
+    elif current == "manual" and account.is_pppra_enabled is False:
+        # If the global scalar was not usable, its exact equivalent is the per-hour maximum
+        # across all independently verified regions, not the average of their monthly peaks.
+        hottest = [max(hour) for hour in zip(*inputs.values(), strict=True)]
+        inputs = dict.fromkeys(account.location_names, hottest)
+    rows = {}
+    for r, (manual_full, auto_full) in factors.items():
+        rows[r] = {"manual_units": manual_full * size,
+                   "autoscale_units": auto_full * fsum(max(10.0, pct) / 100 for pct in inputs[r])}
+    evidence.update(meter=meter, equal_capacity_ru=capacity, regional_meter_units=rows,
+                    manual_meter_units=fsum(row["manual_units"] for row in rows.values()),
+                    autoscale_meter_units=fsum(row["autoscale_units"] for row in rows.values()),
+                    autoscale_input=("actual_scaled" if current == "autoscale" else
+                                     "regional_hourly_peak_upper_bound" if account.is_pppra_enabled is True
+                                     else "modeled_from_hourly_peak"),
+                    throughput_metric=("NormalizedRUConsumption" if current == "manual" else
+                                       "ProvisionedThroughput" if account.is_pppra_enabled is False else "AutoscaledRU"),
+                    zone_premium_regions=(0 if account.multi_region_writes_enabled else account.zone_redundant_region_count),
+                    scaling_basis=("traditional" if account.is_pppra_enabled is False else
+                                   "dynamic" if account.is_pppra_enabled is True else "single_region"))
+    alternate = "autoscale" if current == "manual" else "manual"
+    # A regional price cancels only within that region. A blended account rate must not settle
+    # opposite regional deltas. Ties in one region do not erase a strict improvement elsewhere.
+    pairs = [(row[current + "_units"], row[alternate + "_units"]) for row in rows.values()]
+    if any(a > b for a, b in pairs) and any(a < b for a, b in pairs):
+        return observation("regional_prices_required", " Regional estimates favor different modes; "
+                           "region-specific unit prices are required to identify the cheaper total.")
+    if not any(a > b and not isclose(a, b, rel_tol=1e-12) for a, b in pairs):
+        evidence["advice_stage"] = "no_change"
+        note = (" The regional peak model does not establish that autoscale is cheaper; independent "
+                "partition scaling could use less." if current == "manual" and account.is_pppra_enabled is True
+                else f" {alternate.capitalize()} was not cheaper in the equal-capacity estimate.")
+        return observation("not_cheaper", note)
+    comparison = f" At equal capacity, {alternate} has the lower estimated throughput cost for those hours."
+    if consecutive < MONTH:
+        evidence["advice_stage"] = "review"
+        return ModeSwitchVerdict(False, "review", "none", summary + comparison,
+                                 "Review whether this measured week is representative.", evidence)
+    evidence["advice_stage"] = "recommendation"
+    return ModeSwitchVerdict(True, "lower_estimated_cost", "medium", summary + comparison,
+                             f"Consider switching to {alternate} at the same {capacity:g} RU/s capacity. "
+                             "Check service limits, billing terms and expected future load first; "
+                             "future savings are not guaranteed.", evidence)
 
 
-def _abstain_mode(current: str, recommended: str, reason: str, detail: str) -> ModeSwitchVerdict:
-    return ModeSwitchVerdict(
-        recommend_switch=False, root_cause="insufficient_data", current_mode=current,
-        recommended_mode=recommended, avg=0.0, p99=0.0, max_util=0.0, peak_to_avg=0.0,
-        severity="none", recommended_action="", methodology={"abstained": reason, "detail": detail},
-    )
+def _regional_reads(account, reader):
+    """Keep good regions as observations; a missing/denied/ambiguous region cannot be prorated."""
+    data, issues = {}, {}
+    for r in account.location_names:
+        try:
+            data[r] = reader(r)
+        except (AzureError, ValueError) as exc:
+            issues[r] = type(exc).__name__
+    return data, issues
 
 
-# Re-export so callers don't reach into over_provisioning for the shared helpers.
-__all__ = [
-    "DutyCycleSignal", "ModeSwitchConfig", "ModeSwitchVerdict",
-    "classify_manual_to_autoscale", "classify_autoscale_to_manual",
-    "detect_manual_to_autoscale", "detect_autoscale_to_manual",
-]
+def _observation_fallback(data, issues, reader):
+    """Use an available aggregate only to describe a signal, never to fill an absent region."""
+    if issues or any(s.points for s in data.values()):
+        return EMPTY
+    try:
+        return reader()
+    except (AzureError, ValueError) as exc:
+        issues["aggregate"] = type(exc).__name__
+        return EMPTY
+
+
+def detect_manual_to_autoscale(provider, account_resource_id: str, database: str, container: str,
+                             provisioned_ru: float, window: TimeWindow, *,
+                             account: AccountConfig | None = None,
+                             resource_created_at: datetime | None = None,
+                             resource_existed_by: datetime | None = None) -> ModeSwitchVerdict:
+    """Evaluate one dedicated manual offer without inferring an autoscale ceiling from peaks."""
+    def normalized(region=None):
+        """A multi-region global maximum is usable as a common projection only for traditional scaling."""
+        scope = {"DatabaseName": database, "CollectionName": container}
+        if region is not None:
+            scope["Region"] = region
+        strict = {"require_single_series": True} if region or (account and account.region_count > 1) else {}
+        return provider.get_metric(account_resource_id, "NormalizedRUConsumption", window, aggregation="Maximum",
+                                   dimension_filter=scope, **strict)
+
+    regional = issues = None
+    meter = _offer_meter(account)
+    if meter and account.is_pppra_enabled is True:
+        regional, issues = _regional_reads(account, normalized)
+        data = _observation_fallback(regional, issues, normalized)
+    elif meter and account.region_count > 1 and account.is_pppra_enabled is False:
+        try:
+            data = normalized()
+        except ValueError:
+            data = EMPTY  # An unaggregated regional slice is not the common hottest-hour signal.
+        if not data.points:
+            regional, issues = _regional_reads(account, normalized)
+    else:
+        data = normalized()
+    return assess_mode("manual", data, provisioned_ru, window, account, resource_created_at, resource_existed_by,
+                       regional=regional, read_issues=issues)
+
+
+def detect_autoscale_to_manual(provider, account_resource_id: str, database: str, container: str,
+                             provisioned_ru: float, window: TimeWindow, *,
+                             account: AccountConfig | None = None,
+                             resource_created_at: datetime | None = None) -> ModeSwitchVerdict:
+    """Evaluate one dedicated autoscale offer using measured scaled throughput, not consumption."""
+    def measured(region=None):
+        """Read a certified actual throughput history, not demand or an ARM ceiling."""
+        if account and account.is_pppra_enabled is False:
+            # AutoscaledRU is a dynamic-scaling metric. The regional ProvisionedThroughput hourly
+            # maximum is the historical scaled/billed signal, not the configured maximum (from ARM).
+            scope = {"DatabaseName": database, "CollectionName": container}
+            if region is not None:
+                scope["Region"] = region
+            ru = provider.get_metric(account_resource_id, "ProvisionedThroughput", window, aggregation="Maximum",
+                                     dimension_filter=scope, require_single_series=True)
+            return MetricSeries(ru.name, "Maximum", "Percent", tuple(
+                MetricPoint(p.timestamp, 100*p.value/provisioned_ru if p.value is not None and
+                            provisioned_ru > 0 and p.value >= 0.1*provisioned_ru else None) for p in ru.points))
+        return autoscaled_utilization_series(provider, account_resource_id, database, container,
+                                             provisioned_ru, window, region=region)
+
+    regional = issues = None
+    if _offer_meter(account) and account.is_pppra_enabled is not None:
+        regional, issues = _regional_reads(account, measured)
+        data = _observation_fallback(regional, issues, measured)
+    else:
+        data = measured()
+    return assess_mode("autoscale", data, provisioned_ru, window, account, resource_created_at,
+                       regional=regional, read_issues=issues)

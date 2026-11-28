@@ -61,17 +61,23 @@ workspace. The tables are populated in that workspace; they are not Cosmos DB co
 | DX-003 - Shared-throughput starvation | Required | `CDBDataPlaneRequests5M` preferred; raw `CDBDataPlaneRequests` supported |
 | DX-007 - Shard-key misalignment | Required | `CDBQueryRuntimeStatistics` **and** raw `CDBDataPlaneRequests` |
 | DX-010 - Uncontrolled ingestion | Required | `CDBDataPlaneRequests5M` preferred; raw `CDBDataPlaneRequests` supported |
+| DX-015 - Partition storage skew | Optional logical-key storage; physical observations still run | `CDBPartitionKeyStatistics` |
 | DX-016 - Expensive consistency | Optional read-charge enrichment; the finding uses ARM configuration | `CDBDataPlaneRequests5M` preferred; raw `CDBDataPlaneRequests` supported |
 
-Twenty detectors do not require Log Analytics; DX-016 can optionally use it for enrichment. See the
+Twenty detectors do not require Log Analytics; DX-015 and DX-016 can optionally use it for enrichment. See the
 [full detector-to-data-source and production-window table](docs/detectors.md#data-and-interpretation)
 for metrics, configuration, and optional cost/pricing inputs.
+
+DX-014's optional serverless cost comparison requires comparable subscription Cost Management
+data for the same 30 measured days. Without it CODA can still report usage; it won't infer a
+cheaper capacity mode. DX-023's reservation review does not require access to buy reservations.
 
 An administrator configures collection:
 
 1. Choose an existing Log Analytics workspace, or create one under your organization's policies.
 2. In Azure Portal, open the **Cosmos DB account > Monitoring > Diagnostic settings > Add diagnostic setting**.
 3. Select **DataPlaneRequests5M** for DX-003, DX-010, and optional DX-016 enrichment.
+   Select **PartitionKeyStatistics** if you want DX-015 to check sampled logical-key sizes.
    Also select **DataPlaneRequests** and **QueryRuntimeStatistics** if you need DX-002/DX-007.
    Enable only the categories needed for your diagnostics rather than indiscriminately enabling all logs.
 4. Choose **Send to Log Analytics workspace**, select the workspace, and select
@@ -83,6 +89,9 @@ An administrator configures collection:
 The four log-dependent detectors request 24 hours of logs. New settings collect future events;
 they do not backfill history. Ingestion/retention can incur charges, and readable records alone
 do not prove a complete window or sufficient per-container traffic.
+DX-002 and DX-007 show query fan-out observations early, but require 24 hours of verified
+container and logging history before assigning severity. Quiet hours count. DX-007 also needs
+recurring all-query fan-out before recommending re-keying.
 Full-text query logging is not required. Follow the
 [detailed setup and readiness guide](docs/detections/log-analytics-readiness.md).
 

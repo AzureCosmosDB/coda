@@ -16,6 +16,7 @@ from coda_core.error_contract import StableError, normalize_identifier
 from coda_core.pipeline.capabilities import (
     CAP_LA_REQUEST_AGGREGATES,
     CAPABILITIES,
+    LA_CAPABILITIES,
     CapabilitySet,
     log_source_tables,
     resolve_capabilities,
@@ -27,6 +28,7 @@ from coda_core.pipeline.registry import (
     SERVERLESS_REGISTRY,
 )
 from coda_core.providers.arm import account_config_from_arm
+from coda_core.providers.diagnostic_settings import read_log_exports
 from coda_core.providers.log_analytics import DataPlaneSource, _rows_from_response
 from coda_core.scan import NOSQL_KIND
 
@@ -94,7 +96,7 @@ def _exception_failure(phase: str, exc: Exception) -> StableError:
 
 
 def log_detector_requirements() -> list[dict[str, Any]]:
-    """Derive the five log-using paths from the same registry used by diagnosis."""
+    """Derive required and optional log sources from the diagnosis registry."""
     entries: dict[str, dict[str, Any]] = {}
     for adapter in (*REGISTRY, *ACCOUNT_REGISTRY, *DATABASE_REGISTRY, *SERVERLESS_REGISTRY):
         required = {key for key in adapter.requires if CAPABILITIES[key].is_log_analytics}
@@ -118,59 +120,8 @@ def log_detector_requirements() -> list[dict[str, Any]]:
 
 def _configuration(monitor, resource_id: str, descriptors: dict) -> dict[str, dict]:
     """Read account-specific exports, including category groups and destination table mode."""
-    categories = {}
-    for item in monitor.diagnostic_settings_category.list(resource_id, **_READ_OPTIONS):
-        if item.category_type != "Logs":
-            continue
-        if not isinstance(item.name, str) or not item.name:
-            raise ValueError("Diagnostic category has no name.")
-        categories[item.name.casefold()] = frozenset(
-            group.casefold() for group in item.category_groups or ()
-        )
-    settings = list(monitor.diagnostic_settings.list(resource_id, **_READ_OPTIONS))
-
-    def matches(log, category: str) -> bool:
-        """Handle named categories and groups without treating malformed booleans as enabled."""
-        if type(log.enabled) is not bool:
-            raise ValueError("Diagnostic category enabled state is invalid.")
-        if not log.enabled:
-            return False
-        if bool(log.category) == bool(log.category_group):
-            raise ValueError("Diagnostic log must name exactly one category or group.")
-        if log.category:
-            return log.category.casefold() == category
-        group = log.category_group.casefold()
-        return (
-            group == "alllogs" and category in categories
-            or group in categories.get(category, ())
-        )
-
-    results = {}
-    for table, descriptor in descriptors.items():
-        category = descriptor.category.casefold()
-        dedicated, legacy = set(), set()
-        other_destination = False
-        for setting in settings:
-            enabled = any(matches(log, category) for log in setting.logs or ())
-            if not enabled:
-                continue
-            if not setting.workspace_id:
-                other_destination = True
-            elif not isinstance(setting.workspace_id, str):
-                raise ValueError("Diagnostic workspace identity is invalid.")
-            elif (setting.log_analytics_destination_type or "").casefold() == "dedicated":
-                dedicated.add(setting.workspace_id)
-            elif (setting.log_analytics_destination_type or "").casefold() in {"", "azurediagnostics"}:
-                legacy.add(setting.workspace_id)
-            else:
-                raise ValueError("Unknown Log Analytics destination table mode.")
-        state = (
-            "configured" if dedicated else "wrong_mode" if legacy
-            else "missing_workspace" if other_destination
-            else "not_configured" if category in categories else "unsupported"
-        )
-        results[table] = {"status": state, "workspaces": sorted(dedicated | legacy)}
-    return results
+    exports = read_log_exports(monitor, resource_id, {t: d.category for t, d in descriptors.items()}, **_READ_OPTIONS)
+    return {t: {"status": e.status, "workspaces": list(e.workspaces)} for t, e in exports.items()}
 
 
 def _dependency_state(key: str, sources: dict, caps: CapabilitySet) -> tuple[str, list[str]]:
@@ -218,7 +169,7 @@ def _check_account(credential, subscription, group, account, resource_id, now) -
     with LogsQueryClient(credential, **_READ_OPTIONS) as client:
         caps = resolve_capabilities(
             la=_BoundedLogReader(client), account_resource_id=resource_id, span=span,
-            include_latest=True,
+            include_latest=True, required_la_caps=LA_CAPABILITIES,
         )
     observations = {item.table: item for item in caps.table_observations}
     sources = {}

@@ -3,16 +3,16 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from functools import lru_cache
-from math import ceil, isfinite
+from math import isfinite
 from typing import Iterator
 
 from azure.core.exceptions import HttpResponseError, ServiceRequestError, ServiceResponseError
 from azure.monitor.query import MetricAggregationType
 
-from .base import MetricPoint, MetricSeries, TimeWindow
+from .base import MetricPoint, MetricSeries, TimeWindow, covers_bucket_grid
 from .monitor_retry import MonitorUnavailable
 
 SERIES_LIMIT = 1000
@@ -75,6 +75,7 @@ class RegionHistory:
     series: dict[str, MetricSeries]
     issues: tuple[str, ...]
     granularity: timedelta
+    counts_by_time: dict[datetime, int] = field(default_factory=dict)
 
     @property
     def complete(self) -> bool:
@@ -148,17 +149,24 @@ class PartitionReader:
                                   max(window.granularity, timedelta(minutes=5)))
         rows = self._rows(rid, "PhysicalPartitionCount", scope, count_window, 2)
         if len(rows) != 1:
-            return None, "count_missing_or_ambiguous"
-        points = [p for p in rows[0].data if p.maximum is not None]
-        counts = {p.maximum for p in points}
+            return None, "count_missing_or_ambiguous", {}
+        by_time = {}
+        invalid = set()
+        for p in rows[0].data:
+            n = p.maximum
+            if (n is None or not isfinite(n) or n < 1 or n != int(n)
+                    or (p.timestamp in by_time and by_time[p.timestamp] != n)):
+                invalid.add(p.timestamp)
+            else:
+                by_time[p.timestamp] = int(n)
+        for stamp in invalid:
+            by_time.pop(stamp, None)
+        counts = set(by_time.values())
         if len(counts) != 1:
-            return None, "count_changed" if counts else "count_missing_or_ambiguous"
-        n = counts.pop()
-        if not isfinite(n) or n < 1 or n != int(n):
-            return None, "count_invalid"
-        if not _covers_window({p.timestamp for p in points}, count_window):
-            return None, "count_history_incomplete"
-        return int(n), None
+            return None, "count_changed" if counts else "count_missing_or_ambiguous", by_time
+        if not _covers_window(by_time, count_window):
+            return None, "count_history_incomplete", by_time
+        return counts.pop(), None, by_time
 
     def _region(self, rid: str, db: str, container: str | None, owner: str | None,
                 region: str, window: TimeWindow, metric: str) -> RegionHistory:
@@ -172,9 +180,9 @@ class PartitionReader:
             return RegionHistory(region, None, 0, {}, ("shared_offer_identity_missing",), window.granularity)
         issues = []
         try:
-            expected, issue = self.count(rid, scope, window)
+            expected, issue, counts_by_time = self.count(rid, scope, window)
         except READ_ERRORS as exc:
-            expected, issue = None, _read_error("count", exc)
+            expected, issue, counts_by_time = None, _read_error("count", exc), {}
         if issue:
             issues.append(issue)
         top = min(SERIES_LIMIT, max(16, (expected or 0) + 1))
@@ -228,7 +236,8 @@ class PartitionReader:
         grids = {tuple(p.timestamp for p in s.points) for s in usable.values()}
         if len(grids) > 1 or any(not _covers_window(grid, window) for grid in grids):
             issues.append("partition_history_incomplete")
-        return RegionHistory(region, expected, observed, usable, tuple(issues), window.granularity)
+        return RegionHistory(region, expected, observed, usable, tuple(issues), window.granularity,
+                             counts_by_time)
 
 
 def _read_error(stage, exc):
@@ -240,11 +249,4 @@ def _read_error(stage, exc):
 
 def _covers_window(stamps, window):
     """Require contiguous grain-spaced buckets covering the requested interval, not just N IDs."""
-    if not stamps:
-        return False
-    ordered = sorted(stamps)
-    grain = window.granularity
-    return (len(ordered) >= ceil((window.end - window.start) / grain)
-            and window.start - grain < ordered[0] <= window.start
-            and window.end - grain <= ordered[-1] < window.end
-            and all(b - a == grain for a, b in zip(ordered, ordered[1:])))
+    return covers_bucket_grid(sorted(stamps), window)

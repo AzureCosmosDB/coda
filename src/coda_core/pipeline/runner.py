@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 
 from coda_core.detections import cross_partition_query as cpq
 from coda_core.detections import indexing_cost as indexing
+from coda_core.detections import logical_partition_storage as lps
 from coda_core.detections import partition_merge as pm
 from coda_core.detections import shared_throughput as sht
 from coda_core.detections import uncontrolled_ingestion as ui
@@ -66,6 +67,7 @@ from coda_core.pipeline.registry import (
 from coda_core.pipeline.report import DiagnosticReport, now_iso
 from coda_core.pipeline.rollup import aggregate, compute_scope_provisioned_ru, correlate
 from coda_core.providers.arm import ArmProvider, ResourceAge, account_config_from_arm
+from coda_core.providers.diagnostic_settings import FanoutLogHistory
 from coda_core.providers.indexing_batch import InvalidIndexingInventory, ProjectedReads, plan as plan_indexing
 from coda_core.providers.monitor_cohort import COHORT_SIZE
 from coda_core.providers.shared_offer import offer_request_counts
@@ -76,7 +78,6 @@ from coda_core.providers.log_analytics import (
     CachingLogAnalyticsProvider,
     DataPlaneSource,
     LogAnalyticsProvider,
-    primary_destination_filter,
 )
 from coda_core.providers.retail_prices import RetailPricesProvider
 
@@ -116,13 +117,14 @@ class _ThreadLocalUnitProviders:
         self._subscription_id = getattr(arm, "subscription_id", None)
         self._local = threading.local()
 
+    @property
+    def isolated(self) -> bool:
+        """Only enable parallel SDK I/O when we can construct worker-owned clients."""
+        return all(v is not None for v in (self._metrics_credential, self._arm_credential, self._subscription_id))
+
     def current(self) -> tuple[AzureMonitorMetricsProvider, ArmProvider, LogAnalyticsProvider | None]:
         """Return this worker thread's providers, falling back to supplied fakes in unit tests."""
-        if (
-            self._metrics_credential is None
-            or self._arm_credential is None
-            or self._subscription_id is None
-        ):
+        if not self.isolated:
             return self._base_metrics, self._base_arm, self._la
         providers = getattr(self._local, "providers", None)
         if providers is None:
@@ -171,11 +173,6 @@ def _ordered_parallel_map(items, worker, *, concurrency: int) -> list:
     return results
 
 
-def _kql_literal(value: str) -> str:
-    """Quote a Cosmos name for KQL using the detectors' existing quote-stripping convention."""
-    return "'" + value.replace("'", "") + "'"
-
-
 def _run_metric_groups(items, cohort_key, axes, worker, providers, concurrency):
     """Process bounded, compatible ARM inventory groups; restore the original report ordering."""
     grouped = defaultdict(list)
@@ -197,14 +194,6 @@ def _run_metric_groups(items, cohort_key, axes, worker, providers, concurrency):
         for i, result in group:
             ordered[i] = result
     return ordered
-
-
-def _container_predicate(units: list[tuple[str, str]]) -> str:
-    """KQL predicate matching the exact account containers being diagnosed."""
-    return " or ".join(
-        f"(DatabaseName == {_kql_literal(db)} and CollectionName == {_kql_literal(container)})"
-        for db, container in units
-    )
 
 
 def _group_rows(rows: list[dict]) -> dict[tuple[str, str], list[dict]]:
@@ -242,13 +231,8 @@ def _prime_log_analytics_cache(
         return
 
     source = caps.dataplane_source
-    data_window = (
-        ui.production_window(run_now, source) if source is not None
-        else ui.production_window(run_now)
-    )
-    data_span = (data_window.start, data_window.end)
-    predicate = _container_predicate(containers) if containers else ""
-    writes = ", ".join(f"'{w}'" for w in ui.WRITE_OPS)
+    ingestion_window = ui.production_window(run_now)
+    ingestion_span = (ingestion_window.start, ingestion_window.end)
 
     def _read(kql: str, span):
         """One account-wide LA read; rows or None on failure (prefetch is strictly best-effort)."""
@@ -267,68 +251,22 @@ def _prime_log_analytics_cache(
         if containers and caps.has(CAP_LA_QUERYSTATS) and caps.has(CAP_LA_DATAPLANE):
             query_window = cpq.production_window(run_now)
             qs_span = (query_window.start, query_window.end)
-            qs_kql = (
-                "CDBQueryRuntimeStatistics "
-                + primary_destination_filter("CDBQueryRuntimeStatistics")
-                + f"| where {predicate} "
-                "| project DatabaseName, CollectionName, ActivityId, CorrelatedActivityId, "
-                "QueryText, PartitionKeyRangeId "
-                "| join kind=leftouter ("
-                "CDBDataPlaneRequests "
-                + primary_destination_filter("CDBDataPlaneRequests")
-                + f"| where {predicate} "
-                "| summarize ru = sum(RequestCharge) by ActivityId"
-                ") on ActivityId "
-                "| summarize partitionsHit = dcount(PartitionKeyRangeId), queryRU = sum(ru) "
-                "by DatabaseName, CollectionName, CorrelatedActivityId, QueryText "
-                "| summarize executions = count(), avgFanout = avg(partitionsHit), "
-                "maxFanout = max(partitionsHit), avgRU = avg(queryRU) "
-                "by DatabaseName, CollectionName, QueryText"
-            )
+            qs_kql = cpq.fanout_batch_kql(containers, query_window)
             qs_fut = ex.submit(_read, qs_kql, qs_span)
 
-        dp_futs = None
+        ingestion_futures = {}
         if containers and source is not None and caps.has(CAP_LA_REQUEST_AGGREGATES):
-            agg_kql = (
-                source.query_table(data_window)
-                + f"| where {predicate} "
-                f"| summarize totalRu = sum({source.charge}), "
-                f"writeRu = sumif({source.charge}, OperationName in ({writes})), "
-                f"reqs = {source.count}, throttles = {source.count_if('StatusCode == 429')}"
-                f"{source.invalid_rows} "
-                "by DatabaseName, CollectionName"
-            )
-            burst_kql = (
-                source.query_table(data_window)
-                + f"| where ({predicate}) and OperationName in ({writes}) "
-                f"| summarize ru = sum({source.charge}) by DatabaseName, CollectionName, "
-                f"bin(TimeGenerated, {source.burst_interval}) "
-                "| summarize peak = max(ru), avg = avg(ru) by DatabaseName, CollectionName"
-            )
-            ua_kql = (
-                source.query_table(data_window)
-                + f"| where ({predicate}) and OperationName in ({writes}) "
-                f"| summarize n = {source.count} by DatabaseName, CollectionName, UserAgent "
-                "| summarize arg_max(n, UserAgent) by DatabaseName, CollectionName"
-            )
-            dp_futs = {
-                "agg": ex.submit(_read, agg_kql, data_span),
-                "burst": ex.submit(_read, burst_kql, data_span),
-                "ua": ex.submit(_read, ua_kql, data_span),
-            }
+            for build in (ui.interval_kql, ui.burst_kql, ui.user_agent_kql):
+                query = build(containers, source, ingestion_window, account_resource_id)
+                ingestion_futures[build] = ex.submit(_read, query, ingestion_span)
 
         dbs = None
         shared_fut = None
         if database_offers and source is not None and caps.has(CAP_LA_REQUEST_AGGREGATES):
             dbs = [dbo.database for dbo in database_offers]
-            db_literals = ", ".join(_kql_literal(db) for db in dbs)
-            shared_kql = (
-                source.query_table(data_window)
-                + f"| where DatabaseName in ({db_literals}) and isnotempty(CollectionName) "
-                f"| summarize requests = {source.count}, "
-                f"throttled = {source.count_if('StatusCode == 429')}, "
-                f"ru = sum({source.charge}){source.invalid_rows} by DatabaseName, CollectionName"
-            )
+            data_window = sht.production_window(run_now, source)
+            data_span = (data_window.start, data_window.end)
+            shared_kql = sht.traffic_kql(dbs, source, data_window)
             shared_fut = ex.submit(_read, shared_kql, data_span)
 
         # Seed the exact per-unit cache keys from the batched results (main thread; order-independent).
@@ -338,47 +276,32 @@ def _prime_log_analytics_cache(
                 grouped = _group_rows(qs_raw)
                 for db, container in containers:
                     rows = grouped.get((db, container), [])
-                    rows = sorted(rows, key=lambda r: r.get("executions") or 0, reverse=True)[:200]
                     la.prime_query_resource(
-                        account_resource_id, cpq.query_shape_kql(db, container), qs_span, rows
+                        account_resource_id, cpq.query_shape_kql(db, container, query_window), qs_span, rows
                     )
 
-        if dp_futs is not None:
-            agg_raw = dp_futs["agg"].result()
-            burst_raw = dp_futs["burst"].result()
-            ua_raw = dp_futs["ua"].result()
-            if agg_raw is not None and burst_raw is not None and ua_raw is not None:
-                agg_by_unit = _group_rows(agg_raw)
-                burst_by_unit = _group_rows(burst_raw)
-                ua_by_unit = _group_rows(ua_raw)
-                for db, container in containers:
-                    zero = [{"totalRu": 0.0, "writeRu": 0.0, "reqs": 0, "throttles": 0}]
-                    if source.invalid_rows:
-                        zero[0]["invalid_rows"] = 0
-                    la.prime_query_resource(
-                        account_resource_id, ui.aggregate_kql(db, container, source, data_window), data_span,
-                        agg_by_unit.get((db, container), zero),
-                    )
-                    la.prime_query_resource(
-                        account_resource_id, ui.burst_kql(db, container, source, data_window), data_span,
-                        burst_by_unit.get((db, container), []),
-                    )
-                    la.prime_query_resource(
-                        account_resource_id, ui.user_agent_kql(db, container, source, data_window), data_span,
-                        ua_by_unit.get((db, container), []),
-                    )
+        for build, future in ingestion_futures.items():
+            rows = future.result()
+            if rows is None:
+                continue
+            grouped = _group_rows(rows)
+            if not grouped.keys() <= set(containers):
+                continue  # Unattributed cohort rows cannot seed an empty/clean per-container result.
+            for unit in containers:
+                la.prime_query_resource(
+                    account_resource_id, build([unit], source, ingestion_window, account_resource_id),
+                    ingestion_span, grouped.get(unit, []),
+                )
 
         if shared_fut is not None:
             shared_raw = shared_fut.result()
             if shared_raw is not None:
-                grouped = _group_rows(shared_raw)
+                by_db = defaultdict(list)
+                for row in shared_raw:
+                    by_db[row.get("DatabaseName")].append(row)
                 for db in dbs:
-                    rows = []
-                    for (row_db, _), group in grouped.items():
-                        if row_db == db:
-                            rows.extend(group)
                     la.prime_query_resource(
-                        account_resource_id, sht.traffic_kql(db, source, data_window), data_span, rows
+                        account_resource_id, sht.traffic_kql(db, source, data_window), data_span, by_db[db]
                     )
 
 
@@ -553,8 +476,28 @@ def _run_diagnostics(
         la=la, account_resource_id=account_resource_id, span=cap_span,
         cost_available=cost is not None,
     )
+    fanout_history = None
+    need_fanout = (la is not None and (container_offers or account_config.is_serverless)
+                   and caps.has(CAP_LA_QUERYSTATS) and caps.has(CAP_LA_DATAPLANE))
+    need_keys = bool(container_offers) and any(a.detection_id == "DX-015" for a in REGISTRY)
+    key_export = "unknown"
+    if need_keys or need_fanout:
+        try:
+            exports = arm.diagnostic_log_exports(account_resource_id)
+            if need_keys:
+                key_export = exports[lps.TABLE].status
+            if need_fanout:
+                fanout_history = FanoutLogHistory.from_exports(exports)
+        except Exception as exc:  # noqa: BLE001 - optional settings evidence; metrics stay independent
+            fanout_history = FanoutLogHistory(None, f"Diagnostic setting read failed: {type(exc).__name__}")
     if eval_window is None and caps.dataplane_source is DataPlaneSource.FIVE_MINUTE:
         window = default_eval_window(now=caps.dataplane_source.anchor(run_now))
+    logical_storage = {}
+    if need_keys:
+        log_window = window if mode == MODE_EVAL else TimeWindow(run_now-timedelta(days=7), run_now)
+        units = {(o.database, o.container): ages.get((o.database, o.container), ResourceAge()).created
+                 for o in container_offers if o.container is not None}
+        logical_storage = lps.collect(la, account_resource_id, key_export, log_window, units)
     # Derive the customer's effective $/RU/s rate once per run from their amortized bill. Account rows
     # are preferred; subscription rows are a provenance-labelled billing-latency fallback (ADR-0051).
     # None means bill-derived savings findings stay capacity-only.
@@ -574,7 +517,7 @@ def _run_diagnostics(
         effective_rate=effective_rate,
         dataplane_source=caps.dataplane_source,
         dataplane_error=caps.probe_error_for(frozenset({CAP_LA_REQUEST_AGGREGATES})),
-        inventory_issues=inventory.issues,
+        inventory_issues=inventory.issues, cost=cost,
     )
     for acct_adapter in ACCOUNT_REGISTRY:
         findings.append(run_account(acct_adapter, acct_ctx, caps))
@@ -611,10 +554,12 @@ def _run_diagnostics(
         def _run_serverless_unit(_idx: int, unit: tuple[str, str], projected=None) -> list:
             db_name, container_name = unit
             worker_metrics, _, worker_la = worker_providers.current()
+            age = ages.get(unit, ResourceAge())
             sls_ctx = ServerlessDetectionContext(
                 metrics=projected or worker_metrics, account=account, account_resource_id=account_resource_id,
                 database=db_name, container=container_name, mode=mode, eval_window=window,
                 now=run_now, la=worker_la,
+                resource_created_at=age.created, resource_existed_by=age.existed_by, fanout_log_history=fanout_history,
             )
             unit_findings = []
             for sls_adapter in SERVERLESS_REGISTRY:
@@ -652,21 +597,14 @@ def _run_diagnostics(
             dataplane_source=caps.dataplane_source,
             account_config=account_config,
             storage_peak=storage_peaks.get(key),
+            fanout_log_history=fanout_history,
+            logical_storage=logical_storage.get(key),
         )
         unit_findings = []
         for adapter in REGISTRY:
             if adapter.applies(offer):
                 unit_findings.append(run_container(adapter, ctx, caps))
         return unit_findings
-
-    # Unknown age affects only age-gated checks; independent account/database results stand.
-    for _key, _fut in _created_futs.items():
-        try:
-            created = _fut.result()
-        except Exception as exc:  # noqa: BLE001 - isolate optional SDK/decoding failures per resource
-            age_errors[_key] = type(exc).__name__
-        else:
-            ages[_key] = replace(ages.get(_key, ResourceAge()), created=created)
 
     # Shared-throughput DATABASE offers also run the metrics-based detectors at database scope
     # (DX-001/004/005/006/011 — idle/over/under-provisioning, hot partition; see _is_metrics_scoped).
@@ -699,7 +637,8 @@ def _run_diagnostics(
         if (callable(make_plan := getattr(metrics, "indexing_plan", None)) and indexing_inventory
                 and index_window.end - index_window.start <= 72 * index_window.granularity
                 and any(a.detection_id == "DX-024" and not caps.missing(a.requires) for a in INVENTORY_REGISTRY)):
-            reader = make_plan(account_resource_id, index_window)
+            worker_provider = (lambda: worker_providers.current()[0]) if worker_providers.isolated else None
+            reader = make_plan(account_resource_id, index_window, worker_provider=worker_provider)
             units = {(c.database, c.container): (i, c) for i, c in enumerate(indexing_inventory)}
             counts = Counter((c.database, c.container) for c in indexing_inventory)
             valid, ordered = [], {}
@@ -711,26 +650,29 @@ def _run_diagnostics(
                         account_resource_id, index_window, c.database, (c.container,),
                         "Incomplete indexing inventory: invalid or duplicate container identity",
                         error_type=InvalidIndexingInventory))
-            for batch in plan_indexing(valid):
-                try:
-                    projection = reader.project(batch)
-                except (ValueError, TypeError, AttributeError, KeyError) as exc:
-                    # Malformed wire/SDK data must not abort the rest of the diagnosis.
-                    projection = ProjectedReads.unavailable(account_resource_id, index_window, batch.database,
-                                                           batch.containers, f"Invalid Monitor response: {type(exc).__name__}")
+            for batch, projection in reader.projections(plan_indexing(valid), unit_concurrency):
                 for name in batch.containers:
                     i, container = units[batch.database, name]
                     ordered[i] = _run_inventory_unit(i, container, projection)
                     if use_cohorts and index_window == pm.recent_window(run_now):
                         cell = projection.cells.get((name, "DataUsage"))
-                        if isinstance(cell, MetricSeries) and (values := cell.values()):
-                            storage_peaks[batch.database, name] = max(values)
+                        if isinstance(cell, MetricSeries) and (peak := pm.measured_storage_peak(cell.values())) is not None:
+                            storage_peaks[batch.database, name] = peak
             inventory_results = [ordered[i] for i in sorted(ordered)]
         else:
             inventory_results = _ordered_parallel_map(
                 indexing_inventory, _run_inventory_unit, concurrency=unit_concurrency)
         for unit_findings in inventory_results:
             inventory_tail.extend(unit_findings)
+
+    # Indexing does not depend on age; let its Monitor reads overlap pending ARM lookups.
+    for _key, _fut in _created_futs.items():
+        try:
+            created = _fut.result()
+        except Exception as exc:  # noqa: BLE001 - isolate optional SDK/decoding failures per resource
+            age_errors[_key] = type(exc).__name__
+        else:
+            ages[_key] = replace(ages.get(_key, ResourceAge()), created=created)
 
     metrics_offers = container_offers + database_offers
     if use_cohorts:

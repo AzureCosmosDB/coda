@@ -105,7 +105,7 @@ Write-Output "Created assignment $($assignment.id). Allow propagation, then reru
 
 def _logging_script(identity: dict, account_id: str, category: str) -> str:
     """Add only a missing category in a new setting; never replace or delete existing exports."""
-    if category not in {"DataPlaneRequests5M", "DataPlaneRequests", "QueryRuntimeStatistics"}:
+    if category not in {"DataPlaneRequests5M", "DataPlaneRequests", "QueryRuntimeStatistics", "PartitionKeyStatistics"}:
         raise ValueError("Unsupported diagnostic category.")
     subscription = str(uuid.UUID(account_id.split("/")[2]))
     return (

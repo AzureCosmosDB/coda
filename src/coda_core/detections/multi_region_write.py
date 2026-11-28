@@ -5,9 +5,8 @@ which regions accept writes, not how an application will reach them during an ou
 
 * **Mongo / Cassandra / Gremlin / Table API + multi-region writes** — Low advisory to verify
   client write failover, not evidence of unsupported writes or a misconfiguration (ADR-0079).
-* **Non-production + multi-region writes** — dev/test/stage workloads don't need RTO=0 write failover;
-  the feature adds write-conflict surface, while retaining unnecessary regions repeats provisioned
-  throughput in every region. A common real case is production config cloned into a test/QA account.
+* **Non-production + multiple write regions** — an ungraded prompt to verify the purpose,
+  e.g. a failover rehearsal. An environment label does not establish that a region is removable.
 * **Single write region + the flag set (any environment)** — a *tripwire*: the feature yields neither
   benefit with one region (write failover needs a second region; low-latency writes need >=2). Adding
   another region separately repeats provisioned throughput there. This applies in production too.
@@ -17,8 +16,8 @@ A production NoSQL account with multi-region writes across two or more write reg
 
 This is a **configuration/state** detection. ARM throughput offers can quantify configured regional
 capacity, but never customer spend: manual throughput ``S`` across ``N`` regions has a global footprint
-of ``S * N`` regional RU/s. Only a recommendation that removes unnecessary regions can call
-``S * (N - 1)`` removable. Toggling multi-write while retaining the regions does not reduce that
+of ``S * N`` regional RU/s. No DX-008 branch establishes removable capacity.
+Toggling multi-write while retaining the regions does not reduce that
 footprint. Serverless and any autoscale inventory fail closed. Read-only / diagnose-only.
 """
 
@@ -26,6 +25,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
+import math
 
 from coda_core.framework.env_classifier import classify_environment
 from coda_core.providers.arm import AccountConfig, ThroughputOffer
@@ -61,7 +61,6 @@ def _regional_capacity(
     config: AccountConfig,
     offers: Sequence[ThroughputOffer],
     *,
-    remove_extra_regions: bool,
     inventory_issues: tuple[str, ...],
 ) -> dict:
     """Quantify only complete, unique manual-throughput inventory from ARM."""
@@ -87,36 +86,22 @@ def _regional_capacity(
             "reason": "autoscale_or_mixed_inventory_not_quantified",
             "offer_modes": sorted({offer.mode for offer in offers}),
         }
-    if config.region_count < 1 or any(offer.provisioned_ru <= 0 for offer in offers):
+    if config.region_count < 1 or any(not math.isfinite(o.provisioned_ru) or o.provisioned_ru <= 0 for o in offers):
         return {**evidence, "reason": "invalid_region_or_throughput_inventory"}
 
     per_region = round(sum(offer.provisioned_ru for offer in offers), 2)
     global_footprint = round(per_region * config.region_count, 2)
-    removable = (
-        round(per_region * (config.region_count - 1), 2)
-        if remove_extra_regions and config.region_count > 1
-        else None
-    )
     return {
         **evidence,
         "status": "quantified",
         "configured_per_region_ru": per_region,
         "global_regional_ru": global_footprint,
-        "removable_extra_region_ru": removable,
+        "removable_extra_region_ru": None,
         "formula": {
             "global_regional_ru": "configured_per_region_ru * region_count",
-            "removable_extra_region_ru": (
-                "configured_per_region_ru * (region_count - 1)"
-                if remove_extra_regions
-                else None
-            ),
+            "removable_extra_region_ru": None,
         },
-        "removal_condition": (
-            "Remove the unnecessary extra regions; disabling multi-write alone does not change "
-            "throughput provisioned in retained regions."
-            if remove_extra_regions
-            else "No region-removal recommendation is made by this classification."
-        ),
+        "removal_condition": "No region-removal recommendation is made by this classification.",
         "offers": [offer.as_dict() for offer in offers],
     }
 
@@ -151,7 +136,6 @@ def detect_multi_region_writes(
                 config,
                 offers,
                 inventory_issues=inventory_issues,
-                remove_extra_regions=base["root_cause"] == "nonprod_multi_region_writes",
             ),
         }
         return MultiRegionWriteVerdict(**base)
@@ -180,10 +164,10 @@ def detect_multi_region_writes(
             is_antipattern=True, root_cause="single_region_multi_region_writes_tripwire",
             severity="low",
             recommended_action=(
-                "Multi-region writes are enabled but the account has a single write region — so the "
-                "feature delivers no benefit today (RTO=0 write failover needs a second region; "
-                "low-latency local writes need at least two regions). Disable multi-region writes to "
-                "remove the tripwire unless a second write region is imminent and justified."
+                "Disable multi-region writes while there is only one write region. There is no "
+                "second region to accept writes today. If you add another region with this setting "
+                "enabled, provisioned throughput can be billed at the multi-region write rate. "
+                "Enable it deliberately when the application needs a second writable region."
             ),
         )
 
@@ -191,15 +175,4 @@ def detect_multi_region_writes(
     if not non_prod:
         return verdict(root_cause="legitimate_ha")
 
-    # Non-production with >=2 write regions: doesn't need RTO=0 write failover.
-    return verdict(
-        is_antipattern=True, root_cause="nonprod_multi_region_writes", severity="medium",
-        recommended_action=(
-            "Multi-region writes are enabled across "
-            f"{config.write_region_count} write regions on a non-production account, which does "
-            "not need RTO=0 write failover. Remove unnecessary extra regions to eliminate their "
-            "regional throughput footprint, then disable multi-region writes to remove the conflict "
-            "surface. Disabling multi-region writes while retaining the regions does not reduce "
-            "throughput provisioned in those regions."
-        ),
-    )
+    return verdict(root_cause="nonprod_multi_region_writes")

@@ -13,12 +13,13 @@ from azure.monitor.query import LogsQueryResult, LogsTable
 from coda_core import log_readiness as readiness
 from coda_core.pipeline.capabilities import CAPABILITIES
 from coda_core.providers.log_analytics import LogAnalyticsQueryError
+from coda_core.providers.arm import ArmProvider
 
 pytestmark = pytest.mark.public
 SUB = "11111111-2222-3333-4444-555555555555"
 GROUP = "customer-rg"
 NOW = datetime(2026, 10, 16, 12, tzinfo=timezone.utc)
-TABLES = ("CDBDataPlaneRequests5M", "CDBDataPlaneRequests", "CDBQueryRuntimeStatistics")
+TABLES = ("CDBDataPlaneRequests5M", "CDBDataPlaneRequests", "CDBQueryRuntimeStatistics", "CDBPartitionKeyStatistics")
 
 
 def _account(name="account-one", group=GROUP):
@@ -45,7 +46,7 @@ def _install(monkeypatch, *, accounts=None, settings=None, outcomes=None, config
     calls = []
     categories = [
         NS(name=category, category_type="Logs", category_groups=["allLogs"])
-        for category in ("DataPlaneRequests5M", "DataPlaneRequests", "QueryRuntimeStatistics")
+        for category in ("DataPlaneRequests5M", "DataPlaneRequests", "QueryRuntimeStatistics", "PartitionKeyStatistics")
     ]
 
     def get(group, name, **kwargs):
@@ -111,10 +112,41 @@ def test_single_account_checks_configuration_and_data_without_group_enumeration(
     assert all(source["data"]["status"] == "recent" for source in account["sources"])
     assert all(detector["status"] == "available" for detector in account["detectors"])
     assert account["selected_request_source"] == "CDBDataPlaneRequests5M"
-    assert [row["id"] for row in account["detectors"]] == ["DX-002", "DX-003", "DX-007", "DX-010", "DX-016"]
+    assert [row["id"] for row in account["detectors"]] == ["DX-002", "DX-003", "DX-007", "DX-010", "DX-015", "DX-016"]
+    assert account["detectors"][-2]["optional"] is True
     assert account["detectors"][-1]["optional"] is True
     assert all(call[-1]["retry_total"] == 0 for call in calls if call[0] in {"get", "settings", "categories"})
     assert all(call[-1] == 15 for call in calls if call[0] == "query")
+
+
+@pytest.mark.parametrize(("layout", "hours"), [
+    ("established allLogs", 48), ("new raw destination", 4), ("redundant new export", 48),
+    ("unknown modification", None), ("only query category", None), ("legacy", None),
+])
+def test_fanout_configuration_history_uses_both_resource_specific_categories(monkeypatch, layout, hours):
+    """The date must describe enabled categories, not just an old account or table."""
+    settings = [_setting(group="allLogs")]
+    settings[0].system_data = NS(last_modified_at=NOW-timedelta(days=2))
+    if "new" in layout:
+        settings.append(_setting(category="DataPlaneRequests",
+                                 workspace="other" if layout == "new raw destination" else "workspace-one"))
+        settings[-1].system_data = NS(last_modified_at=NOW-timedelta(hours=4))
+    elif layout == "unknown modification":
+        settings[0].system_data = NS(created_at=NOW-timedelta(days=90), last_modified_at=None)
+    elif layout == "only query category":
+        settings[0] = _setting(category="QueryRuntimeStatistics")
+        settings[0].system_data = NS(last_modified_at=NOW-timedelta(days=2))
+    elif layout == "legacy":
+        settings[0].log_analytics_destination_type = None
+    calls = _install(monkeypatch, settings=settings)
+    monkeypatch.setattr("azure.mgmt.monitor.MonitorManagementClient", readiness.MonitorManagementClient)
+    arm = object.__new__(ArmProvider)
+    arm._credential, arm._subscription_id = object(), SUB
+    from coda_core.providers.diagnostic_settings import FanoutLogHistory
+    result = FanoutLogHistory.from_exports(arm.diagnostic_log_exports(_account().id))
+    assert result.since == (NOW-timedelta(hours=hours) if hours is not None else None)
+    assert bool(result.issue) == (hours is None)
+    assert [c[0] for c in calls] == ["categories", "settings"]
 
 
 def test_configured_but_empty_is_waiting_for_data_not_disabled(monkeypatch):

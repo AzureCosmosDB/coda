@@ -1,24 +1,4 @@
-"""DX-024: Indexing cost risk (index storage large relative to data).
-
-Every indexed path costs write RU on every insert/replace and adds index storage. The default
-NoSQL indexing policy indexes **every** path, so containers whose queries touch only a few
-properties pay for index entries they never use. A large index-to-data storage ratio is the
-observable footprint of that over-indexing.
-
-Ported from the Azure Cosmos DB VS Code extension's ``IndexingCostRisk`` advisory (TS source
-``IndexingCostRiskDetector.ts``) with two deliberate, fleet-grounded differences (ADR-0069):
-
-* **Never abstain on user exclusions.** The extension stays silent whenever the policy excludes
-  any path besides the default ``_etag``. A container that excluded one small path can still index
-  everything else, so CODA keeps flagging it and reports the exclusion count as evidence instead.
-* **Banded severity.** Low when index > 30% of data (the extension's cutoff); Medium when the index
-  is *larger than the data itself* (> 100%). Fleet probe 2026-10-22 (20% sample, consistent-indexing
-  containers): 27.5% exceed 0.3 and 3.3% exceed 1.0 (``docs/evidence/dx024-indexing-ratio.md``).
-
-Signal (Azure Monitor + ARM, no Log Analytics): latest ``IndexUsage`` and ``DataUsage`` bytes for the
-container, plus its ARM indexing policy (mode + excluded paths). Read-only / diagnose-only: the
-remediation (``index-exclude-unused``) is a policy change the customer applies.
-"""
+"""DX-024: compare measured index and data footprints; size alone cannot identify unused paths."""
 
 from __future__ import annotations
 
@@ -42,8 +22,7 @@ DEFAULT_EXCLUDED_PATHS = frozenset({'/_etag/?', '/"_etag"/?'})
 
 @dataclass(frozen=True)
 class IndexingCostConfig:
-    low_ratio: float = 0.3      # strict >, extension parity
-    medium_ratio: float = 1.0   # strict >: index larger than the data it indexes
+    review_ratio: float = 0.3   # strict >; a review prompt, not severity
 
 
 def production_window(now: datetime | None = None) -> TimeWindow:
@@ -88,8 +67,7 @@ def classify(
     """Classify one container's indexing footprint. Pure (no I/O)."""
     user_paths = user_excluded_paths(excluded_paths)
     methodology = {
-        "low_ratio_threshold": config.low_ratio,
-        "medium_ratio_threshold": config.medium_ratio,
+        "review_ratio_threshold": config.review_ratio,
         "indexing_mode": indexing_mode,
         "user_excluded_path_count": len(user_paths),
         "user_excluded_paths": list(user_paths),
@@ -108,28 +86,17 @@ def classify(
 
     ratio = index_bytes / data_bytes
     methodology["ratio"] = round(ratio, 4)
-    if ratio <= config.low_ratio:
+    if ratio <= config.review_ratio:
         return IndexingCostVerdict(is_risk=False, severity="none", root_cause="normal_ratio",
                                    ratio=ratio, recommended_action="", **base)
 
-    severity = "medium" if ratio > config.medium_ratio else "low"
-    tuned = (f" The policy already excludes {len(user_paths)} path(s); review whether more unused "
-             f"paths can be excluded." if user_paths else
-             " The policy excludes no paths beyond the default, so every property is indexed.")
+    methodology["visible_observation"] = True
     action = (
-        f"Index storage is {ratio:.0%} of data storage ({index_bytes / 1024**3:.2f} GiB index vs "
-        f"{data_bytes / 1024**3:.2f} GiB data). Every indexed path adds write RU to each insert and "
-        f"replace and grows index storage.{tuned} Exclude paths your queries never filter or sort on "
-        f"(or switch to an include-list policy) to cut write RU and storage."
+        "Review which indexed paths representative queries use to filter or sort, including infrequent jobs. "
+        "Test query behavior and write RU before excluding a path. Index size alone does not establish waste."
     )
-    return IndexingCostVerdict(is_risk=True, severity=severity, root_cause="high_index_ratio",
+    return IndexingCostVerdict(is_risk=True, severity="none", root_cause="high_index_ratio",
                                ratio=ratio, recommended_action=action, **base)
-
-
-def _latest(series) -> float | None:
-    """Latest non-null sample; the newest grain is often still unpopulated (null) at query time."""
-    values = series.values()
-    return values[-1] if values else None
 
 
 def detect_indexing_cost(
@@ -156,5 +123,11 @@ def detect_indexing_cost(
         result = classify(None, None, indexing_mode=indexing_mode, excluded_paths=excluded_paths, config=config)
         result.methodology["storage_read_issue"] = type(exc).__name__
         return result
-    return classify(_latest(index), _latest(data), indexing_mode=indexing_mode,
-                    excluded_paths=excluded_paths, config=config)
+    index_sizes = {p.timestamp: p.value for p in index.points if p.value is not None}
+    data_sizes = {p.timestamp: p.value for p in data.points if p.value is not None}
+    latest = max(index_sizes.keys() & data_sizes.keys(), default=None)
+    result = classify(index_sizes.get(latest), data_sizes.get(latest), indexing_mode=indexing_mode,
+                      excluded_paths=excluded_paths, config=config)
+    if latest is not None:
+        result.methodology["sample_at"] = latest.isoformat()
+    return result

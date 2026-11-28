@@ -218,8 +218,11 @@ For an actionable finding:
 4. Present a proposed remediation for review. Resource or code changes are a separate,
    explicitly authorized task; CODA does not perform them.
 
-Null mappings are intentional for some platform/commercial actions. DX-021 chooses a rule
-by the dominant operation category; do not hardcode one rule for that detector.
+Null mappings are intentional for some platform/commercial actions and descriptive checks.
+DX-021 reports operation shares, not a cause or a fix; do not select a rule from those shares.
+Present ungraded observations (`evidence.visible_observation` or detector-specific observation
+fields) without creating an additional graded issue. Same-offer sizing and mode recommendations
+linked by `evidence.alternative_to` are alternatives; never add their savings together.
 Use the methodology page to understand the limits of each recommendation.
 
 ## Privacy, approvals and troubleshooting

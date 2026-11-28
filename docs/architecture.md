@@ -73,8 +73,10 @@ Independent owner-scoped, dedicated-container and account-configuration findings
    caches repeated queries; concurrent workers use separate SDK clients. Cost/pricing enrichment
    is optional and carries its own provenance.
 5. **Evaluate and correlate.** Rules produce findings, not-detected results, abstentions, or errors.
-   Correlation groups related signals and avoids counting superseded findings as independent impact.
-6. **Render a report.** The browser shows recommendations and incomplete evaluations. JSON/MCP
+   Correlation groups related signals. For the same offer retirement supersedes sizing and
+   conversion; otherwise sizing and mode-change recommendations are alternatives, not additive savings.
+6. **Render a report.** The browser and Markdown show ungraded observations separately from
+   actionable findings and incomplete evaluations. JSON/MCP
    retains evidence, identifiers, thresholds, and remediation-rule metadata.
 
 The diagnostic path does not call an LLM. An AI client can call the MCP tools and interpret
@@ -89,7 +91,9 @@ not a measured zero or evidence that an offer is balanced.
 DX-003, DX-010, and optional DX-016 read-charge enrichment prefer five-minute request aggregates,
 with raw-log compatibility when aggregates are unavailable. Source selection and cache keys are
 consistent within a run; errors are not a reason to silently switch sources. DX-002/DX-007 still
-require raw request logs for activity-level query-charge joins. See
+require raw request logs for activity-level query-charge joins. Both reuse one diagnostic
+export history check per applicable account report before assigning severity.
+Provisioned and serverless containers share this read; quiet hours need no separate probe. See
 [Log Analytics readiness](detections/log-analytics-readiness.md) for configuration and window limits.
 
 ## Services and outbound connections
@@ -108,7 +112,13 @@ underneath. A service 429 pauses new Metrics requests in that scan's subscriptio
 probes recovery before the others resume. CODA honors `Retry-After` (including HTTP dates and
 Azure millisecond headers), or uses exponential backoff with jitter when no usable hint exists.
 408, 500, 502, 503, 504 and transport errors are retryable; permission and invalid-query
-errors are not. An account has at most 60 seconds of cumulative retry waiting or the caller's
+errors are not. Independent indexing groups can run concurrently (four workers by default);
+responses retain their own database/container identities and inventory order. The eight indexing
+recoveries are allocated once, in plan order, not eight per worker. In-flight reads can finish
+after a rejection, but the collector does not start individual retries for the rejected group.
+Indexing can also proceed while ARM resource-age lookups are pending.
+
+An account has at most 60 seconds of cumulative retry waiting or the caller's
 remaining deadline, whichever is shorter. CODA never shortens Azure's requested delay to fit;
 it reports missing evidence and retains independent results. These are collection limits,
 not a hard ceiling on normal reads and not a change to detector severity.

@@ -1,138 +1,164 @@
-"""DX-014: Provisioned → Serverless candidate (account-scoped).
-
-Serverless is a per-account capacity mode that bills per RU consumed with no provisioned floor — it
-wins for **low, sporadic** workloads with long idle stretches. This detection flags an account whose
-total consumed throughput is low and bursty (a low average-to-peak ratio) as a candidate to evaluate
-serverless.
-
-Important constraints make this a **migration-class, high-confidence-only** recommendation (per the
-right-sizing family doc, verified against Microsoft Learn):
-* Conversion is **one-way**: there is no in-place provisioned → serverless path, so it means creating a
-  **new** serverless account and migrating data.
-* Serverless is **single-region**, has **no shared-throughput databases**, and caps at **5,000 RU/s per
-  physical partition**.
-
-Signal: the account-total **Request Units consumed** (Azure Monitor ``TotalRequestUnits``) over the
-window — no per-container filter, no Log Analytics. Qualitative per ADR-0012 (no cost figure); the
-benefit is a pricing model change, and the customer must validate the constraints fit. Read-only.
-"""
+"""DX-014: compare like-for-like throughput costs only after verifying account eligibility."""
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from math import isfinite
 
-from coda_core.providers.azure_monitor import AzureMonitorMetricsProvider
-from coda_core.providers.base import TimeWindow
+from coda_core.providers.arm import AccountConfig, ThroughputOffer
+from coda_core.providers.base import DataProvider, TimeWindow
+from coda_core.providers.cost_management import CostManagementProvider
 
 PRODUCTION_WINDOW_DAYS = 30
-GRANULARITY = timedelta(hours=1)
-# Serverless capacity is 5,000 RU/s *per physical partition* (total = partitions × 5,000). We gate the
-# candidate's **account-total peak** at this single-partition figure as a deliberately CONSERVATIVE bar:
-# (a) serverless gives no throughput/latency guarantee, so suggesting it for a >5,000 RU/s workload is
-# risky; and (b) realising partitions × 5,000 needs even key distribution we can't verify. A workload
-# that peaks above this is steered away from serverless (a safe false-negative). Raise this as the
-# serverless RU ceiling is lifted (see docs/exploration / serverless telemetry notes).
-SERVERLESS_CONTAINER_CEILING_RU = 5000.0
-
-
-def production_window(now: datetime | None = None) -> TimeWindow:
-    anchor = now or datetime.now(timezone.utc)
-    return TimeWindow(anchor - timedelta(days=PRODUCTION_WINDOW_DAYS), anchor, GRANULARITY)
+HOUR = timedelta(hours=1)
 
 
 @dataclass(frozen=True)
 class ServerlessCandidateConfig:
-    sporadic_ratio: float = 0.10      # avg/peak below this = sporadic (long idle stretches)
-    peak_ceiling_ru: float = SERVERLESS_CONTAINER_CEILING_RU  # conservative single-partition fit bar
-    peak_floor_ru: float = 10.0       # some real usage (a fully idle account is DX-004, not this)
-    min_points: int = 24              # need enough history to judge the shape
+    """A comparison needs all hours in the last 30 completed UTC billing dates."""
+
+    required_hours: int = PRODUCTION_WINDOW_DAYS * 24
+
+
+def _midnight(stamp: datetime) -> datetime:
+    return stamp.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def production_window(now: datetime | None = None) -> TimeWindow:
+    """Include today's observations, but do not compare a partial UTC billing date."""
+    end = now or datetime.now(timezone.utc)
+    return TimeWindow(_midnight(end) - timedelta(days=PRODUCTION_WINDOW_DAYS), end, HOUR)
+
+
+def eligibility(config: AccountConfig, offers: tuple[ThroughputOffer, ...],
+                inventory_issues: tuple[str, ...]) -> tuple[str, str]:
+    """Known blockers take precedence over missing evidence. Unclassified features are not blockers."""
+    names = {n.casefold().replace(" ", "") for n in config.location_names if n and n.strip()}
+    replicas = {n.casefold().replace(" ", "") for n in config.reported_replica_regions if n.strip()}
+    if config.is_serverless or any(c.casefold() == "enableserverless" for c in config.capabilities):
+        return "not_applicable", "account is already serverless"
+    if config.region_count > 1 or config.write_region_count > 1 or len(names | replicas) > 1:
+        return "not_applicable", "multiple configured regions (including read replicas)"
+    if any(o.level == "database" for o in offers):
+        return "not_applicable", "shared database throughput"
+    if config.free_tier is True:
+        return "not_applicable", "free tier is enabled"
+    if config.priority_based_execution is True:
+        return "not_applicable", "priority-based execution is enabled"
+    if config.burst_capacity is True:
+        return "not_applicable", "provisioned burst capacity is enabled"
+    if (config.write_region_count != 1 or config.region_count != 1 or len(names) != 1
+            or any(not n.strip() for n in config.reported_replica_regions)):
+        return "eligibility_unverified", "region configuration is incomplete"
+    if (inventory_issues or not offers or any(o.level != "container" or o.mode not in {"manual", "autoscale"}
+                                              for o in offers)):
+        return "eligibility_unverified", "dedicated provisioned offer inventory is unverified"
+    if config.api != "sql" or config.api_kind.casefold() != "globaldocumentdb":
+        return "eligibility_unverified", "this ARM inventory verifies only NoSQL databases and containers"
+    missing = [label for value, label in ((config.free_tier, "free-tier setting"),
+               (config.priority_based_execution, "priority-based execution setting"),
+               (config.burst_capacity, "burst capacity setting"),
+               (config.multi_region_writes_enabled, "single-write setting")) if value is not False]
+    if not config.capability_inventory_complete:
+        missing.append("capability inventory")
+    if config.capabilities:
+        missing.append("compatibility of configured capabilities")
+    if missing:
+        return "eligibility_unverified", "unverified: " + ", ".join(missing)
+    return "compatible", "single-region provisioned NoSQL; verified dedicated offers and feature checks"
 
 
 @dataclass(frozen=True)
 class ServerlessCandidateVerdict:
-    is_candidate: bool
-    avg_ru_per_s: float
-    peak_ru_per_s: float
-    avg_to_peak: float
-    severity: str  # low | none
-    # serverless_candidate | steady_load | too_high | idle_or_empty | insufficient_data
+    """Keep preflight, actual measurements and price provenance explicit and distinct."""
+
     root_cause: str
+    summary: str
     recommended_action: str
-    methodology: dict = field(default_factory=dict)
-
-    def as_dict(self) -> dict:
-        return asdict(self)
+    methodology: dict
 
 
-def classify(
-    avg_ru_s: float, peak_ru_s: float, sample_count: int,
-    config: ServerlessCandidateConfig | None = None,
-) -> ServerlessCandidateVerdict:
-    cfg = config or ServerlessCandidateConfig()
-    ratio = (avg_ru_s / peak_ru_s) if peak_ru_s > 0 else 0.0
-    method = {"thresholds": {"sporadic_ratio": cfg.sporadic_ratio,
-                             "peak_ceiling_ru": cfg.peak_ceiling_ru,
-                             "peak_floor_ru": cfg.peak_floor_ru}}
+def detect_serverless_candidate(metrics: DataProvider, rid: str, window: TimeWindow, *,
+                               account: AccountConfig, offers: tuple[ThroughputOffer, ...],
+                               inventory_issues: tuple[str, ...], cost: CostManagementProvider | None
+                               ) -> ServerlessCandidateVerdict:
+    """Read consumption only for compatible accounts, and pricing only for a complete measured month."""
+    state, reason = eligibility(account, offers, inventory_issues)
+    evidence = {"eligibility": state, "eligibility_reason": reason}
 
-    def verdict(**kw) -> ServerlessCandidateVerdict:
-        base = dict(is_candidate=False, avg_ru_per_s=round(avg_ru_s, 1),
-                    peak_ru_per_s=round(peak_ru_s, 1), avg_to_peak=round(ratio, 3),
-                    severity="none", root_cause="steady_load", recommended_action="",
-                    methodology=method)
-        base.update(kw)
-        return ServerlessCandidateVerdict(**base)
+    def verdict(cause, summary, action=""):
+        return ServerlessCandidateVerdict(cause, summary, action, {**evidence, "root_cause": cause})
 
-    if sample_count < cfg.min_points:
-        return verdict(root_cause="insufficient_data")
-    if peak_ru_s < cfg.peak_floor_ru:
-        return verdict(root_cause="idle_or_empty")   # ~no usage -> DX-004 decommission, not serverless
-    if peak_ru_s > cfg.peak_ceiling_ru:
-        # Above the conservative single-partition serverless bar — steer away (safe false-negative).
-        return verdict(root_cause="too_high")
-    if ratio >= cfg.sporadic_ratio:
-        return verdict(root_cause="steady_load")      # not sporadic enough to win on serverless
-
-    return verdict(
-        is_candidate=True, root_cause="serverless_candidate", severity="low",
-        recommended_action=(
-            f"Account throughput is low and sporadic (peak {peak_ru_s:.0f} RU/s, average "
-            f"{avg_ru_s:.0f} RU/s — a {ratio * 100:.0f}% average-to-peak ratio with long idle "
-            f"stretches). Serverless (pay-per-RU, no provisioned floor) may cost less for this shape. "
-            f"This is migration-class — serverless is a new, single-region account (not an in-place "
-            f"switch) with no shared-throughput databases and a 5,000 RU/s per-partition cap — validate "
-            f"those fit before migrating data to a new serverless account."
-        ),
-    )
-
-
-def detect_serverless_candidate(
-    metrics: AzureMonitorMetricsProvider,
-    account_resource_id: str,
-    window: TimeWindow,
-    *,
-    is_serverless: bool = False,
-    config: ServerlessCandidateConfig | None = None,
-) -> ServerlessCandidateVerdict:
-    """End-to-end DX-014 for one account: judge the account-total consumed-RU shape.
-
-    Guard: an account that is **already serverless** is never a candidate — recommending serverless to
-    a serverless account is nonsensical. This is the one detector that would otherwise misfire on a
-    serverless account (the container detectors skip it — serverless containers have no throughput
-    offer — but DX-014 is account-level and a serverless account does report consumed RU).
-    """
-    if is_serverless:
-        return ServerlessCandidateVerdict(
-            is_candidate=False, avg_ru_per_s=0.0, peak_ru_per_s=0.0, avg_to_peak=0.0, severity="none",
-            root_cause="already_serverless", recommended_action="",
-            methodology={"guard": "account is already serverless; DX-014 not applicable"},
-        )
-    # Account-total RU consumed per bucket (no DatabaseName/CollectionName filter).
-    series = metrics.get_metric(account_resource_id, "TotalRequestUnits", window, aggregation="Total")
-    bucket_seconds = window.granularity.total_seconds() or 3600.0
-    ru_per_s = [v / bucket_seconds for v in series.values()]
-    if not ru_per_s:
-        return classify(0.0, 0.0, 0, config)
-    avg_ru_s = sum(ru_per_s) / len(ru_per_s)
-    peak_ru_s = max(ru_per_s)
-    return classify(avg_ru_s, peak_ru_s, len(ru_per_s), config)
+    if state != "compatible":
+        evidence["visible_observation"] = True
+        return verdict(state, f"DX-014 {state.replace('_', ' ')}: {reason}.")
+    series = metrics.get_metric(rid, "TotalRequestUnits", TimeWindow(window.start, window.end, HOUR),
+                                aggregation="Total")
+    hours = {}
+    for p in series.points:
+        if not window.start <= p.timestamp < window.end:
+            continue
+        n = p.value
+        hours[p.timestamp] = (Decimal(str(n)) if p.timestamp not in hours and type(n) in (float, int)
+                              and isfinite(n) and n >= 0 else None)
+    # A clock label amid finer-grained samples is not an hourly total. Never double count
+    # overlapping samples or silently price just the bucket at the top of each hour.
+    off_grid_hours = {s.replace(minute=0, second=0, microsecond=0) for s in hours
+                      if s.minute or s.second or s.microsecond}
+    measured = {s: v for s, v in hours.items() if v is not None and
+                s.replace(minute=0, second=0, microsecond=0) not in off_grid_hours}
+    end = _midnight(window.end)
+    start = end - timedelta(days=PRODUCTION_WINDOW_DAYS)
+    required = ServerlessCandidateConfig().required_hours
+    stamps = [start + i*HOUR for i in range(required)]
+    covered = sum(stamp in measured for stamp in stamps)
+    evidence.update(measured_buckets=len(measured), comparison_hours=covered,
+                    comparison_start=start.isoformat(), comparison_end=end.isoformat())
+    if not measured:
+        return verdict("insufficient_data", "No usable account-total consumed-RU measurements.")
+    observed = sum(measured.values())
+    evidence.update(visible_observation=True, observed_ru=float(observed),
+                    observation_start=window.start.isoformat(), observation_end=window.end.isoformat())
+    summary = f"Observed {observed:,.2f} RU across {len(measured):,} measured account buckets."
+    if covered != required or window.start > start:
+        return verdict("incomplete_history", f"{summary} {covered} of {required} completed comparison hours measured.")
+    if cost is None or account.zone_redundant_region_count != 0:
+        return verdict("pricing_unavailable", f"{summary} No verified comparable throughput prices.")
+    region = account.location_names[0]
+    try:
+        days = cost.serverless_comparison_days(start.date(), end.date(), resource_id=rid, region=region)
+        if set(days) != {s.date() for s in stamps}:
+            raise ValueError("Incomplete billing dates")
+        currencies = {v.currency for v in days.values()}
+        if (len(currencies) != 1 or not all(v.provisioned_cost.is_finite() and v.provisioned_cost >= 0
+                and v.price_per_million_ru.is_finite() and v.price_per_million_ru > 0 for v in days.values())):
+            raise ValueError("Incomparable pricing")
+        currency = currencies.pop()
+        provisioned = sum(v.provisioned_cost for v in days.values())
+        daily_ru = defaultdict(Decimal)
+        for s in stamps:
+            daily_ru[s.date()] += measured[s]
+        alternative = sum(ru * days[d].price_per_million_ru for d, ru in daily_ru.items()) / 1_000_000
+    except Exception as exc:  # noqa: BLE001 - optional billing cannot erase measured consumption
+        evidence["price_issue"] = type(exc).__name__
+        return verdict("pricing_unavailable", f"{summary} Comparable daily throughput pricing was unavailable.")
+    evidence.update(consumed_ru=float(sum(measured[s] for s in stamps)), currency=currency,
+                    provisioned_cost=float(provisioned), estimated_serverless_cost=float(alternative),
+                    price_source="customer_amortized_bill", serverless_rate_scope="subscription_region",
+                    region=region, serverless_meter="1M RUs", provisioned_meter="100 RU/s",
+                    daily_comparison=[{"date": d.isoformat(), "consumed_ru": float(ru),
+                                       "provisioned_cost": float(days[d].provisioned_cost),
+                                       "price_per_million_ru": float(days[d].price_per_million_ru)}
+                                      for d, ru in daily_ru.items()])
+    comparison = (f"For {start.date()} to {end.date()} (end exclusive), measured "
+                  f"{evidence['consumed_ru']:,.2f} RU: estimated serverless {currency} {alternative:,.2f} "
+                  f"at this subscription's regional meter rates versus actual provisioned throughput "
+                  f"{currency} {provisioned:,.2f}.")
+    if alternative >= provisioned:
+        return verdict("not_cheaper", f"{comparison} No lower serverless throughput cost.")
+    return verdict("serverless_candidate", comparison, "Evaluate serverless for this workload; "
+                   "confirm partition burst capacity, application fit and actual terms. "
+                   "A lower historical throughput estimate is not a forecast.")
